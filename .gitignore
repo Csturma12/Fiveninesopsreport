@@ -8,7 +8,16 @@ __v0_jsx-dev-runtime.ts
 next.user-config.*
 
 # Environment variables
+.env
 .env*.local
+
+# Supabase local development state
+supabase/.temp/
+supabase/.branches/
+
+# Local logs and runtime artifacts
+*.log
+coverage/
 
 # Common ignores
 node_modules
