@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+local-data/
+*.db
+*.sqlite
+.DS_Store
+coverage/
+.vercel/
