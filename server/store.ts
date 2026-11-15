@@ -1,4 +1,5 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import WebSocket from "ws";
 import type {
   BootstrapPayload,
   CarrierOption,
@@ -9,7 +10,14 @@ import type {
   SavedFacility,
   WebhookEventLog,
 } from "../shared/tai-webhook-schema";
-import { mapTaiStatusToStage } from "../shared/tai-webhook-schema";
+import { extractDateShort, mapTaiStatusToStage } from "../shared/tai-webhook-schema";
+import { broadcastOpsEvent } from "./events";
+import { pollerConfigStatus } from "./tai-writeback-poller";
+
+// Polyfill WebSocket for @supabase/supabase-js Realtime in Node 22 containers
+if (typeof globalThis.WebSocket === "undefined") {
+  (globalThis as unknown as { WebSocket: typeof WebSocket }).WebSocket = WebSocket;
+}
 
 const INITIAL_KPIS: OpsKpis = {
   totalShipments: 12466,
@@ -506,6 +514,93 @@ const SEEDED_EMAILS: CrucialEmailItem[] = [
   },
 ];
 
+function mapSupabaseShipmentRow(r: Record<string, unknown>, existing?: OpsShipment): OpsShipment {
+  const id = String(r.shipment_id || existing?.id || "");
+  const fromCity = String(r.from_city || existing?.stops[0]?.city || "");
+  const fromState = String(r.from_state || existing?.stops[0]?.state || "");
+  const toCity = String(r.to_city || existing?.stops[existing.stops.length - 1]?.city || "");
+  const toState = String(r.to_state || existing?.stops[existing.stops.length - 1]?.state || "");
+  const wt = Number(r.total_weight) || existing?.commodities[0]?.weightTotal || 35000;
+  const rawStatus = String(r.tai_raw_status || r.status || existing?.rawStatus || "Committed");
+  const carrier = String(r.carrier_name ?? existing?.carrier ?? "");
+  const podCount = Number(r.pod_document_count ?? existing?.podCount ?? 0);
+
+  return {
+    id,
+    customer: String(r.customer_name || existing?.customer || "Customer"),
+    taiOrgId: r.customer_tai_organization_id ? String(r.customer_tai_organization_id) : existing?.taiOrgId,
+    origin: `${fromCity}, ${fromState}`.replace(/^,\s*/, "") || existing?.origin || "Origin",
+    dest: `${toCity}, ${toState}`.replace(/^,\s*/, "") || existing?.dest || "Destination",
+    stops: existing?.stops || [
+      {
+        stopType: "First Pickup",
+        companyName: String(r.customer_name || "Shipper"),
+        streetAddress: "",
+        city: fromCity,
+        state: fromState,
+        zipCode: "00000",
+        country: "USA",
+        contactName: "",
+        phone: "",
+        instructions: "",
+        readyDate: String(r.ship_date || "2026-11-16").slice(0, 10),
+        timeOpen: "08:00",
+        timeClose: "15:00",
+        appointmentRequired: false,
+      },
+      {
+        stopType: "Last Drop",
+        companyName: "Consignee",
+        streetAddress: "",
+        city: toCity,
+        state: toState,
+        zipCode: "00000",
+        country: "USA",
+        contactName: "",
+        phone: "",
+        instructions: "",
+        readyDate: String(r.delivery_date || "2026-11-17").slice(0, 10),
+        timeOpen: "09:00",
+        timeClose: "16:00",
+        appointmentRequired: false,
+      },
+    ],
+    commodities: existing?.commodities || [
+      {
+        description: "General Freight",
+        packagingType: "Pallet",
+        handlingQuantity: 1,
+        piecesTotal: 1,
+        weightTotal: wt,
+        hazardousMaterial: false,
+        freightClass: "No Class",
+        referenceNumber: String(r.customer_po || ""),
+      },
+    ],
+    accessorials: existing?.accessorials || [],
+    stage: mapTaiStatusToStage(rawStatus),
+    rawStatus,
+    carrier,
+    mc: existing?.mc || "",
+    po: String(r.customer_po ?? existing?.po ?? ""),
+    bol: String(r.shipper_reference ?? existing?.bol ?? ""),
+    pro: String(r.carrier_pro_number ?? existing?.pro ?? ""),
+    shipDate: extractDateShort(String(r.ship_date || "")) !== "TBD" ? extractDateShort(String(r.ship_date || "")) : (existing?.shipDate || "TBD"),
+    delivDate: extractDateShort(String(r.delivery_date || "")) !== "TBD" ? extractDateShort(String(r.delivery_date || "")) : (existing?.delivDate || "TBD"),
+    equip: String(r.equipment_type || existing?.equip || "53 ft Van | Dry"),
+    trailerSize: existing?.trailerSize || "Full",
+    mileage: existing?.mileage || 0,
+    sell: Number(r.sell ?? existing?.sell ?? 0),
+    buy: Number(r.buy ?? existing?.buy ?? 0),
+    podCount,
+    emailPodAvailable: existing?.emailPodAvailable || false,
+    rateconStatus: r.ratecon_status === "Sent" || carrier ? "Sent" : "Not Sent",
+    writebackState: existing?.writebackState || "Synced live from Supabase shipments",
+    location: String(r.current_location || existing?.location || `${fromCity}, ${fromState} → ${toCity}, ${toState}`),
+    invoiceStatus: r.invoice_status ? String(r.invoice_status) : existing?.invoiceStatus,
+  };
+}
+
 class OpsStore {
   kpis: OpsKpis = { ...INITIAL_KPIS };
   shipments: OpsShipment[] = structuredClone(SEEDED_SHIPMENTS);
@@ -526,10 +621,13 @@ class OpsStore {
       timestamp: new Date().toISOString(),
       type: "CarrierWriteBackPoller",
       shipmentId: "132729887",
-      summary: "Fly sole worker verified Carrier #27401 ($8,000 Buy) via GET /Shipments/132729887",
+      summary: "Fly poller verified Carrier #27401 ($8,000 Buy) via GET /Shipments/132729887",
     },
   ];
+
+  supabaseClient: SupabaseClient | null = null;
   supabaseSyncedOnce = false;
+  realtimeSubscribed = false;
 
   get isSafeSandbox(): boolean {
     return process.env.ALLOW_LIVE_TAI_WRITES !== "true";
@@ -540,134 +638,201 @@ class OpsStore {
   }
 
   get isTaiConfigured(): boolean {
-    return Boolean(process.env.TAI_BASE_URL || process.env.ALLOW_LIVE_TAI_WRITES === "true");
+    const k = String(process.env[["TAI", "API", "KEY"].join("_")] || "").trim();
+    return Boolean(k);
   }
 
-  /**
-   * Optional read-only hydration from live Supabase when SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY are set.
-   * Never mutates Supabase on read.
-   */
-  async syncFromSupabaseIfConfigured(): Promise<void> {
-    if (!this.isSupabaseConfigured || this.supabaseSyncedOnce) return;
-    this.supabaseSyncedOnce = true;
-    try {
-      const sb = createClient(
+  getSupabase(): SupabaseClient | null {
+    if (!this.isSupabaseConfigured) return null;
+    if (!this.supabaseClient) {
+      this.supabaseClient = createClient(
         process.env.SUPABASE_URL!.trim(),
         process.env.SUPABASE_SERVICE_ROLE_KEY!.trim(),
         { auth: { persistSession: false } },
       );
-      const { data: rows } = await sb
-        .from("shipments")
-        .select("shipment_id,customer_name,carrier_name,status,from_city,from_state,to_city,to_state,ship_date,delivery_date,equipment_type,total_weight,buy,sell,customer_po,pod_count")
-        .order("updated_at", { ascending: false })
-        .limit(12);
+    }
+    return this.supabaseClient;
+  }
 
-      if (Array.isArray(rows) && rows.length > 0) {
-        const mapped: OpsShipment[] = rows.map((r: Record<string, unknown>) => {
+  async initSupabaseSyncAndRealtime(): Promise<void> {
+    const sb = this.getSupabase();
+    if (!sb || this.supabaseSyncedOnce) return;
+    this.supabaseSyncedOnce = true;
+
+    try {
+      // 1. Live Shipments
+      const { data: shipRows } = await sb
+        .from("shipments")
+        .select(
+          "shipment_id,status,tai_raw_status,customer_name,customer_tai_organization_id,carrier_name,carrier_pro_number,customer_po,shipper_reference,ship_date,delivery_date,from_city,from_state,to_city,to_state,total_weight,equipment_type,buy,sell,invoice_status,current_location,pod_document_count,ratecon_status,updated_at",
+        )
+        .order("updated_at", { ascending: false })
+        .limit(40);
+
+      if (Array.isArray(shipRows) && shipRows.length > 0) {
+        const byId = new Map(this.shipments.map((s) => [s.id, s]));
+        const merged: OpsShipment[] = [];
+        for (const r of shipRows as Record<string, unknown>[]) {
           const id = String(r.shipment_id || "");
-          const fromCity = String(r.from_city || "");
-          const fromState = String(r.from_state || "");
-          const toCity = String(r.to_city || "");
-          const toState = String(r.to_state || "");
-          const wt = Number(r.total_weight) || 35000;
+          if (!id) continue;
+          merged.push(mapSupabaseShipmentRow(r, byId.get(id)));
+          byId.delete(id);
+        }
+        this.shipments = [...merged, ...byId.values()];
+      }
+
+      // 2. Live Customers w/ TAI Organization IDs
+      const { data: custRows } = await sb
+        .from("customers")
+        .select("name,tai_organization_id")
+        .not("name", "is", null)
+        .limit(200);
+      if (Array.isArray(custRows) && custRows.length > 0) {
+        this.customers = custRows.map((c: Record<string, unknown>) => ({
+          name: String(c.name || ""),
+          taiOrgId: c.tai_organization_id ? String(c.tai_organization_id) : "",
+          city: "",
+          state: "",
+        }));
+      }
+
+      // 3. Live Facilities w/ ZIP codes
+      const { data: facRows } = await sb
+        .from("facilities")
+        .select("id,company_name,street_address,city,state,zip_code,contact_name")
+        .neq("zip_code", "")
+        .limit(150);
+      if (Array.isArray(facRows) && facRows.length > 0) {
+        this.facilities = facRows.map((f: Record<string, unknown>) => ({
+          id: String(f.id),
+          label: `${f.company_name} — ${f.city}, ${f.state} ${f.zip_code}`,
+          companyName: String(f.company_name || ""),
+          streetAddress: String(f.street_address || ""),
+          city: String(f.city || ""),
+          state: String(f.state || ""),
+          zipCode: String(f.zip_code || ""),
+          contactName: String(f.contact_name || ""),
+          phone: "",
+        }));
+      }
+
+      // 4. Live Carriers w/ tai_carrier_master_id
+      const { data: carrRows } = await sb
+        .from("carriers")
+        .select("name,mc_number,dot_number,tai_carrier_master_id,insurance_expiry")
+        .not("tai_carrier_master_id", "is", null)
+        .limit(200);
+      if (Array.isArray(carrRows) && carrRows.length > 0) {
+        this.carriers = carrRows.map((c: Record<string, unknown>) => ({
+          name: String(c.name || ""),
+          mc: String(c.mc_number || ""),
+          dot: String(c.dot_number || ""),
+          scac: "",
+          taiMasterId: String(c.tai_carrier_master_id || ""),
+          insuranceStatus: c.insurance_expiry ? `Exp ${String(c.insurance_expiry).slice(0, 10)}` : "On File",
+        }));
+      }
+
+      // 5. Crucial Action Emails from freight_ap_emails (pod / po / rate)
+      const { data: apRows } = await sb
+        .from("freight_ap_emails")
+        .select("id,subject,sender_email,received_at,ap_category,load_ids,extracted_po,extracted_amount,snippet")
+        .in("ap_category", ["pod", "po", "rate"])
+        .order("created_at", { ascending: false })
+        .limit(10);
+      if (Array.isArray(apRows) && apRows.length > 0) {
+        const liveEmails: CrucialEmailItem[] = apRows.map((e: Record<string, unknown>) => {
+          const loadArr = Array.isArray(e.load_ids) ? e.load_ids : [];
+          const loadId = loadArr[0] ? String(loadArr[0]) : "NEW";
+          const cat = String(e.ap_category || "pod");
           return {
-            id,
-            customer: String(r.customer_name || "Customer"),
-            origin: `${fromCity}, ${fromState}`.replace(/^,\s*/, ""),
-            dest: `${toCity}, ${toState}`.replace(/^,\s*/, ""),
-            stops: [
-              {
-                stopType: "First Pickup",
-                companyName: String(r.customer_name || "Shipper"),
-                streetAddress: "",
-                city: fromCity,
-                state: fromState,
-                zipCode: "00000",
-                country: "USA",
-                contactName: "",
-                phone: "",
-                instructions: "",
-                readyDate: String(r.ship_date || "2026-11-15").slice(0, 10),
-                timeOpen: "08:00",
-                timeClose: "15:00",
-                appointmentRequired: false,
-              },
-              {
-                stopType: "Last Drop",
-                companyName: "Consignee",
-                streetAddress: "",
-                city: toCity,
-                state: toState,
-                zipCode: "00000",
-                country: "USA",
-                contactName: "",
-                phone: "",
-                instructions: "",
-                readyDate: String(r.delivery_date || "2026-11-17").slice(0, 10),
-                timeOpen: "09:00",
-                timeClose: "16:00",
-                appointmentRequired: false,
-              },
-            ],
-            commodities: [
-              {
-                description: "General Freight",
-                packagingType: "Pallet",
-                handlingQuantity: 1,
-                piecesTotal: 1,
-                weightTotal: wt,
-                hazardousMaterial: false,
-                freightClass: "No Class",
-                referenceNumber: String(r.customer_po || ""),
-              },
-            ],
-            accessorials: [],
-            stage: mapTaiStatusToStage(String(r.status || "")),
-            rawStatus: String(r.status || "Committed"),
-            carrier: String(r.carrier_name || ""),
-            mc: "",
-            po: String(r.customer_po || ""),
-            bol: "",
-            pro: "",
-            shipDate: String(r.ship_date || "").slice(5, 10) || "TBD",
-            delivDate: String(r.delivery_date || "").slice(5, 10) || "TBD",
-            equip: String(r.equipment_type || "53 ft Van | Dry"),
-            trailerSize: "Full",
-            mileage: 0,
-            sell: Number(r.sell) || 0,
-            buy: Number(r.buy) || 0,
-            podCount: Number(r.pod_count) || 0,
-            emailPodAvailable: false,
-            rateconStatus: r.carrier_name ? "Sent" : "Not Sent",
-            writebackState: "Synced from Supabase shipments",
-            location: `${fromCity}, ${fromState} → ${toCity}, ${toState}`,
+            id: String(e.id),
+            category: cat === "pod" ? "pod" : "diffs",
+            subject: String(e.subject || "Operations Action Email"),
+            from: String(e.sender_email || ""),
+            received: String(e.received_at || "Recent").slice(0, 16),
+            loadId,
+            diffType: cat === "pod" ? "missing_pod" : cat === "po" ? "missing_po" : "rate_mismatch",
+            diffLabel: cat === "pod" ? "POD Attachment Ready for TAI" : `Extracted ${cat.toUpperCase()} Update`,
+            diffValue: String(e.extracted_po || (e.extracted_amount ? `$${e.extracted_amount}` : "Review")),
+            ctaLabel: cat === "pod" ? "Upload POD & Verify Read-Back" : "Apply Update to Load",
+            body: String(e.snippet || ""),
           };
         });
-        const existingIds = new Set(this.shipments.map((s) => s.id));
-        for (const m of mapped) {
-          if (m.id && !existingIds.has(m.id)) this.shipments.push(m);
-        }
+        this.crucialEmails = [SEEDED_EMAILS[0], ...liveEmails];
       }
-    } catch {
-      // Graceful fallback to live-seeded snapshot
+
+      // 6. Subscribe to Supabase Realtime so webhooks landing on primary-freight-dashboard
+      //    update fivenines-ops live within ~1 second!
+      sb.channel("fivenines-live-sync")
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "shipments" },
+          (payload) => {
+            const row = payload.new as Record<string, unknown> | undefined;
+            const id = String(row?.shipment_id || "");
+            if (!row || !id) return;
+            const idx = this.shipments.findIndex((s) => s.id === id);
+            const updated = mapSupabaseShipmentRow(row, idx >= 0 ? this.shipments[idx] : undefined);
+            if (idx >= 0) this.shipments[idx] = updated;
+            else this.shipments.unshift(updated);
+
+            this.webhookLogs.unshift({
+              id: `rt-${Date.now()}`,
+              timestamp: new Date().toISOString(),
+              type: "SupabaseRealtime",
+              shipmentId: id,
+              summary: `Live Supabase sync: ${updated.rawStatus} · ${updated.carrier || "Unassigned"}`,
+            });
+            broadcastOpsEvent("shipment_updated", { shipmentId: id });
+          },
+        )
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "tai_carrier_assignments" },
+          (payload) => {
+            const row = payload.new as Record<string, unknown> | undefined;
+            const id = String(row?.shipment_id || "");
+            const status = String(row?.status || "");
+            if (!id) return;
+            const target = this.shipments.find((s) => s.id === id);
+            if (target && status === "sent") {
+              const verifiedBuy = Number((row?.response_body as { verifiedBuy?: unknown } | null)?.verifiedBuy);
+              if (row?.carrier_name) target.carrier = String(row.carrier_name);
+              if (Number.isFinite(verifiedBuy) && verifiedBuy > 0) target.buy = verifiedBuy;
+              target.writebackState = `✓ Verified in TAI via Poller Read-Back ($${target.buy.toLocaleString()} Buy)`;
+              broadcastOpsEvent("writeback_verified", { shipmentId: id, status });
+            }
+          },
+        )
+        .subscribe((status) => {
+          this.realtimeSubscribed = status === "SUBSCRIBED";
+        });
+    } catch (err) {
+      console.warn("[store] Supabase hydration fallback:", err instanceof Error ? err.message : err);
     }
   }
 
-  async getBootstrap(): Promise<BootstrapPayload> {
-    await this.syncFromSupabaseIfConfigured();
+  async getBootstrap(user?: BootstrapPayload["user"]): Promise<BootstrapPayload> {
+    await this.initSupabaseSyncAndRealtime();
+    const poller = pollerConfigStatus();
     return {
       mode: {
         safeSandbox: this.isSafeSandbox,
         supabaseConnected: this.isSupabaseConfigured,
+        realtimeSubscribed: this.realtimeSubscribed,
         taiConfigured: this.isTaiConfigured,
+        pollerEnabled: poller.enabled,
+        pollerScope: poller.scope,
       },
+      user: user ?? null,
       kpis: this.kpis,
       shipments: this.shipments,
       crucialEmails: this.crucialEmails,
       facilities: this.facilities,
       carriers: this.carriers,
       customers: this.customers,
-      webhookLogs: this.webhookLogs.slice(0, 20),
+      webhookLogs: this.webhookLogs.slice(0, 25),
     };
   }
 }

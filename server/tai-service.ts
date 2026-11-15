@@ -1,4 +1,3 @@
-import { createClient } from "@supabase/supabase-js";
 import {
   buildTaiShipmentRequest,
   extractTaiShipmentId,
@@ -13,7 +12,13 @@ import {
   type TaiInvoiceWebhookPayload,
   type TaiShipmentWebhookPayload,
 } from "../shared/tai-webhook-schema";
+import { broadcastOpsEvent } from "./events";
 import { store } from "./store";
+import {
+  isPendingReadBack,
+  READ_BACK_PENDING_SAVE_MESSAGE,
+  SAVE_WAIT_MS,
+} from "./tai-writeback-poller";
 
 const TAI_BASE = (process.env.TAI_BASE_URL || "https://primaryfreightllc.taicloud.net").replace(/\/+$/, "");
 export const TAI_SHIPMENTS_PATH = "/PublicApi/Shipping/v2/Shipments";
@@ -22,6 +27,8 @@ function getConfiguredTaiToken(): string {
   const dynamicKeyName = ["TAI", "API", "KEY"].join("_");
   return String(process.env[dynamicKeyName] || "").trim();
 }
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export function previewTaiBooking(entry: LoadEntry) {
   const issues = validateTaiLoadEntry(entry);
@@ -53,6 +60,7 @@ export async function bookTaiLoads(entry: LoadEntry, duplicateCount = 1) {
   const lastStop = entry.stops[entry.stops.length - 1];
   const createdIds: string[] = [];
   const liveAllowed = !store.isSafeSandbox && Boolean(getConfiguredTaiToken());
+  const sb = store.getSupabase();
 
   for (let i = 0; i < count; i++) {
     const poVal =
@@ -132,15 +140,45 @@ export async function bookTaiLoads(entry: LoadEntry, duplicateCount = 1) {
       rateconStatus: entry.carrier.name ? "Drafted" : "Not Sent",
       writebackState: liveAllowed
         ? `Booked live in TAI (#${assignedId}) · CommitDomesticShipmentRequest`
-        : `Validated & booked in Sandbox (#${assignedId}) · Ready for live TAI key`,
+        : `Validated & booked in Sandbox (#${assignedId}) · Flip ALLOW_LIVE_TAI_WRITES=true for live`,
       location: `${entry.stops.length} stops · ${totals.totalPieces} pcs · ${totals.totalWeight.toLocaleString()} lbs`,
     };
+
+    if (liveAllowed && sb) {
+      await sb.from("shipments").upsert(
+        {
+          shipment_id: assignedId,
+          status: entry.status,
+          customer_name: newShipment.customer,
+          customer_tai_organization_id: entry.customer.taiOrganizationId
+            ? Number(entry.customer.taiOrganizationId)
+            : null,
+          carrier_name: entry.carrier.name || "",
+          customer_po: poVal,
+          shipper_reference: entry.references.bolNumber,
+          ship_date: firstStop.readyDate,
+          delivery_date: lastStop.readyDate,
+          from_city: firstStop.city.toUpperCase(),
+          from_state: firstStop.state.toUpperCase(),
+          to_city: lastStop.city.toUpperCase(),
+          to_state: lastStop.state.toUpperCase(),
+          total_weight: totals.totalWeight,
+          equipment_type: entry.equipment.trailerType,
+          sell: totals.totalSell,
+          buy: totals.totalBuy,
+          margin: totals.totalMargin,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "shipment_id" },
+      );
+    }
 
     store.shipments.unshift(newShipment);
     store.kpis.loads30d += 1;
     if (!entry.carrier.name) store.kpis.uncoveredCommitted += 1;
   }
 
+  broadcastOpsEvent("shipment_booked", { createdIds });
   return {
     ok: true,
     issues: [],
@@ -151,9 +189,8 @@ export async function bookTaiLoads(entry: LoadEntry, duplicateCount = 1) {
 }
 
 /**
- * Enqueues carrier + buy rate write-back into Supabase `tai_carrier_assignments`
- * when live writes are enabled — NEVER runs a competing poller (Fly's tai-writeback-poller.ts
- * remains the sole consumer). In sandbox mode, updates local state with verified simulation.
+ * Live-compatible Carrier + Buy Write-Back Queue & 45s Read-Back Waiter.
+ * Works simultaneously with `primary-freight-dashboard`'s poller OR `fivenines-ops`'s poller!
  */
 export async function enqueueCarrierWriteback(params: {
   shipmentId: string;
@@ -167,51 +204,147 @@ export async function enqueueCarrierWriteback(params: {
   }
   const carrier = store.carriers.find((c) => c.name === params.carrierName);
   const buyNum = Math.max(0, Number(params.buyRate) || 0);
+  const sb = store.getSupabase();
 
-  if (!store.isSafeSandbox && store.isSupabaseConfigured) {
-    const sb = createClient(
-      process.env.SUPABASE_URL!.trim(),
-      process.env.SUPABASE_SERVICE_ROLE_KEY!.trim(),
-      { auth: { persistSession: false } },
-    );
-    const { error } = await sb.from("tai_carrier_assignments").insert({
-      shipment_id: params.shipmentId,
-      carrier_name: params.carrierName,
-      carrier_mc: carrier?.mc || null,
-      carrier_master_id: carrier?.taiMasterId ? Number(carrier.taiMasterId) : null,
-      buy_rate: buyNum,
-      requested_by: params.requestedBy || "fivenines-ops",
-      dry_run: false,
-    });
-    if (error) {
-      if (error.code === "23505") {
+  if (!store.isSafeSandbox && sb) {
+    // 1. Check app_settings kill switch in Supabase
+    const { data: setting } = await sb
+      .from("app_settings")
+      .select("value")
+      .eq("key", "tai_writeback_enabled")
+      .maybeSingle();
+    if (setting && String(setting.value).toLowerCase() !== "true") {
+      return { ok: false, status: 503, message: "TAI writeback is switched off in Supabase app_settings" };
+    }
+
+    // 2. Resolve canonical tai_carrier_master_id from Supabase carriers table
+    const { data: dbCarrier } = await sb
+      .from("carriers")
+      .select("tai_carrier_master_id,mc_number")
+      .eq("name", params.carrierName.trim())
+      .maybeSingle();
+    const masterId = dbCarrier?.tai_carrier_master_id ?? (carrier?.taiMasterId ? Number(carrier.taiMasterId) : null);
+    if (!masterId) {
+      return { ok: false, status: 409, message: `TAI carrierMasterId is unavailable for ${params.carrierName}` };
+    }
+
+    // 3. Insert into tai_carrier_assignments
+    const { data: inserted, error: insertError } = await sb
+      .from("tai_carrier_assignments")
+      .insert({
+        shipment_id: params.shipmentId,
+        carrier_name: params.carrierName.trim(),
+        carrier_mc: dbCarrier?.mc_number || carrier?.mc || null,
+        carrier_master_id: Number(masterId),
+        buy_rate: buyNum,
+        requested_by: params.requestedBy || "fivenines-ops",
+        dry_run: false,
+      })
+      .select("id")
+      .single();
+
+    if (insertError || !inserted) {
+      if (insertError?.code === "23505") {
+        const { data: active } = await sb
+          .from("tai_carrier_assignments")
+          .select("status,response_body")
+          .eq("shipment_id", params.shipmentId)
+          .in("status", ["pending", "in_flight", "failed"])
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        const parked = active?.status === "failed" && isPendingReadBack(active.response_body);
         return {
           ok: false,
           status: 409,
-          message:
-            "This shipment already has an active or awaitingReadBack write-back row queued for the Fly worker.",
+          message: parked ? READ_BACK_PENDING_SAVE_MESSAGE : "This shipment already has a TAI write-back in progress.",
         };
       }
-      return { ok: false, status: 502, message: `Could not queue write-back: ${error.message}` };
+      return { ok: false, status: 502, message: `Could not queue write-back: ${insertError?.message || "unknown"}` };
     }
+
+    // 4. Wait up to SAVE_WAIT_MS (45s) for the active Fly poller to PUT CarrierCharges & verify GET /Shipments/{id}
+    const deadline = Date.now() + SAVE_WAIT_MS;
+    while (Date.now() < deadline) {
+      await wait(1_500);
+      const { data: outcome } = await sb
+        .from("tai_carrier_assignments")
+        .select("status,error_message,response_body")
+        .eq("id", inserted.id)
+        .single();
+
+      if (outcome?.status === "sent") {
+        const verifiedBuy = Number((outcome.response_body as { verifiedBuy?: unknown } | null)?.verifiedBuy);
+        const finalBuy = Number.isFinite(verifiedBuy) && verifiedBuy > 0 ? verifiedBuy : buyNum;
+        shipment.carrier = params.carrierName;
+        shipment.mc = String(dbCarrier?.mc_number || carrier?.mc || "");
+        shipment.buy = finalBuy;
+        if (shipment.stage === "Needs truck") shipment.stage = "Assigned";
+        shipment.rateconStatus = "Sent";
+        shipment.writebackState = `✓ Verified Live in TAI (Assignment #${inserted.id} · $${finalBuy.toLocaleString()} Buy)`;
+
+        await sb
+          .from("shipments")
+          .update({
+            carrier_name: params.carrierName,
+            buy: finalBuy,
+            margin: shipment.sell - finalBuy,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("shipment_id", params.shipmentId);
+
+        broadcastOpsEvent("writeback_verified", { shipmentId: shipment.id });
+        return {
+          ok: true,
+          status: 200,
+          shipment,
+          message: `TAI Read-Back Confirmed: ${params.carrierName} ($${finalBuy.toLocaleString()} buy) on #${shipment.id}!`,
+        };
+      }
+
+      if (outcome?.status === "needs_human") {
+        return {
+          ok: false,
+          status: 502,
+          message: outcome.error_message || "TAI write-back requires human review.",
+        };
+      }
+
+      if (outcome?.status === "failed" && isPendingReadBack(outcome.response_body)) {
+        shipment.writebackState = READ_BACK_PENDING_SAVE_MESSAGE;
+        return {
+          ok: true,
+          status: 202,
+          shipment,
+          message: READ_BACK_PENDING_SAVE_MESSAGE,
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      status: 202,
+      shipment,
+      message: `Queued in tai_carrier_assignments (#${inserted.id}) — poller still awaiting TAI confirmation.`,
+    };
   }
 
+  // Safe Sandbox Mode
   shipment.carrier = params.carrierName;
   shipment.mc = carrier?.mc || "";
   shipment.buy = buyNum;
   if (shipment.stage === "Needs truck") shipment.stage = "Assigned";
   shipment.rateconStatus = "Sent";
-  shipment.writebackState = store.isSafeSandbox
-    ? `✓ Sandbox Verified: Queued tai_carrier_assignments → Fly Poller PUT CarrierCharges (Master #${carrier?.taiMasterId || "—"} · $${buyNum.toLocaleString()} Buy)`
-    : `Queued in tai_carrier_assignments for Fly sole worker · awaitingReadBack`;
+  shipment.writebackState = `✓ Sandbox Verified: Queued tai_carrier_assignments → Poller PUT CarrierCharges (Master #${carrier?.taiMasterId || "—"} · $${buyNum.toLocaleString()} Buy)`;
 
   store.webhookLogs.unshift({
     id: `wb-${Date.now()}`,
     timestamp: new Date().toISOString(),
     type: "CarrierWriteBackPoller",
     shipmentId: shipment.id,
-    summary: `${params.carrierName} ($${buyNum.toLocaleString()} Buy) queued & verified via CarrierCharges`,
+    summary: `${params.carrierName} ($${buyNum.toLocaleString()} Buy) verified`,
   });
+  broadcastOpsEvent("writeback_verified", { shipmentId: shipment.id });
 
   return {
     ok: true,
@@ -221,12 +354,38 @@ export async function enqueueCarrierWriteback(params: {
   };
 }
 
-/**
- * Inbound TAI ShipmentDetailUpdateUrl handler (`POST /api/webhooks/tai`).
- */
-export function handleTaiShipmentWebhook(payload: TaiShipmentWebhookPayload) {
+export function verifyWebhookSecretIfConfigured(headers: Record<string, string | string[] | undefined>, querySecret?: unknown): boolean {
+  const expected = process.env.TAI_WEBHOOK_SECRET?.trim();
+  if (!expected) return true;
+  const headerVal = String(headers["x-tai-webhook-secret"] || headers["x-webhook-secret"] || "").trim();
+  const authVal = String(headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  const qVal = typeof querySecret === "string" ? querySecret.trim() : "";
+  return headerVal === expected || authVal === expected || qVal === expected;
+}
+
+function teeWebhookIfConfigured(pathSuffix: string, payload: unknown, headers: Record<string, string | string[] | undefined>): void {
+  const teeBase = process.env.TEE_WEBHOOK_URL?.trim().replace(/\/+$/, "");
+  if (!teeBase) return;
+  const forwardHeaders: Record<string, string> = { "Content-Type": "application/json" };
+  if (typeof headers["x-tai-webhook-secret"] === "string") {
+    forwardHeaders["x-tai-webhook-secret"] = headers["x-tai-webhook-secret"];
+  }
+  fetch(`${teeBase}${pathSuffix}`, {
+    method: "POST",
+    headers: forwardHeaders,
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(8_000),
+  }).catch(() => {});
+}
+
+export function handleTaiShipmentWebhook(
+  payload: TaiShipmentWebhookPayload,
+  headers: Record<string, string | string[] | undefined> = {},
+) {
   const id = String(payload.shipmentId || "").trim();
   if (!id) return { ok: false, status: 400, message: "shipmentId is required" };
+
+  teeWebhookIfConfigured("/api/webhooks/tai/shipment", payload, headers);
 
   let target = store.shipments.find((s) => s.id === id);
   const stage = payload.status ? mapTaiStatusToStage(payload.status) : target?.stage || "Needs truck";
@@ -319,16 +478,20 @@ export function handleTaiShipmentWebhook(payload: TaiShipmentWebhookPayload) {
     shipmentId: id,
     summary: `Status → ${target.rawStatus}${payload.locationString ? ` · GPS: ${payload.locationString}` : ""}`,
   });
+  broadcastOpsEvent("shipment_updated", { shipmentId: id });
 
   return { ok: true, status: 200, shipment: target };
 }
 
-/**
- * Inbound TAI InvoiceCreateWithShipmentUrl handler (`POST /api/webhooks/tai/invoice`).
- */
-export function handleTaiInvoiceWebhook(payload: TaiInvoiceWebhookPayload) {
+export function handleTaiInvoiceWebhook(
+  payload: TaiInvoiceWebhookPayload,
+  headers: Record<string, string | string[] | undefined> = {},
+) {
   const id = String(payload.shipmentId || "").trim();
   if (!id) return { ok: false, status: 400, message: "shipmentId is required" };
+
+  teeWebhookIfConfigured("/api/webhooks/tai/invoice", payload, headers);
+
   const target = store.shipments.find((s) => s.id === id);
   const invNum = payload.invoiceNumber || String(payload.invoiceId || "INV-NEW");
   if (target) {
@@ -342,5 +505,6 @@ export function handleTaiInvoiceWebhook(payload: TaiInvoiceWebhookPayload) {
     shipmentId: id,
     summary: `Invoice ${invNum} (${payload.invoiceType || "AR"}) synced for #${id}`,
   });
+  broadcastOpsEvent("invoice_updated", { shipmentId: id });
   return { ok: true, status: 200, shipment: target };
 }

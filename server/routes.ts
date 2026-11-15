@@ -1,4 +1,5 @@
-import type { Express } from "express";
+import type { Express, Request, Response } from "express";
+import { addSseClient } from "./events";
 import { store } from "./store";
 import {
   bookTaiLoads,
@@ -6,39 +7,51 @@ import {
   handleTaiInvoiceWebhook,
   handleTaiShipmentWebhook,
   previewTaiBooking,
+  verifyWebhookSecretIfConfigured,
 } from "./tai-service";
 import type { LoadEntry } from "../shared/load-entry";
 
 export function registerApiRoutes(app: Express): void {
-  app.get("/api/bootstrap", async (_req, res) => {
-    const data = await store.getBootstrap();
+  // Fly.io unauthenticated liveness endpoint
+  app.get("/healthz", (_req: Request, res: Response) => {
+    res.status(200).json({ ok: true, service: "fivenines-ops", ts: new Date().toISOString() });
+  });
+
+  // Server-Sent Events stream for instant Supabase Realtime & TAI Webhook updates
+  app.get("/api/events", (_req: Request, res: Response) => {
+    addSseClient(res);
+  });
+
+  app.get("/api/bootstrap", async (req: Request, res: Response) => {
+    const data = await store.getBootstrap(req.staffUser || null);
     res.json(data);
   });
 
-  app.post("/api/loads/preview", (req, res) => {
+  app.post("/api/loads/preview", (req: Request, res: Response) => {
     const entry = req.body?.entry as LoadEntry;
     const result = previewTaiBooking(entry);
     res.json(result);
   });
 
-  app.post("/api/loads/book", async (req, res) => {
+  app.post("/api/loads/book", async (req: Request, res: Response) => {
     const entry = req.body?.entry as LoadEntry;
     const duplicateCount = Number(req.body?.duplicateCount) || 1;
     const result = await bookTaiLoads(entry, duplicateCount);
     res.status(result.ok ? 200 : 422).json(result);
   });
 
-  app.post("/api/loads/:id/writeback-carrier", async (req, res) => {
+  app.post("/api/loads/:id/writeback-carrier", async (req: Request, res: Response) => {
+    const actor = req.staffUser?.email ? `fivenines-ops:${req.staffUser.email}` : "fivenines-ops";
     const result = await enqueueCarrierWriteback({
-      shipmentId: req.params.id,
+      shipmentId: String(req.params.id),
       carrierName: String(req.body?.carrierName || ""),
       buyRate: Number(req.body?.buyRate) || 0,
-      requestedBy: "fivenines-ops",
+      requestedBy: actor,
     });
     res.status(result.status).json(result);
   });
 
-  app.post("/api/loads/:id/pod", (req, res) => {
+  app.post("/api/loads/:id/pod", (req: Request, res: Response) => {
     const s = store.shipments.find((x) => x.id === req.params.id);
     if (!s) {
       res.status(404).json({ ok: false, message: "Shipment not found" });
@@ -50,7 +63,7 @@ export function registerApiRoutes(app: Express): void {
     res.json({ ok: true, shipment: s, message: `POD uploaded & read-back verified on #${s.id}` });
   });
 
-  app.post("/api/loads/:id/sell", (req, res) => {
+  app.post("/api/loads/:id/sell", (req: Request, res: Response) => {
     const s = store.shipments.find((x) => x.id === req.params.id);
     if (!s) {
       res.status(404).json({ ok: false, message: "Shipment not found" });
@@ -64,7 +77,7 @@ export function registerApiRoutes(app: Express): void {
     res.json({ ok: true, shipment: s, message: `Updated #${s.id} sell to $${newSell.toLocaleString()}` });
   });
 
-  app.post("/api/inbox/:id/apply", (req, res) => {
+  app.post("/api/inbox/:id/apply", (req: Request, res: Response) => {
     const item = store.crucialEmails.find((e) => e.id === req.params.id);
     if (!item) {
       res.status(404).json({ ok: false, message: "Action email not found" });
@@ -106,7 +119,7 @@ export function registerApiRoutes(app: Express): void {
     res.json({ ok: true, action: "extract_tender", message: "Extracted tender into Compact Load Builder" });
   });
 
-  app.post("/api/assistant/ask", (req, res) => {
+  app.post("/api/assistant/ask", (req: Request, res: Response) => {
     const q = String(req.body?.question || "").trim();
     const ql = q.toLowerCase();
     let answer = "";
@@ -115,8 +128,7 @@ export function registerApiRoutes(app: Express): void {
       answer =
         "Top historical PA → GA Flatbed runners in TAI: (1) EVANS DELIVERY COMPANY INC (MC 117950 · 12 pickups, avg $2,350 buy), (2) AESJS INCORPORATED (MC 884120 · avg $2,400 buy), (3) FOX CARRIERS (MC 994210). All carry active cargo insurance.";
     } else if (ql.includes("webhook") || ql.includes("write") || ql.includes("poller") || ql.includes("tai")) {
-      answer =
-        "TAI Sync Pipeline: Inbound `/api/webhooks/tai` (ShipmentDetailUpdateUrl) and `/api/webhooks/tai/invoice` (InvoiceCreateWithShipmentUrl) are active. Outbound bookings send `CommitDomesticShipmentRequest` (optional `customerId`, mandatory Origin/Dest ZIPs + Commodity Weight/Pieces/Description). Carrier + Buy writes enqueue to `tai_carrier_assignments` for Fly's sole poller with read-back verification.";
+      answer = `TAI Live Sync: Supabase ${store.isSupabaseConfigured ? "Connected" : "Seeded"}, Realtime ${store.realtimeSubscribed ? "Subscribed" : "Standby"}. Inbound webhooks (/api/webhooks/tai/shipment & /api/webhooks/tai/invoice) active. Carrier/Buy writes enqueue to tai_carrier_assignments and wait up to 45s for verified TAI GET /Shipments/{id} read-back.`;
     } else {
       const matchedLoad = store.shipments.find((s) => ql.includes(s.id));
       if (matchedLoad) {
@@ -129,19 +141,28 @@ export function registerApiRoutes(app: Express): void {
     res.json({ ok: true, answer });
   });
 
-  // Canonical TAI Inbound Webhooks
-  app.post("/api/webhooks/tai", (req, res) => {
-    const result = handleTaiShipmentWebhook(req.body || {});
+  // Canonical TAI Inbound Webhooks (both /shipment and root alias supported)
+  const shipmentWebhookHandler = (req: Request, res: Response) => {
+    if (!verifyWebhookSecretIfConfigured(req.headers, req.query.secret)) {
+      res.status(401).json({ ok: false, message: "Invalid TAI webhook secret" });
+      return;
+    }
+    const result = handleTaiShipmentWebhook(req.body || {}, req.headers);
+    res.status(result.status).json(result);
+  };
+  app.post("/api/webhooks/tai", shipmentWebhookHandler);
+  app.post("/api/webhooks/tai/shipment", shipmentWebhookHandler);
+
+  app.post("/api/webhooks/tai/invoice", (req: Request, res: Response) => {
+    if (!verifyWebhookSecretIfConfigured(req.headers, req.query.secret)) {
+      res.status(401).json({ ok: false, message: "Invalid TAI webhook secret" });
+      return;
+    }
+    const result = handleTaiInvoiceWebhook(req.body || {}, req.headers);
     res.status(result.status).json(result);
   });
 
-  app.post("/api/webhooks/tai/invoice", (req, res) => {
-    const result = handleTaiInvoiceWebhook(req.body || {});
-    res.status(result.status).json(result);
-  });
-
-  // 1-Click Webhook Simulator for interactive testing
-  app.post("/api/webhooks/tai/simulate", (req, res) => {
+  app.post("/api/webhooks/tai/simulate", (req: Request, res: Response) => {
     const kind = String(req.body?.kind || "gps");
     if (kind === "invoice") {
       const target = store.shipments[0];

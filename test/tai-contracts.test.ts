@@ -6,13 +6,19 @@ import {
   validateTaiLoadEntry,
   type LoadEntry,
 } from "../shared/load-entry";
-import { handleTaiInvoiceWebhook, handleTaiShipmentWebhook } from "../server/tai-service";
+import { isStaffGoogleIdentity } from "../shared/staff-domains";
+import {
+  handleTaiInvoiceWebhook,
+  handleTaiShipmentWebhook,
+  verifyWebhookSecretIfConfigured,
+} from "../server/tai-service";
+import { isPendingReadBack } from "../server/tai-writeback-poller";
 
 function makeSampleEntry(): LoadEntry {
   return {
     shipmentType: "Truckload",
     status: "Committed",
-    customer: { name: "Larkin Refractory", taiOrganizationId: "" }, // Unlinked customer!
+    customer: { name: "Larkin Refractory", taiOrganizationId: "" },
     references: {
       customerPO: "42705",
       bolNumber: "42705",
@@ -143,4 +149,24 @@ test("inbound TAI ShipmentDetailUpdateUrl & InvoiceCreateWithShipmentUrl webhook
   });
   assert.equal(inv.ok, true);
   assert.match(String(inv.shipment?.invoiceStatus), /INV-99401/);
+});
+
+test("staff Google Workspace domain gate allows primarycompanies.com & shipfivenines.com only", () => {
+  assert.equal(isStaffGoogleIdentity("chriss@primarycompanies.com", "primarycompanies.com"), true);
+  assert.equal(isStaffGoogleIdentity("ops@shipfivenines.com", "shipfivenines.com"), true);
+  assert.equal(isStaffGoogleIdentity("stranger@gmail.com", "gmail.com"), false);
+  assert.equal(isStaffGoogleIdentity("chriss@primarycompanies.com", "evil.com"), false);
+});
+
+test("pending read-back marker is detected so parked rows are re-read without re-sending PUT", () => {
+  const marker = isPendingReadBack({
+    awaitingReadBack: true,
+    writeSentAt: "2026-11-15T18:00:00.000Z",
+    readBackRounds: 2,
+    writeResponse: { ok: true },
+  });
+  assert.ok(marker);
+  assert.equal(marker.readBackRounds, 2);
+  assert.equal(isPendingReadBack({ ok: true }), null);
+  assert.equal(verifyWebhookSecretIfConfigured({}), true);
 });

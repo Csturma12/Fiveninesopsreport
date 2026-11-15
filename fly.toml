@@ -1,0 +1,47 @@
+# Fly.io configuration for Five Nines Operations Platform & Compact Gmail Toolkit (v2)
+#
+# First-time setup (creates a brand-new Fly app without touching primary-freight-dashboard):
+#   1. flyctl apps create fivenines-ops
+#   2. flyctl secrets set -a fivenines-ops \
+#        SUPABASE_URL="https://nonqwidfqrklksjluloz.supabase.co" \
+#        SUPABASE_SERVICE_ROLE_KEY="..." \
+#        GOOGLE_CLIENT_ID="..." \
+#        GOOGLE_CLIENT_SECRET="..." \
+#        SESSION_SECRET="..." \
+#        ALLOW_LIVE_TAI_WRITES="true" \
+#        TAI_WRITEBACK_POLLER_ENABLED="false"
+#      (Also pass your TAI credential secret; keep TAI_WRITEBACK_POLLER_ENABLED="false"
+#       while primary-freight-dashboard is running so both apps share the single active
+#       poller on tai_carrier_assignments, or set TAI_WRITEBACK_POLLER_ENABLED="true"
+#       and TAI_WRITEBACK_POLLER_SCOPE="own" to process only fivenines-ops writes!)
+#   3. flyctl deploy -a fivenines-ops
+
+app = "fivenines-ops"
+primary_region = "dfw"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  APP_BASE_URL = "https://fivenines-ops.fly.dev"
+  GMAIL_FREIGHT_TOOLKIT_OAUTH_CLIENT_IDS = "1093823548746-u96k7b3qro0a2vs6g5m1b9hfbn3441be.apps.googleusercontent.com,413556084944-jp47ckqu854t3cpccu318eqmn8c5ck50.apps.googleusercontent.com"
+  TAI_WRITEBACK_POLLER_ENABLED = "false"
+  TAI_WRITEBACK_POLLER_SCOPE = "own"
+
+[http_service]
+  internal_port = 5000
+  force_https = true
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory_mb = 512

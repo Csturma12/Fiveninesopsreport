@@ -100,7 +100,7 @@ export interface OpsKpis {
 export interface WebhookEventLog {
   id: string;
   timestamp: string;
-  type: "ShipmentDetailUpdateUrl" | "InvoiceCreateWithShipmentUrl" | "CarrierWriteBackPoller";
+  type: "ShipmentDetailUpdateUrl" | "InvoiceCreateWithShipmentUrl" | "CarrierWriteBackPoller" | "SupabaseRealtime";
   shipmentId: string;
   summary: string;
 }
@@ -109,8 +109,16 @@ export interface BootstrapPayload {
   mode: {
     safeSandbox: boolean;
     supabaseConnected: boolean;
+    realtimeSubscribed: boolean;
     taiConfigured: boolean;
+    pollerEnabled: boolean;
+    pollerScope: string;
   };
+  user?: {
+    email: string;
+    name: string;
+    mode: string;
+  } | null;
   kpis: OpsKpis;
   shipments: OpsShipment[];
   crucialEmails: CrucialEmailItem[];
@@ -120,9 +128,6 @@ export interface BootstrapPayload {
   webhookLogs: WebhookEventLog[];
 }
 
-/**
- * Inbound TAI ShipmentDetailUpdateUrl payload (supports both camelCase & PascalCase variants).
- */
 export interface TaiShipmentWebhookPayload {
   shipmentId: number | string;
   status?: string;

@@ -116,6 +116,7 @@ export const App: React.FC = () => {
   const [inboxFilter, setInboxFilter] = useState<string>("all");
   const [toast, setToast] = useState<string | null>(null);
   const [builderEntry, setBuilderEntry] = useState<LoadEntry>(() => createDefaultBuilderEntry());
+  const [authGateUrl, setAuthGateUrl] = useState<string | null>(null);
   const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; text: string }>>([
     {
       role: "assistant",
@@ -129,7 +130,13 @@ export const App: React.FC = () => {
   }, []);
 
   const refreshBootstrap = useCallback(async () => {
-    const res = await fetch("/api/bootstrap");
+    const res = await fetch("/api/bootstrap", { credentials: "include" });
+    if (res.status === 401) {
+      const errJson = (await res.json().catch(() => ({}))) as { loginUrl?: string };
+      setAuthGateUrl(errJson.loginUrl || `/auth/google?returnTo=${encodeURIComponent(window.location.pathname)}`);
+      return;
+    }
+    setAuthGateUrl(null);
     const json = (await res.json()) as BootstrapPayload;
     setData(json);
   }, []);
@@ -137,6 +144,20 @@ export const App: React.FC = () => {
   useEffect(() => {
     refreshBootstrap();
   }, [refreshBootstrap]);
+
+  // Live SSE listener for Supabase Realtime & Inbound TAI Webhooks
+  useEffect(() => {
+    if (authGateUrl) return;
+    const es = new EventSource("/api/events");
+    const onLiveUpdate = () => {
+      refreshBootstrap().catch(() => {});
+    };
+    es.addEventListener("shipment_updated", onLiveUpdate);
+    es.addEventListener("shipment_booked", onLiveUpdate);
+    es.addEventListener("writeback_verified", onLiveUpdate);
+    es.addEventListener("invoice_updated", onLiveUpdate);
+    return () => es.close();
+  }, [authGateUrl, refreshBootstrap]);
 
   const extractMultiStopTender = useCallback(() => {
     setBuilderEntry({
@@ -274,6 +295,36 @@ export const App: React.FC = () => {
     await refreshBootstrap();
   };
 
+  if (authGateUrl) {
+    return (
+      <div data-theme={theme} className="pf-app min-h-screen flex flex-col items-center justify-center p-6">
+        <div
+          className="max-w-sm w-full p-6 rounded-2xl space-y-4 text-center"
+          style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+        >
+          <div className="pf-brand-rule rounded overflow-hidden">
+            <div style={{ background: "#1D2C5E" }} />
+            <div style={{ background: "#682C87" }} />
+            <div style={{ background: "#D52A3B" }} />
+            <div style={{ background: "#F0641E" }} />
+            <div style={{ background: "#F5B841" }} />
+          </div>
+          <div className="font-serif font-bold text-lg">Five Nines Operations</div>
+          <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
+            Sign in with your verified <code>@primarycompanies.com</code> or <code>@shipfivenines.com</code> Google Workspace account to access live shipments and TAI write-back.
+          </p>
+          <a
+            href={authGateUrl}
+            className="block w-full py-2.5 px-4 rounded-lg text-xs font-bold"
+            style={{ background: "var(--pf-action)", color: "#ffffff" }}
+          >
+            Sign in with Google Workspace
+          </a>
+        </div>
+      </div>
+    );
+  }
+
   if (!data) {
     return (
       <div data-theme={theme} className="pf-app min-h-screen flex items-center justify-center text-sm font-mono">
@@ -399,24 +450,24 @@ export const App: React.FC = () => {
 
             <div className="pt-3 space-y-1.5 text-xs" style={{ borderTop: "1px solid rgba(255,255,255,0.08)" }}>
               <div className="px-2 text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#8e97a3" }}>
-                TAI Pipeline Health
+                Live Sync &amp; Poller
               </div>
               <div className="px-2 flex justify-between" style={{ color: "#cbd5e1" }}>
-                <span>Shipment Webhook</span>
-                <span className="font-mono text-[11px]" style={{ color: "#3ebf82" }}>
-                  ● Armed
+                <span>Supabase DB</span>
+                <span className="font-mono text-[11px]" style={{ color: data.mode.supabaseConnected ? "#3ebf82" : "#d4a04a" }}>
+                  ● {data.mode.supabaseConnected ? "Live" : "Seeded"}
                 </span>
               </div>
               <div className="px-2 flex justify-between" style={{ color: "#cbd5e1" }}>
-                <span>Invoice Webhook</span>
-                <span className="font-mono text-[11px]" style={{ color: "#3ebf82" }}>
-                  ● Armed
+                <span>Realtime Stream</span>
+                <span className="font-mono text-[11px]" style={{ color: data.mode.realtimeSubscribed ? "#3ebf82" : "#8e97a3" }}>
+                  ● {data.mode.realtimeSubscribed ? "Active" : "SSE Ready"}
                 </span>
               </div>
               <div className="px-2 flex justify-between" style={{ color: "#cbd5e1" }}>
-                <span>Fly Poller Queue</span>
+                <span>Write-Back Poller</span>
                 <span className="font-mono text-[11px]" style={{ color: "#3ebf82" }}>
-                  ● Sole Worker
+                  ● {data.mode.pollerEnabled ? `Local (${data.mode.pollerScope})` : "Shared Queue"}
                 </span>
               </div>
             </div>
@@ -426,9 +477,12 @@ export const App: React.FC = () => {
             className="p-2.5 rounded-lg text-[11px] space-y-1"
             style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.09)" }}
           >
+            <div className="truncate font-mono text-[10px]" style={{ color: "#3ebf82" }}>
+              {data.user?.email || "chriss@primarycompanies.com"}
+            </div>
             <div className="flex justify-between font-mono">
               <span className="text-white">{data.kpis.totalShipments.toLocaleString()} loads</span>
-              <span style={{ color: "#3ebf82" }}>{data.kpis.customersCount} cust</span>
+              <span style={{ color: "#8e97a3" }}>{data.kpis.customersCount} cust</span>
             </div>
             <div style={{ color: "#8e97a3" }}>
               30d Net: <strong className="text-white font-mono">${(data.kpis.rev30d - data.kpis.buy30d).toLocaleString()}</strong>
