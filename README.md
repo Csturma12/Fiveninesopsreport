@@ -1,2 +1,10 @@
 # Fiveninesopsreport
-Secure Five Nines operations shipment reporting and TAI-backed read-only data access
+Design & Architecture Review (Dashboard First → Toolkit Second): design_review_dashboard_and_toolkit.md
+Interactive Live-Data Demo Panel: primary_freight_redesign_demo.html — seeded with a read-only snapshot from production Supabase (12,466 shipments, 380 uncovered committed, 66 Gmail POD gaps, 78 TMS rate alerts, 342 customers, 5,003 carriers). It opens directly on 1. Dashboard Redesign, lets you dock or switch to 2. Gmail Toolkit Review & Simulator, toggle Paper Dark (#0F1217) vs. Primary Light (#F4F6FA), click through real Gmail threads, assign carriers, attach PODs, and test Fill from email with live margin math.
+Key Decisions to Align On First (Dashboard Foundation)
+Sidebar & Workspace Consolidation: Do you want to collapse the current 25+ sidebar routes in freight-dashboard into the 5 primary workspaces shown in the demo (Command & Attention, Unified Dispatch merging /worklist + /dispatch, Load & Doc Studio, POD & AP Billing, and Finance & Network)?
+Visual Direction: Do you prefer Paper Dark (#0F1217 slate + #3EBF82 emerald) as the default operational theme (keeping the 5-stroke Primary Freight rule + #F0641E action orange for brand continuity), Primary Light (#F4F6FA + #16234B Navy) as default, or both via the theme toggle?
+Shared Component Host for the Toolkit: Since the Gmail extension already loads its frame from the Dashboard server, should we build the Toolkit views directly as 400–440px responsive routes of the redesigned React Dashboard (retiring the separate vanilla DOM UI in gmail-freight-toolkit/extension/panel.js)?
+Inline controls above: Switch between 1. Dashboard Redesign (Command & Attention, Unified Dispatch, Load & Doc Studio, POD & Billing), 2. Gmail Toolkit (Unified), and 3. Paper Dark Tiles, or toggle Dark / Light and test the sandbox actions (Revise DO Sell, Assign Fox Carriers, Apply PO to TAI, Attach POD).
+Full-size app: Open in the Browser pane (http://127.0.0.1:5088/primary_freight_redesign_demo.html
+) or directly from primary_freight_redesign_demo.html to try the slide-over load drawer, Gmail inbox thread switcher, and live AI Assistant lookup.
