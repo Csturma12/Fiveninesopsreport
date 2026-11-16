@@ -13,6 +13,7 @@ import {
   verifyWebhookSecretIfConfigured,
 } from "../server/tai-service";
 import { isPendingReadBack } from "../server/tai-writeback-poller";
+import { store } from "../server/store";
 import {
   buildGmailContainerSearchUrl,
   extractContainerNumbers,
@@ -200,4 +201,30 @@ test("container extractor correlates CAAU724710-0 / CAAU7247100 and synthesizes 
   assert.equal(synth.hasEquipmentIssue, true);
   assert.match(String(synth.note), /TONU PAID/i);
   assert.match(String(synth.note), /forklift/i);
+});
+
+test("SalesOps CRM CRUD and inbox/shipment delete operations persist cleanly on store", () => {
+  const created = store.addCrmLead({
+    company: "Test Foundry LLC",
+    contact: "Alex Ops",
+    email: "alex@testfoundry.com",
+    location: "Birmingham, AL",
+    source: "Manual",
+    evidence: "Flatbed lanes",
+  });
+  assert.equal(created.duplicate, false);
+  assert.ok(store.crmLeads.some((l) => l.id === created.lead.id));
+
+  const updated = store.updateCrmLead(created.lead.id, { status: "Converted" });
+  assert.equal(updated?.status, "Converted");
+  assert.ok(store.customers.some((c) => c.name === "TEST FOUNDRY LLC"));
+
+  assert.equal(store.deleteCrmLead(created.lead.id), true);
+  assert.equal(store.crmLeads.some((l) => l.id === created.lead.id), false);
+
+  const firstEmailId = store.crucialEmails[0]?.id;
+  if (firstEmailId) {
+    assert.equal(store.dismissEmail(firstEmailId), true);
+    assert.equal(store.dismissedEmailIds.has(firstEmailId), true);
+  }
 });

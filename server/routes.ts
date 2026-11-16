@@ -148,6 +148,159 @@ export function registerApiRoutes(app: Express): void {
     });
   });
 
+  app.delete("/api/loads/:id", (req: Request, res: Response) => {
+    const id = String(req.params.id || "").trim();
+    const removed = store.deleteShipment(id);
+    if (!removed) {
+      res.status(404).json({ ok: false, message: `Load #${id} not found` });
+      return;
+    }
+    broadcastOpsEvent("shipment_updated", { deletedId: id });
+    res.json({ ok: true, id, message: `Deleted load #${id}` });
+  });
+
+  app.delete("/api/inbox/:id", (req: Request, res: Response) => {
+    const id = String(req.params.id || "").trim();
+    const removed = store.dismissEmail(id);
+    if (!removed) {
+      res.status(404).json({ ok: false, message: "Email tile not found" });
+      return;
+    }
+    broadcastOpsEvent("shipment_updated", { dismissedEmailId: id });
+    res.json({ ok: true, id, message: "Deleted email tile from Crucial Inbox" });
+  });
+
+  // ============================================================================
+  // SALESOPS CRM ROUTES
+  // ============================================================================
+  const pushLeadWebhook = async (lead: ReturnType<typeof store.addCrmLead>["lead"]) => {
+    const secret = process.env.CRM_WEBHOOK_SECRET?.trim();
+    if (!secret) {
+      store.updateCrmLead(lead.id, { pushedToVercelCrm: true });
+      return { pushedRemote: false, status: 200 };
+    }
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${secret}`,
+    };
+    const bypass = process.env.CRM_VERCEL_BYPASS_SECRET?.trim();
+    if (bypass) headers["x-vercel-protection-bypass"] = bypass;
+
+    const resp = await fetch(store.getCrmWebhookUrl(), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        company_name: lead.company,
+        contact_name: lead.contact || undefined,
+        email: lead.email || undefined,
+        phone: lead.phone || undefined,
+        address: lead.location || undefined,
+        notes: [lead.evidence, lead.estimatedLanes].filter(Boolean).join(" · ") || "Added from Five Nines Ops",
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (resp.ok) {
+      store.updateCrmLead(lead.id, { pushedToVercelCrm: true });
+    }
+    return { pushedRemote: resp.ok, status: resp.status };
+  };
+
+  app.post("/api/crm/leads", async (req: Request, res: Response) => {
+    const rawList = Array.isArray(req.body?.leads) ? req.body.leads : [req.body];
+    let added = 0;
+    let duplicates = 0;
+    let lastLead = null;
+
+    for (const item of rawList) {
+      if (!item || !String(item.company || "").trim()) continue;
+      const result = store.addCrmLead({
+        company: String(item.company || ""),
+        contact: item.contact,
+        email: item.email,
+        phone: item.phone,
+        location: item.location,
+        source: item.source,
+        sourceUrl: item.sourceUrl,
+        status: item.status,
+        owner: item.owner || req.staffUser?.name || "Chris Sturma",
+        followUp: item.followUp,
+        evidence: item.evidence,
+        estimatedLanes: item.estimatedLanes,
+      });
+      lastLead = result.lead;
+      if (result.duplicate) {
+        duplicates++;
+      } else {
+        added++;
+        if (process.env.CRM_WEBHOOK_SECRET?.trim()) {
+          pushLeadWebhook(result.lead).catch(() => {});
+        }
+      }
+    }
+
+    if (!lastLead) {
+      res.status(400).json({ ok: false, message: "Company name is required" });
+      return;
+    }
+
+    broadcastOpsEvent("crm_updated", { added });
+    res.json({
+      ok: true,
+      lead: lastLead,
+      leads: store.crmLeads,
+      added,
+      duplicates,
+      message: rawList.length > 1
+        ? `Imported ${added} lead(s) (${duplicates} duplicate skipped).`
+        : `Added ${lastLead.company} to SalesOps CRM.`,
+    });
+  });
+
+  app.patch("/api/crm/leads/:id", (req: Request, res: Response) => {
+    const updated = store.updateCrmLead(String(req.params.id), req.body || {});
+    if (!updated) {
+      res.status(404).json({ ok: false, message: "Lead not found" });
+      return;
+    }
+    broadcastOpsEvent("crm_updated", { id: updated.id });
+    res.json({ ok: true, lead: updated, message: `Updated ${updated.company} (${updated.status}).` });
+  });
+
+  app.delete("/api/crm/leads/:id", (req: Request, res: Response) => {
+    const id = String(req.params.id || "").trim();
+    const removed = store.deleteCrmLead(id);
+    if (!removed) {
+      res.status(404).json({ ok: false, message: "Lead not found" });
+      return;
+    }
+    broadcastOpsEvent("crm_updated", { deletedId: id });
+    res.json({ ok: true, id, message: "Deleted lead from SalesOps CRM." });
+  });
+
+  app.post("/api/crm/leads/:id/push", async (req: Request, res: Response) => {
+    const lead = store.crmLeads.find((l) => l.id === req.params.id);
+    if (!lead) {
+      res.status(404).json({ ok: false, message: "Lead not found" });
+      return;
+    }
+    try {
+      const outcome = await pushLeadWebhook(lead);
+      broadcastOpsEvent("crm_updated", { id: lead.id });
+      res.json({
+        ok: true,
+        lead: store.crmLeads.find((l) => l.id === lead.id),
+        message: outcome.pushedRemote
+          ? `Pushed ${lead.company} live to SalesOps Vercel CRM!`
+          : `Marked ${lead.company} synced locally (set CRM_WEBHOOK_SECRET on Fly for remote Vercel webhook push).`,
+      });
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        message: `SalesOps webhook push failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  });
+
   app.post("/api/inbox/:id/apply", (req: Request, res: Response) => {
     const item = store.crucialEmails.find((e) => e.id === req.params.id);
     if (!item) {

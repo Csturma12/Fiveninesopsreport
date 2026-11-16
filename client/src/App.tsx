@@ -1,16 +1,18 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { useLocation } from "wouter";
 import type { LoadEntry } from "@shared/load-entry";
-import type { BootstrapPayload, CrucialEmailItem, OpsShipment } from "@shared/tai-webhook-schema";
+import type { BootstrapPayload, CrmLeadItem, CrucialEmailItem, OpsShipment } from "@shared/tai-webhook-schema";
 import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
 import { CompactLoadBuilder } from "./components/CompactLoadBuilder";
 import { UnifiedDispatchView } from "./components/UnifiedDispatchView";
 import { GmailToolkitPanel } from "./components/GmailToolkitPanel";
+import { SalesOpsCrmView } from "./components/SalesOpsCrmView";
 import {
   Activity,
   Bot,
   ExternalLink,
   FileCheck2,
+  Handshake,
   Inbox,
   Layers,
   Mail,
@@ -21,6 +23,8 @@ import {
   Search,
   Send,
   Sun,
+  Trash2,
+  UserPlus,
   X,
   Zap,
 } from "lucide-react";
@@ -164,6 +168,7 @@ export const App: React.FC = () => {
     es.addEventListener("shipment_booked", onLiveUpdate);
     es.addEventListener("writeback_verified", onLiveUpdate);
     es.addEventListener("invoice_updated", onLiveUpdate);
+    es.addEventListener("crm_updated", onLiveUpdate);
     return () => es.close();
   }, [authGateUrl, refreshBootstrap]);
 
@@ -282,6 +287,102 @@ export const App: React.FC = () => {
     setPasteEmailDraft("");
     await refreshBootstrap();
   };
+
+  const handleDeleteInboxItem = async (emailId: string) => {
+    const res = await fetch(`/api/inbox/${encodeURIComponent(emailId)}`, { method: "DELETE" });
+    const out = await res.json();
+    if (reviewEmail?.id === emailId) setReviewEmail(null);
+    showToast(out.message || "Deleted email tile");
+    await refreshBootstrap();
+  };
+
+  const handleDeleteLoad = async (shipmentId: string) => {
+    const res = await fetch(`/api/loads/${encodeURIComponent(shipmentId)}`, { method: "DELETE" });
+    const out = await res.json();
+    if (expandedLoadId === shipmentId) setExpandedLoadId(null);
+    showToast(out.message || `Deleted load #${shipmentId}`);
+    await refreshBootstrap();
+  };
+
+  const handleAddCrmLead = async (payload: Partial<CrmLeadItem>) => {
+    const res = await fetch("/api/crm/leads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const out = await res.json();
+    showToast(out.message || "Added lead to SalesOps CRM");
+    await refreshBootstrap();
+  };
+
+  const handleBulkImportCrmLeads = async (leads: Array<Partial<CrmLeadItem>>) => {
+    const res = await fetch("/api/crm/leads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leads }),
+    });
+    const out = await res.json();
+    showToast(out.message || "Imported leads into SalesOps CRM");
+    await refreshBootstrap();
+  };
+
+  const handleUpdateCrmLead = async (id: string, patch: Partial<CrmLeadItem>) => {
+    const res = await fetch(`/api/crm/leads/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    const out = await res.json();
+    showToast(out.message || "Updated lead");
+    await refreshBootstrap();
+  };
+
+  const handleDeleteCrmLead = async (id: string) => {
+    const res = await fetch(`/api/crm/leads/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const out = await res.json();
+    showToast(out.message || "Deleted lead");
+    await refreshBootstrap();
+  };
+
+  const handlePushCrmLead = async (id: string) => {
+    const res = await fetch(`/api/crm/leads/${encodeURIComponent(id)}/push`, { method: "POST" });
+    const out = await res.json();
+    showToast(out.message || "Pushed lead to SalesOps CRM");
+    await refreshBootstrap();
+  };
+
+  const handleSaveSenderToCrm = useCallback(
+    async (em: CrucialEmailItem) => {
+      const domainCompany = em.from.split("@")[1]?.split(".")[0]?.toUpperCase() || em.senderName || em.from;
+      await handleAddCrmLead({
+        company: em.senderName || domainCompany,
+        contact: em.senderName || "",
+        email: em.from,
+        source: "Gmail",
+        status: "New",
+        evidence: `${em.subject} — ${em.body}`,
+      });
+    },
+    [],
+  );
+
+  const buildLoadFromLead = useCallback(
+    (lead: CrmLeadItem) => {
+      setBuilderEntry({
+        ...createDefaultBuilderEntry(),
+        customer: {
+          name: lead.company.toUpperCase(),
+          taiOrganizationId: "",
+          contactName: lead.contact,
+          email: lead.email,
+        },
+        specialInstructions: lead.estimatedLanes || lead.evidence || "",
+      });
+      setLocation("/load-builder");
+      showToast(`Prefilled Compact Load Builder for ${lead.company} (SalesOps Lead).`);
+    },
+    [setLocation, showToast],
+  );
 
   const handleApplyEmailAction = async (em: CrucialEmailItem) => {
     if (em.diffType === "new_tender") {
@@ -433,6 +534,8 @@ export const App: React.FC = () => {
           onExtractTender={extractMultiStopTender}
           chatHistory={chatHistory}
           onAskAi={handleAskAi}
+          onDeleteEmail={handleDeleteInboxItem}
+          onSaveToCrm={handleSaveSenderToCrm}
         />
       </div>
     );
@@ -443,6 +546,7 @@ export const App: React.FC = () => {
     { path: "/", label: "Crucial Inbox", icon: Inbox, badge: openActionsCount },
     { path: "/dispatch", label: "Unified Dispatch", icon: Layers, badge: data.shipments.length },
     { path: "/load-builder", label: "Compact Builder", icon: PlusCircle, badge: "Fast" },
+    { path: "/salesops", label: "SalesOps CRM", icon: Handshake, badge: data.crmLeads?.length ?? 0 },
     { path: "/ai-assistant", label: "TAI Copilot", icon: Bot, badge: null },
     { path: "/pod-billing", label: "POD & Webhooks", icon: FileCheck2, badge: data.kpis.emailPodReady },
   ];
@@ -724,8 +828,22 @@ export const App: React.FC = () => {
                                   </span>
                                 )}
                               </div>
-                              <span className="truncate" style={{ color: "var(--pf-text-subtle)" }}>
-                                {em.from} · {em.received}
+                              <span className="inline-flex items-center gap-1.5 min-w-0">
+                                <span className="truncate" style={{ color: "var(--pf-text-subtle)" }}>
+                                  {em.from} · {em.received}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteInboxItem(em.id);
+                                  }}
+                                  className="p-1 rounded shrink-0 hover:opacity-80"
+                                  style={{ background: "var(--pf-danger-dim)", color: "var(--pf-danger)" }}
+                                  title="Delete email tile"
+                                >
+                                  <Trash2 size={11} />
+                                </button>
                               </span>
                             </div>
                             <div className="text-sm font-semibold leading-snug">{em.subject}</div>
@@ -811,10 +929,25 @@ export const App: React.FC = () => {
                 onAssignCarrier={handleAssignCarrier}
                 onUploadPod={handleUploadPod}
                 onSaveNote={handleSaveLoadNote}
+                onDeleteLoad={handleDeleteLoad}
                 onAskAi={(q) => {
                   handleAskAi(q);
                   setLocation("/ai-assistant");
                 }}
+              />
+            )}
+
+            {/* ROUTE 3B: SALESOPS CRM */}
+            {location === "/salesops" && (
+              <SalesOpsCrmView
+                leads={data.crmLeads || []}
+                crmWebhookUrl={data.crmWebhookUrl}
+                onAddLead={handleAddCrmLead}
+                onBulkImportLeads={handleBulkImportCrmLeads}
+                onUpdateLead={handleUpdateCrmLead}
+                onDeleteLead={handleDeleteCrmLead}
+                onPushLead={handlePushCrmLead}
+                onBuildLoadFromLead={buildLoadFromLead}
               />
             )}
 
@@ -1068,6 +1201,22 @@ export const App: React.FC = () => {
                     >
                       <ExternalLink size={12} /> Open in Gmail
                     </a>
+                    <button
+                      type="button"
+                      onClick={() => handleSaveSenderToCrm(reviewEmail)}
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
+                      style={{ background: "var(--pf-primary-dim)", color: "var(--pf-primary)" }}
+                    >
+                      <UserPlus size={12} /> Save to CRM
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteInboxItem(reviewEmail.id)}
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
+                      style={{ background: "var(--pf-danger-dim)", color: "var(--pf-danger)" }}
+                    >
+                      <Trash2 size={12} /> Delete Tile
+                    </button>
                     <button
                       type="button"
                       onClick={() => setReviewEmail(null)}
@@ -1397,6 +1546,8 @@ export const App: React.FC = () => {
               onExtractTender={extractMultiStopTender}
               chatHistory={chatHistory}
               onAskAi={handleAskAi}
+              onDeleteEmail={handleDeleteInboxItem}
+              onSaveToCrm={handleSaveSenderToCrm}
             />
           </div>
         )}

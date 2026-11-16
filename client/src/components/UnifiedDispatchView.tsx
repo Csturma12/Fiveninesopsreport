@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import type { CarrierOption, OpsShipment } from "@shared/tai-webhook-schema";
 import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
-import { CheckCircle2, ChevronDown, ChevronRight, MapPin, Search, Upload } from "lucide-react";
+import { CheckCircle2, ChevronDown, ChevronRight, MapPin, Search, Trash2, Upload } from "lucide-react";
 
 interface UnifiedDispatchViewProps {
   shipments: OpsShipment[];
@@ -15,6 +15,7 @@ interface UnifiedDispatchViewProps {
     shipmentId: string,
     payload: { note?: string; pastedEmailText?: string; containerNumber?: string },
   ) => Promise<void>;
+  onDeleteLoad: (shipmentId: string) => Promise<void>;
   onAskAi: (question: string) => void;
 }
 
@@ -29,6 +30,7 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
   onAssignCarrier,
   onUploadPod,
   onSaveNote,
+  onDeleteLoad,
   onAskAi,
 }) => {
   const [stageFilter, setStageFilter] = useState<string>("All");
@@ -192,6 +194,18 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                       {s.buy === 0 ? "Buy TBD" : `${margin >= 0 ? "+" : "-"}$${Math.abs(margin).toLocaleString()} mgn`}
                     </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteLoad(s.id);
+                    }}
+                    className="p-1.5 rounded-lg shrink-0 hover:opacity-80"
+                    style={{ background: "var(--pf-danger-dim)", color: "var(--pf-danger)" }}
+                    title={`Delete load #${s.id}`}
+                  >
+                    <Trash2 size={13} />
+                  </button>
                 </div>
               </div>
 
@@ -422,6 +436,18 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                         style={{ background: "var(--pf-action)", color: "#ffffff" }}
                       >
                         Save Note
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onDeleteLoad(s.id)}
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold shrink-0 inline-flex items-center gap-1"
+                        style={{
+                          background: "var(--pf-danger-dim)",
+                          color: "var(--pf-danger)",
+                          border: "1px solid rgba(226,75,74,0.35)",
+                        }}
+                      >
+                        <Trash2 size={12} /> Delete Load
                       </button>
                     </div>
                   </div>

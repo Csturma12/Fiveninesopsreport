@@ -9,7 +9,7 @@ import type {
 } from "@shared/tai-webhook-schema";
 import { CompactLoadBuilder } from "./CompactLoadBuilder";
 import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
-import { ExternalLink, Search, Send } from "lucide-react";
+import { ExternalLink, Search, Send, Trash2, UserPlus } from "lucide-react";
 
 interface GmailToolkitPanelProps {
   shipments: OpsShipment[];
@@ -25,6 +25,8 @@ interface GmailToolkitPanelProps {
   onExtractTender: () => void;
   chatHistory: Array<{ role: "user" | "assistant"; text: string }>;
   onAskAi: (q: string) => Promise<void>;
+  onDeleteEmail?: (id: string) => Promise<void>;
+  onSaveToCrm?: (email: CrucialEmailItem) => Promise<void>;
 }
 
 export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
@@ -41,6 +43,8 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
   onExtractTender,
   chatHistory,
   onAskAi,
+  onDeleteEmail,
+  onSaveToCrm,
 }) => {
   const [tab, setTab] = useState<"inbox" | "dispatch" | "builder" | "ai">("builder");
   const [activeEmailIdx, setActiveEmailIdx] = useState<number>(0);
@@ -153,6 +157,17 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
                     <span className="font-mono" style={{ color: "var(--pf-text-muted)" }}>
                       {openEmail.loadId === "NEW" ? "New Tender" : `#${openEmail.loadId}`}
                     </span>
+                    {onDeleteEmail && (
+                      <button
+                        type="button"
+                        onClick={() => onDeleteEmail(openEmail.id)}
+                        className="p-1 rounded"
+                        style={{ background: "var(--pf-danger-dim)", color: "var(--pf-danger)" }}
+                        title="Delete email tile"
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -187,7 +202,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
                   </strong>
                 </div>
 
-                <div className="flex gap-1.5">
+                <div className="flex gap-1.5 flex-wrap">
                   {openEmail.loadId !== "NEW" && (
                     <button
                       type="button"
@@ -195,10 +210,21 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
                         setExpandedId(openEmail.loadId);
                         setTab("dispatch");
                       }}
-                      className="px-2.5 py-2 rounded-lg text-xs font-semibold shrink-0"
+                      className="px-2 py-2 rounded-lg text-[11px] font-semibold shrink-0"
                       style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
                     >
                       View Load #{openEmail.loadId}
+                    </button>
+                  )}
+                  {onSaveToCrm && (
+                    <button
+                      type="button"
+                      onClick={() => onSaveToCrm(openEmail)}
+                      className="px-2 py-2 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 shrink-0"
+                      style={{ background: "var(--pf-primary-dim)", color: "var(--pf-primary)" }}
+                      title="Add sender to SalesOps CRM"
+                    >
+                      <UserPlus size={11} /> + CRM
                     </button>
                   )}
                   <button
@@ -226,27 +252,42 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
             </div>
             <div className="space-y-1.5">
               {crucialEmails.map((em, i) => (
-                <button
+                <div
                   key={em.id}
-                  type="button"
                   onClick={() => setActiveEmailIdx(i)}
-                  className="w-full text-left p-2.5 rounded-lg space-y-0.5"
+                  className="cursor-pointer w-full text-left p-2.5 rounded-lg space-y-0.5"
                   style={{
                     background: i === activeEmailIdx ? "var(--pf-surface-raised)" : "var(--pf-surface)",
                     border: `1px solid ${i === activeEmailIdx ? "var(--pf-primary)" : "var(--pf-border)"}`,
                   }}
                 >
-                  <div className="flex items-center justify-between text-[11px]">
+                  <div className="flex items-center justify-between text-[11px] gap-2">
                     <span className="font-mono font-bold" style={{ color: "var(--pf-action)" }}>
                       {em.loadId === "NEW" ? "TENDER" : `#${em.loadId}`}
                     </span>
-                    <span style={{ color: "var(--pf-text-subtle)" }}>{em.received}</span>
+                    <div className="flex items-center gap-1.5">
+                      <span style={{ color: "var(--pf-text-subtle)" }}>{em.received}</span>
+                      {onDeleteEmail && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDeleteEmail(em.id);
+                          }}
+                          className="p-0.5 rounded hover:opacity-80"
+                          style={{ background: "var(--pf-danger-dim)", color: "var(--pf-danger)" }}
+                          title="Delete email tile"
+                        >
+                          <Trash2 size={10} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div className="text-xs font-medium truncate">{em.subject}</div>
                   <div className="text-[11px]" style={{ color: em.applied ? "var(--pf-primary)" : "var(--pf-warning)" }}>
                     {em.applied ? "✓ Applied" : em.diffLabel}
                   </div>
-                </button>
+                </div>
               ))}
             </div>
           </>

@@ -10,6 +10,9 @@ import type {
   BootstrapPayload,
   CarrierOption,
   ContainerEventItem,
+  CrmLeadItem,
+  CrmLeadSource,
+  CrmLeadStage,
   CrucialEmailItem,
   CustomerOption,
   OpsKpis,
@@ -558,6 +561,92 @@ const SEEDED_SHIPMENTS: OpsShipment[] = [
 const SHIPMENT_SELECT_COLS =
   "shipment_id,status,tai_raw_status,customer_name,customer_tai_organization_id,carrier_name,carrier_pro_number,customer_po,shipper_reference,ship_date,delivery_date,from_city,from_state,to_city,to_state,total_weight,equipment_type,buy,sell,invoice_status,current_location,notes,pod_document_count,ratecon_status,updated_at";
 
+export const DEFAULT_CRM_LEADS_WEBHOOK_URL = "https://salesops-dashboard-coral-seven.vercel.app/api/webhooks/leads";
+
+const SEEDED_CRM_LEADS: CrmLeadItem[] = [
+  {
+    id: "crm-1",
+    company: "CeramSource, Inc.",
+    contact: "Shipping Manager",
+    email: "logistics@ceramsource.com",
+    phone: "(732) 257-5002",
+    location: "Beaver Falls, PA 15010",
+    source: "ImportYeti",
+    status: "Qualified",
+    owner: "Chris Sturma",
+    followUp: "2026-11-18",
+    evidence: "Repeated refractory flatbed shipments PA → GA (PO #42705 multi-pick shipper).",
+    estimatedLanes: "Beaver Falls, PA → Lithonia, GA (48 ft Flatbed | Tarp)",
+    pushedToVercelCrm: true,
+    capturedAt: "2026-11-10T14:00:00.000Z",
+    updatedAt: "2026-11-16T08:00:00.000Z",
+  },
+  {
+    id: "crm-2",
+    company: "Management & Consulting",
+    contact: "Dean Smith",
+    email: "dsmith@mgmtconsulting-pa.com",
+    phone: "(724) 258-5500",
+    location: "Monongahela, PA 15063",
+    source: "Gmail",
+    status: "Contacted",
+    owner: "Chris Sturma",
+    followUp: "2026-11-19",
+    evidence: "High-alumina castable overflow loads (32,000 lbs pallets, stop 2 on PA → GA tenders).",
+    estimatedLanes: "Monongahela, PA → SE & Midwest Flatbed",
+    capturedAt: "2026-11-11T16:30:00.000Z",
+    updatedAt: "2026-11-16T08:00:00.000Z",
+  },
+  {
+    id: "crm-3",
+    company: "West Monroe Paper Mill",
+    contact: "Gate 2 Receiving Desk",
+    email: "traffic@westmonroepaper.com",
+    phone: "(318) 362-2000",
+    location: "West Monroe, LA 71292",
+    source: "Clay",
+    status: "Researching",
+    owner: "Chris Sturma",
+    followUp: "2026-11-20",
+    evidence: "Consistent inbound flatbed & dry van industrial mill freight from GA & TX.",
+    estimatedLanes: "GA / TX → West Monroe, LA",
+    capturedAt: "2026-11-12T10:15:00.000Z",
+    updatedAt: "2026-11-15T18:00:00.000Z",
+  },
+  {
+    id: "crm-4",
+    company: "Port Newark Container Drayage",
+    contact: "Import Operations",
+    email: "drayage@portnewarkterminal.com",
+    phone: "(973) 555-0192",
+    location: "Newark, NJ 07114",
+    source: "Quote",
+    status: "New",
+    owner: "Chris Sturma",
+    followUp: "2026-11-17",
+    evidence: "Cross-country Port Newark container transloads & step deck team freight.",
+    estimatedLanes: "Newark, NJ → Los Angeles, CA / Midwest",
+    capturedAt: "2026-11-14T09:20:00.000Z",
+    updatedAt: "2026-11-16T08:00:00.000Z",
+  },
+  {
+    id: "crm-5",
+    company: "Phoenix Industrial Pipe",
+    contact: "Receiving & Procurement",
+    email: "dispatch@phoenixindustrialpipe.com",
+    phone: "(602) 555-0114",
+    location: "Phoenix, AZ 85043",
+    source: "Manual",
+    status: "New",
+    owner: "Chris Sturma",
+    followUp: "2026-11-21",
+    evidence: "42,000 lb bundled industrial pipe & refractory anchor lanes from LA.",
+    estimatedLanes: "Ethel, LA → Phoenix, AZ (48 ft Flatbed)",
+    capturedAt: "2026-11-15T11:00:00.000Z",
+    updatedAt: "2026-11-16T08:00:00.000Z",
+  },
+];
+
 const SEEDED_EMAILS: CrucialEmailItem[] = [
   {
     id: "em-tonu-132702126",
@@ -756,6 +845,9 @@ class OpsStore {
   facilities: SavedFacility[] = structuredClone(SEEDED_FACILITIES);
   carriers: CarrierOption[] = structuredClone(SEEDED_CARRIERS);
   customers: CustomerOption[] = structuredClone(SEEDED_CUSTOMERS);
+  crmLeads: CrmLeadItem[] = structuredClone(SEEDED_CRM_LEADS);
+  dismissedEmailIds = new Set<string>();
+  deletedShipmentIds = new Set<string>();
   webhookLogs: WebhookEventLog[] = [
     {
       id: "wh-1",
@@ -1033,7 +1125,7 @@ class OpsStore {
           SEEDED_EMAILS[1], // NEW 2-PICK TENDER (#42705)
           ...(has132702126 ? [] : [SEEDED_EMAILS[0]]),
           ...liveEmails,
-        ];
+        ].filter((m) => !this.dismissedEmailIds.has(m.id));
 
         // Guarantee every numeric loadId referenced by crucialEmails (plus #132702126) is hydrated into this.shipments
         const loadedIds = new Set(this.shipments.map((s) => s.id));
@@ -1076,7 +1168,7 @@ class OpsStore {
           (payload) => {
             const row = payload.new as Record<string, unknown> | undefined;
             const id = String(row?.shipment_id || "");
-            if (!row || !id) return;
+            if (!row || !id || this.deletedShipmentIds.has(id)) return;
             const idx = this.shipments.findIndex((s) => s.id === id);
             const updated = mapSupabaseShipmentRow(row, idx >= 0 ? this.shipments[idx] : undefined);
             if (idx >= 0) this.shipments[idx] = updated;
@@ -1189,8 +1281,109 @@ class OpsStore {
     }
   }
 
+  getCrmWebhookUrl(): string {
+    return process.env.CRM_LEADS_WEBHOOK_URL?.trim() || DEFAULT_CRM_LEADS_WEBHOOK_URL;
+  }
+
+  addCrmLead(input: {
+    company: string;
+    contact?: string;
+    email?: string;
+    phone?: string;
+    location?: string;
+    source?: CrmLeadSource;
+    sourceUrl?: string;
+    status?: CrmLeadStage;
+    owner?: string;
+    followUp?: string;
+    evidence?: string;
+    estimatedLanes?: string;
+  }): { lead: CrmLeadItem; duplicate: boolean } {
+    const company = String(input.company || "").trim();
+    const norm = company.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const existing = this.crmLeads.find((l) => l.company.toLowerCase().replace(/[^a-z0-9]+/g, "") === norm);
+    if (existing) {
+      return { lead: existing, duplicate: true };
+    }
+    const now = new Date().toISOString();
+    const lead: CrmLeadItem = {
+      id: `crm-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      company,
+      contact: String(input.contact || "").trim(),
+      email: String(input.email || "").trim(),
+      phone: String(input.phone || "").trim(),
+      location: String(input.location || "").trim(),
+      source: input.source || "Manual",
+      sourceUrl: input.sourceUrl ? String(input.sourceUrl).trim() : undefined,
+      status: input.status || "New",
+      owner: String(input.owner || "Chris Sturma").trim(),
+      followUp: String(input.followUp || "").trim(),
+      evidence: String(input.evidence || "").trim(),
+      estimatedLanes: input.estimatedLanes ? String(input.estimatedLanes).trim() : undefined,
+      capturedAt: now,
+      updatedAt: now,
+    };
+    this.crmLeads.unshift(lead);
+    return { lead, duplicate: false };
+  }
+
+  updateCrmLead(
+    id: string,
+    patch: Partial<
+      Pick<
+        CrmLeadItem,
+        "company" | "contact" | "email" | "phone" | "location" | "status" | "owner" | "followUp" | "evidence" | "estimatedLanes" | "pushedToVercelCrm"
+      >
+    >,
+  ): CrmLeadItem | null {
+    const idx = this.crmLeads.findIndex((l) => l.id === id);
+    if (idx < 0) return null;
+    const updated: CrmLeadItem = {
+      ...this.crmLeads[idx],
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    };
+    this.crmLeads[idx] = updated;
+    if (updated.status === "Converted") {
+      const existsInCustomers = this.customers.some(
+        (c) => c.name.trim().toLowerCase() === updated.company.trim().toLowerCase(),
+      );
+      if (!existsInCustomers) {
+        this.customers.unshift({
+          name: updated.company.toUpperCase(),
+          taiOrgId: "",
+          city: updated.location.split(",")[0]?.trim() || "",
+          state: updated.location.split(",")[1]?.trim().slice(0, 2) || "",
+        });
+      }
+    }
+    return updated;
+  }
+
+  deleteCrmLead(id: string): boolean {
+    const before = this.crmLeads.length;
+    this.crmLeads = this.crmLeads.filter((l) => l.id !== id);
+    return this.crmLeads.length < before;
+  }
+
+  dismissEmail(id: string): boolean {
+    this.dismissedEmailIds.add(id);
+    const before = this.crucialEmails.length;
+    this.crucialEmails = this.crucialEmails.filter((e) => e.id !== id);
+    return this.crucialEmails.length < before;
+  }
+
+  deleteShipment(id: string): boolean {
+    this.deletedShipmentIds.add(id);
+    const before = this.shipments.length;
+    this.shipments = this.shipments.filter((s) => s.id !== id);
+    return this.shipments.length < before;
+  }
+
   async getBootstrap(user?: BootstrapPayload["user"]): Promise<BootstrapPayload> {
     await this.initSupabaseSyncAndRealtime();
+    this.shipments = this.shipments.filter((s) => !this.deletedShipmentIds.has(s.id));
+    this.crucialEmails = this.crucialEmails.filter((e) => !this.dismissedEmailIds.has(e.id));
     this.correlateContainerEventsAndNotes();
     const poller = pollerConfigStatus();
     return {
@@ -1209,6 +1402,8 @@ class OpsStore {
       facilities: this.facilities,
       carriers: this.carriers,
       customers: this.customers,
+      crmLeads: this.crmLeads,
+      crmWebhookUrl: this.getCrmWebhookUrl(),
       webhookLogs: this.webhookLogs.slice(0, 25),
     };
   }

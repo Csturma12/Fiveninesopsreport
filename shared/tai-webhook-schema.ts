@@ -103,6 +103,28 @@ export interface CustomerOption {
   state: string;
 }
 
+export type CrmLeadStage = "New" | "Researching" | "Contacted" | "Qualified" | "Converted";
+export type CrmLeadSource = "Manual" | "Clay" | "ImportYeti" | "Gmail" | "Quote";
+
+export interface CrmLeadItem {
+  id: string;
+  company: string;
+  contact: string;
+  email: string;
+  phone: string;
+  location: string;
+  source: CrmLeadSource;
+  sourceUrl?: string;
+  status: CrmLeadStage;
+  owner: string;
+  followUp: string;
+  evidence: string;
+  estimatedLanes?: string;
+  pushedToVercelCrm?: boolean;
+  capturedAt: string;
+  updatedAt: string;
+}
+
 export interface OpsKpis {
   totalShipments: number;
   loads30d: number;
@@ -149,6 +171,8 @@ export interface BootstrapPayload {
   facilities: SavedFacility[];
   carriers: CarrierOption[];
   customers: CustomerOption[];
+  crmLeads: CrmLeadItem[];
+  crmWebhookUrl: string;
   webhookLogs: WebhookEventLog[];
 }
 
