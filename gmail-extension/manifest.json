@@ -4,7 +4,7 @@
   "version": "2.0.0",
   "description": "Compact shared-host Gmail side panel for Primary Freight / Five Nines Operations (TAI-valid Load Builder, Crucial Action Inbox, Unified Dispatch & AI Copilot).",
   "permissions": ["sidePanel", "storage"],
-  "host_permissions": ["https://mail.google.com/*", "http://127.0.0.1:5090/*"],
+  "host_permissions": ["https://mail.google.com/*", "https://fivenines-ops.fly.dev/*", "http://127.0.0.1:5090/*"],
   "background": {
     "service_worker": "background.js"
   },
