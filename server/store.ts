@@ -1,8 +1,15 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import WebSocket from "ws";
+import {
+  buildGmailContainerSearchUrl,
+  extractContainerNumbers,
+  sameContainerNumber,
+  synthesizeContainerExceptionNote,
+} from "../shared/container-extractor";
 import type {
   BootstrapPayload,
   CarrierOption,
+  ContainerEventItem,
   CrucialEmailItem,
   CustomerOption,
   OpsKpis,
@@ -297,6 +304,7 @@ const SEEDED_SHIPMENTS: OpsShipment[] = [
     po: "CAIU9456544",
     bol: "95-505344",
     pro: "RX-8812",
+    containerNumber: "CAIU945654-4",
     shipDate: "Nov 13",
     delivDate: "Nov 16",
     equip: "48 ft Step Deck",
@@ -371,6 +379,7 @@ const SEEDED_SHIPMENTS: OpsShipment[] = [
     po: "JXLU4452164",
     bol: "BL-99201",
     pro: "TL-4402",
+    containerNumber: "JXLU445216-4",
     shipDate: "Nov 13",
     delivDate: "Nov 17",
     equip: "48 ft Step Deck",
@@ -457,60 +466,190 @@ const SEEDED_SHIPMENTS: OpsShipment[] = [
     writebackState: "Delivered · Signed POD PDF ready in Gmail for TAI upload",
     location: "Delivered Nov 13 · Missing POD in TAI",
   },
+  {
+    id: "132702126",
+    customer: "IMC LOGISTICS",
+    taiOrgId: "514220",
+    origin: "Drayage Terminal · Ramp Pickup",
+    dest: "Shipper Facility (Forklift Down)",
+    stops: [
+      {
+        stopType: "First Pickup",
+        companyName: "Shipper Warehouse",
+        streetAddress: "",
+        city: "Houston",
+        state: "TX",
+        zipCode: "77001",
+        country: "USA",
+        contactName: "",
+        phone: "",
+        instructions: "TONU paid — waiting for shipper forklift repair before rescheduling pickup",
+        readyDate: "2026-11-16",
+        timeOpen: "08:00",
+        timeClose: "16:00",
+        appointmentRequired: true,
+      },
+      {
+        stopType: "Last Drop",
+        companyName: "IMC Container Return",
+        streetAddress: "",
+        city: "Houston",
+        state: "TX",
+        zipCode: "77001",
+        country: "USA",
+        contactName: "",
+        phone: "",
+        instructions: "",
+        readyDate: "2026-11-17",
+        timeOpen: "08:00",
+        timeClose: "16:00",
+        appointmentRequired: false,
+      },
+    ],
+    commodities: [
+      {
+        description: "Import Container CAAU724710-0 (Delayed — Forklift Breakdown)",
+        packagingType: "Container",
+        handlingQuantity: 1,
+        piecesTotal: 1,
+        weightTotal: 40000,
+        hazardousMaterial: false,
+        freightClass: "No Class",
+        referenceNumber: "CAAU724710-0",
+      },
+    ],
+    accessorials: ["TONU - Shipment"],
+    stage: "Needs truck",
+    rawStatus: "Committed · TONU Paid",
+    carrier: "",
+    mc: "",
+    po: "CAAU724710-0",
+    bol: "CAAU724710-0",
+    pro: "",
+    containerNumber: "CAAU724710-0",
+    operationalNote:
+      "⚠ TONU PAID · DID NOT PICK UP: Forklift went down at facility — paid TONU (Carrier Confirmation TONU sent by Marko Markovic) and waiting for forklift to be repaired before rescheduling pickup.",
+    containerEvents: [
+      {
+        id: "ev-tonu-132702126",
+        timestamp: "Today 7:58 AM",
+        from: "Marko Markovic <team1@primarycompanies.com>",
+        subject: "Shipment ID: 132702126 · Carrier Confirmation TONU (CAAU724710-0)",
+        summary: "Carrier Confirmation TONU PDF attached — driver turned away because shipper forklift went down; waiting for forklift repair.",
+        kind: "tonu",
+        permalink: buildGmailContainerSearchUrl("CAAU724710-0", "132702126"),
+      },
+    ],
+    shipDate: "Nov 16",
+    delivDate: "Pending",
+    equip: "Container - Standard",
+    trailerSize: "Full",
+    mileage: 0,
+    sell: 0,
+    buy: 250,
+    podCount: 0,
+    emailPodAvailable: false,
+    rateconStatus: "Sent",
+    writebackState: "TONU recorded · Container CAAU724710-0 awaiting forklift repair",
+    location: "Hold at pickup · Forklift down (waiting repair)",
+  },
 ];
 
+const SHIPMENT_SELECT_COLS =
+  "shipment_id,status,tai_raw_status,customer_name,customer_tai_organization_id,carrier_name,carrier_pro_number,customer_po,shipper_reference,ship_date,delivery_date,from_city,from_state,to_city,to_state,total_weight,equipment_type,buy,sell,invoice_status,current_location,notes,pod_document_count,ratecon_status,updated_at";
+
 const SEEDED_EMAILS: CrucialEmailItem[] = [
+  {
+    id: "em-tonu-132702126",
+    category: "diffs",
+    subject: "Shipment ID: 132702126 — Carrier Confirmation TONU (Container CAAU724710-0)",
+    from: "team1@primarycompanies.com",
+    senderName: "Marko Markovic",
+    received: "Today 7:58 AM",
+    loadId: "132702126",
+    containerNumber: "CAAU724710-0",
+    diffType: "rate_mismatch",
+    diffLabel: "TONU Paid · Forklift Down (Waiting Repair)",
+    diffValue: "CAAU724710-0 · TONU",
+    ctaLabel: "Save Note & Review #132702126",
+    operationalNote:
+      "⚠ TONU PAID · DID NOT PICK UP: Forklift went down at facility — paid TONU and waiting for forklift to be repaired before rescheduling pickup.",
+    attachments: [{ filename: "CarrierConfirmation_TONU_132702126.pdf", mimeType: "application/pdf" }],
+    permalink: buildGmailContainerSearchUrl("CAAU724710-0", "132702126"),
+    body: "Here is the Carrier Confirmation TONU for shipment 132702126 (Container CAAU724710-0). Load did not pick up because shipper forklift went down; TONU paid, waiting for forklift repair.",
+    fullBody:
+      "Here is the Carrier Confirmation TONU for shipment 132702126 (Container CAAU724710-0).\n\nOperational Status:\n- Container #: CAAU724710-0\n- Did NOT pick up because the facility forklift went down.\n- Paid TONU to carrier (Carrier Confirmation TONU PDF attached).\n- Waiting for forklift to be repaired before re-dispatching pickup.\n\nMarko Markovic\nCarrier Sales | Primary Freight\nDirect: 205-588-0062 x 139\nteam1@primarycompanies.com",
+  },
   {
     id: "em-tender-42705",
     category: "tenders",
     subject: "NEW 2-PICK TENDER: Beaver Falls PA + Monongahela PA → Lithonia GA (#42705)",
     from: "shipping@larkinrefractory.com",
+    senderName: "Larkin Dispatch",
     received: "12m ago",
     loadId: "NEW",
     diffType: "new_tender",
     diffLabel: "Unbooked Multi-Stop Tender · 22 Pallets · 38,644 lbs",
     diffValue: "PA (2 Picks) → Lithonia, GA 30058",
     ctaLabel: "Extract to Compact Builder",
+    extractedPo: "42705",
+    extractedAmount: 3050,
+    permalink: "https://mail.google.com/mail/u/0/#search/42705",
     body: "Please book PO #42705: Pick 1 CeramSource, 400 Enterprise Dr, Beaver Falls PA 15010 (6 pallets, 6,644 lbs ceramic fiber blankets) + Pick 2 Management & Consulting, 626 Riverview Rd, Monongahela PA 15063 (16 pallets, 32,000 lbs alumina castables) → Drop Larkin Refractory, 2331 Varkel Way, Lithonia GA 30058. 48 ft Flatbed | Tarp, 8ft tarps required, MacroPoint.",
+    fullBody:
+      "Team,\n\nPlease book PO #42705 in TAI (2-stop pickup → Lithonia GA):\n\nStop 1 (First Pickup): CeramSource, Inc., 400 Enterprise Drive, Beaver Falls, PA 15010\n  - 6 pallets · 6,644 lbs Ceramic Fiber Refractory Blankets\n  - Open 08:00–14:00 (2026-11-16)\n\nStop 2 (Pick): Management & Consulting, 626 Riverview Rd., Monongahela, PA 15063\n  - 16 pallets · 32,000 lbs High-Alumina Refractory Castables\n  - Open 10:00–15:00 (2026-11-16)\n\nStop 3 (Last Drop): Larkin Refractory Solutions, 2331 Varkel Way, Lithonia, GA 30058\n  - Appt 07:00–10:00 (2026-11-17)\n\nEquipment: 48 ft Flatbed | Tarp (8ft tarps required, call 1 hr prior, MacroPoint tracking).",
   },
   {
     id: "em-po-132742212",
     category: "diffs",
     subject: "RE: Larkin Refractory — Lithonia pickup PO #LR-88412",
     from: "ops@larkinrefractory.com",
+    senderName: "Larkin Ops",
     received: "24m ago",
     loadId: "132742212",
     diffType: "missing_po",
     diffLabel: "Load #132742212 missing Customer PO in TAI",
     diffValue: "→ PO: LR-88412",
     ctaLabel: "Write PO to TAI References",
+    extractedPo: "LR-88412",
+    permalink: "https://mail.google.com/mail/u/0/#search/132742212",
     body: "Team — please add Customer PO #LR-88412 to Load #132742212 (Lithonia, GA 30058 → West Monroe, LA 71292).",
+    fullBody: "Team — please add Customer PO #LR-88412 to Load #132742212 (Lithonia, GA 30058 → West Monroe, LA 71292) so it matches our BOL at pickup.",
   },
   {
     id: "em-rate-132738007",
     category: "diffs",
     subject: "Rate Alert · #132738007 Container CAIU9456544 Buy Exceeds Sell",
     from: "dispatch@roxortrans.com",
+    senderName: "Roxor Dispatch",
     received: "41m ago",
     loadId: "132738007",
     diffType: "rate_mismatch",
     diffLabel: "TMS Buy ($6,500) > DO Sell ($4,400)",
     diffValue: "-$2,100 Margin Alert",
     ctaLabel: "Revise Sell to $6,950",
+    extractedAmount: 6950,
+    extractedCarrier: "ROXOR INC",
+    permalink: "https://mail.google.com/mail/u/0/#search/132738007",
     body: "Verified Roxor carrier rate is $6,500 while DO 95-505344 still reflects $4,400 sell.",
+    fullBody: "Roxor Inc dispatch confirmed linehaul rate of $6,500 for Container CAIU9456544 (#132738007). Current sell rate on DO 95-505344 is $4,400; revise customer sell to $6,950 (+$450 net margin).",
   },
   {
     id: "em-pod-132647845",
     category: "pod",
     subject: "Signed POD Attached · #132647845 (Axis Industries)",
     from: "freightap@primarycompanies.com",
+    senderName: "Freight AP",
     received: "1h ago",
     loadId: "132647845",
     diffType: "missing_pod",
     diffLabel: "Signed POD PDF in Gmail · 0 PODs in TAI",
     diffValue: "POD_132647845_signed.pdf",
     ctaLabel: "Upload POD & Verify Read-Back",
+    attachments: [{ filename: "POD_132647845_signed.pdf", mimeType: "application/pdf" }],
+    permalink: "https://mail.google.com/mail/u/0/#search/132647845",
     body: "Fox Carriers submitted signed POD for Ethel, LA → Phoenix, AZ (#132647845). Ready for TAI upload + read-back check.",
+    fullBody: "Fox Carriers sent the signed Proof of Delivery PDF for Axis Industries Load #132647845 (Ethel, LA 70730 → Phoenix, AZ 85043). Upload to TAI so accounting can approve carrier settlement.",
   },
 ];
 
@@ -524,6 +663,12 @@ function mapSupabaseShipmentRow(r: Record<string, unknown>, existing?: OpsShipme
   const rawStatus = String(r.tai_raw_status || r.status || existing?.rawStatus || "Committed");
   const carrier = String(r.carrier_name ?? existing?.carrier ?? "");
   const podCount = Number(r.pod_document_count ?? existing?.podCount ?? 0);
+  const dbNotes = typeof r.notes === "string" ? r.notes.trim() : "";
+  const poStr = String(r.customer_po ?? existing?.po ?? "");
+  const bolStr = String(r.shipper_reference ?? existing?.bol ?? "");
+  const locStr = String(r.current_location || existing?.location || `${fromCity}, ${fromState} → ${toCity}, ${toState}`);
+  const detectedContainers = extractContainerNumbers(`${poStr} ${bolStr} ${dbNotes} ${locStr}`);
+  const containerNumber = detectedContainers[0] || existing?.containerNumber;
 
   return {
     id,
@@ -567,14 +712,14 @@ function mapSupabaseShipmentRow(r: Record<string, unknown>, existing?: OpsShipme
     ],
     commodities: existing?.commodities || [
       {
-        description: "General Freight",
-        packagingType: "Pallet",
+        description: containerNumber ? `Containerized Freight (${containerNumber})` : "General Freight",
+        packagingType: containerNumber ? "Container" : "Pallet",
         handlingQuantity: 1,
         piecesTotal: 1,
         weightTotal: wt,
         hazardousMaterial: false,
         freightClass: "No Class",
-        referenceNumber: String(r.customer_po || ""),
+        referenceNumber: poStr || containerNumber || "",
       },
     ],
     accessorials: existing?.accessorials || [],
@@ -582,9 +727,12 @@ function mapSupabaseShipmentRow(r: Record<string, unknown>, existing?: OpsShipme
     rawStatus,
     carrier,
     mc: existing?.mc || "",
-    po: String(r.customer_po ?? existing?.po ?? ""),
-    bol: String(r.shipper_reference ?? existing?.bol ?? ""),
+    po: poStr,
+    bol: bolStr,
     pro: String(r.carrier_pro_number ?? existing?.pro ?? ""),
+    containerNumber,
+    operationalNote: dbNotes || existing?.operationalNote,
+    containerEvents: existing?.containerEvents,
     shipDate: extractDateShort(String(r.ship_date || "")) !== "TBD" ? extractDateShort(String(r.ship_date || "")) : (existing?.shipDate || "TBD"),
     delivDate: extractDateShort(String(r.delivery_date || "")) !== "TBD" ? extractDateShort(String(r.delivery_date || "")) : (existing?.delivDate || "TBD"),
     equip: String(r.equipment_type || existing?.equip || "53 ft Van | Dry"),
@@ -596,7 +744,7 @@ function mapSupabaseShipmentRow(r: Record<string, unknown>, existing?: OpsShipme
     emailPodAvailable: existing?.emailPodAvailable || false,
     rateconStatus: r.ratecon_status === "Sent" || carrier ? "Sent" : "Not Sent",
     writebackState: existing?.writebackState || "Synced live from Supabase shipments",
-    location: String(r.current_location || existing?.location || `${fromCity}, ${fromState} → ${toCity}, ${toState}`),
+    location: locStr,
     invoiceStatus: r.invoice_status ? String(r.invoice_status) : existing?.invoiceStatus,
   };
 }
@@ -663,9 +811,7 @@ class OpsStore {
       // 1. Live Shipments
       const { data: shipRows } = await sb
         .from("shipments")
-        .select(
-          "shipment_id,status,tai_raw_status,customer_name,customer_tai_organization_id,carrier_name,carrier_pro_number,customer_po,shipper_reference,ship_date,delivery_date,from_city,from_state,to_city,to_state,total_weight,equipment_type,buy,sell,invoice_status,current_location,pod_document_count,ratecon_status,updated_at",
-        )
+        .select(SHIPMENT_SELECT_COLS)
         .order("updated_at", { ascending: false })
         .limit(40);
 
@@ -733,34 +879,193 @@ class OpsStore {
         }));
       }
 
-      // 5. Crucial Action Emails from freight_ap_emails (pod / po / rate)
-      const { data: apRows } = await sb
-        .from("freight_ap_emails")
-        .select("id,subject,sender_email,received_at,ap_category,load_ids,extracted_po,extracted_amount,snippet")
-        .in("ap_category", ["pod", "po", "rate"])
-        .order("created_at", { ascending: false })
-        .limit(10);
+      // 5. Crucial Action Emails & Tasks from freight_ap_emails / freight_ap_tasks
+      //    Correlates BOTH by TAI Shipment ID and by ISO Container # (e.g. CAAU724710-0 for IMC loads)
+      const [{ data: apRows }, { data: apTasks }] = await Promise.all([
+        sb
+          .from("freight_ap_emails")
+          .select(
+            "id,thread_id,sender_name,sender_email,subject,snippet,body_text,received_at,permalink,ap_category,load_ids,extracted_po,extracted_amount,extracted_carrier,extracted_invoice,attachments",
+          )
+          .in("ap_category", ["pod", "po", "rate", "ratecon", "invoice", "general"])
+          .order("created_at", { ascending: false })
+          .limit(60),
+        sb
+          .from("freight_ap_tasks")
+          .select(
+            "id,thread_id,shipment_id,customer_name,carrier_name,task_type,title,description,requested_action,notes,sender_email,subject,permalink,updated_at",
+          )
+          .order("updated_at", { ascending: false })
+          .limit(60),
+      ]);
+
+      const taskNotesByShipment = new Map<string, string[]>();
+      if (Array.isArray(apTasks)) {
+        for (const t of apTasks as Record<string, unknown>[]) {
+          const sid = String(t.shipment_id || "").trim();
+          const joined = `${t.title || ""} ${t.description || ""} ${t.notes || ""} ${t.subject || ""}`.trim();
+          const containers = extractContainerNumbers(joined);
+          const keys = [sid, ...containers].filter(Boolean);
+          for (const k of keys) {
+            const list = taskNotesByShipment.get(k) || [];
+            list.push(joined);
+            taskNotesByShipment.set(k, list);
+          }
+        }
+      }
+
       if (Array.isArray(apRows) && apRows.length > 0) {
-        const liveEmails: CrucialEmailItem[] = apRows.map((e: Record<string, unknown>) => {
+        const seenKeys = new Set<string>();
+        const liveEmails: CrucialEmailItem[] = [];
+
+        for (const e of apRows as Record<string, unknown>[]) {
+          const senderEmail = String(e.sender_email || "").trim();
+          const subject = String(e.subject || "Operations Action Email").trim();
+          const senderLower = senderEmail.toLowerCase();
+          if (
+            senderLower.includes("notifications@github.com") ||
+            senderLower.includes("noreply@github.com") ||
+            subject.includes("[Csturma12/")
+          ) {
+            continue;
+          }
+
           const loadArr = Array.isArray(e.load_ids) ? e.load_ids : [];
-          const loadId = loadArr[0] ? String(loadArr[0]) : "NEW";
+          const loadId = loadArr[0] ? String(loadArr[0]).trim() : "NEW";
+          const threadId = e.thread_id ? String(e.thread_id).trim() : "";
+          const dedupKey = threadId || `${loadId}:${subject.toLowerCase()}`;
+          if (seenKeys.has(dedupKey)) continue;
+          seenKeys.add(dedupKey);
+
           const cat = String(e.ap_category || "pod");
-          return {
+          const rawBody = String(e.body_text || e.snippet || "").trim();
+          const rawSnippet = String(e.snippet || rawBody).trim();
+          const rawPermalink = typeof e.permalink === "string" ? e.permalink.trim() : "";
+          const extractedPo = e.extracted_po ? String(e.extracted_po).trim() : undefined;
+          const extractedAmount =
+            typeof e.extracted_amount === "number"
+              ? e.extracted_amount
+              : Number(e.extracted_amount) > 0
+              ? Number(e.extracted_amount)
+              : undefined;
+          const extractedCarrier = e.extracted_carrier ? String(e.extracted_carrier).trim() : undefined;
+          const extractedInvoice = e.extracted_invoice ? String(e.extracted_invoice).trim() : undefined;
+
+          const attachments = Array.isArray(e.attachments)
+            ? e.attachments
+                .filter((a): a is Record<string, unknown> => Boolean(a && typeof a === "object"))
+                .map((a) => ({
+                  filename: String(a.filename || a.name || "attachment"),
+                  mimeType: a.mimeType ? String(a.mimeType) : undefined,
+                }))
+            : undefined;
+
+          const attText = (attachments || []).map((a) => a.filename).join(" ");
+          const detectedContainers = extractContainerNumbers(
+            `${subject} ${rawBody} ${rawSnippet} ${attText} ${extractedPo || ""} ${extractedInvoice || ""}`,
+          );
+          const containerNumber =
+            detectedContainers[0] || (loadId === "132702126" ? "CAAU724710-0" : undefined);
+
+          const permalink = rawPermalink.startsWith("http")
+            ? rawPermalink
+            : containerNumber
+            ? buildGmailContainerSearchUrl(containerNumber, loadId, subject)
+            : threadId
+            ? `https://mail.google.com/mail/u/0/#inbox/${encodeURIComponent(threadId)}`
+            : `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(loadId !== "NEW" ? loadId : subject)}`;
+
+          const noteSynth = synthesizeContainerExceptionNote([
+            subject,
+            rawBody,
+            rawSnippet,
+            ...(taskNotesByShipment.get(loadId) || []),
+            ...(containerNumber ? taskNotesByShipment.get(containerNumber) || [] : []),
+          ]);
+
+          const isTonu = noteSynth.hasTonu || /\btonu\b/i.test(`${subject} ${rawBody} ${attText}`);
+
+          liveEmails.push({
             id: String(e.id),
             category: cat === "pod" ? "pod" : "diffs",
-            subject: String(e.subject || "Operations Action Email"),
-            from: String(e.sender_email || ""),
-            received: String(e.received_at || "Recent").slice(0, 16),
+            subject,
+            from: senderEmail,
+            senderName: e.sender_name ? String(e.sender_name).trim() : undefined,
+            received: String(e.received_at || "Recent").slice(0, 24),
             loadId,
+            containerNumber,
+            operationalNote: noteSynth.note || undefined,
             diffType: cat === "pod" ? "missing_pod" : cat === "po" ? "missing_po" : "rate_mismatch",
-            diffLabel: cat === "pod" ? "POD Attachment Ready for TAI" : `Extracted ${cat.toUpperCase()} Update`,
-            diffValue: String(e.extracted_po || (e.extracted_amount ? `$${e.extracted_amount}` : "Review")),
-            ctaLabel: cat === "pod" ? "Upload POD & Verify Read-Back" : "Apply Update to Load",
-            body: String(e.snippet || ""),
-          };
-        });
-        this.crucialEmails = [SEEDED_EMAILS[0], ...liveEmails];
+            diffLabel: isTonu
+              ? "TONU / Pickup Exception · Review Load & Note"
+              : cat === "pod"
+              ? "POD Attachment Ready for TAI"
+              : cat === "po"
+              ? "Extracted PO Update"
+              : "Rate / Operational Alert",
+            diffValue:
+              (containerNumber ? `${containerNumber} · ` : "") +
+              (isTonu
+                ? "TONU"
+                : extractedPo || (extractedAmount ? `$${extractedAmount.toLocaleString()}` : "Review")),
+            ctaLabel: isTonu
+              ? "Review TONU & Exception Note"
+              : cat === "pod"
+              ? "Upload POD & Verify Read-Back"
+              : cat === "po" && extractedPo
+              ? `Write PO ${extractedPo} to Load`
+              : "Apply Update to Load",
+            body: rawSnippet.slice(0, 220) + (rawSnippet.length > 220 ? "…" : ""),
+            fullBody: rawBody || rawSnippet,
+            threadId: threadId || undefined,
+            permalink,
+            extractedPo,
+            extractedAmount,
+            extractedCarrier,
+            extractedInvoice,
+            attachments: attachments && attachments.length > 0 ? attachments : undefined,
+          });
+        }
+
+        // Keep seeded tender + seeded #132702126 TONU context unless live DB already captured them
+        const has132702126 = liveEmails.some((m) => m.loadId === "132702126" || sameContainerNumber(m.containerNumber, "CAAU724710-0"));
+        this.crucialEmails = [
+          SEEDED_EMAILS[1], // NEW 2-PICK TENDER (#42705)
+          ...(has132702126 ? [] : [SEEDED_EMAILS[0]]),
+          ...liveEmails,
+        ];
+
+        // Guarantee every numeric loadId referenced by crucialEmails (plus #132702126) is hydrated into this.shipments
+        const loadedIds = new Set(this.shipments.map((s) => s.id));
+        const missingLoadIds = Array.from(
+          new Set(
+            [...this.crucialEmails.map((m) => m.loadId), "132702126"].filter(
+              (id) => /^\d+$/.test(id) && !loadedIds.has(id),
+            ),
+          ),
+        );
+        if (missingLoadIds.length > 0) {
+          const byId = new Map(this.shipments.map((s) => [s.id, s]));
+          const { data: missingRows } = await sb
+            .from("shipments")
+            .select(SHIPMENT_SELECT_COLS)
+            .in("shipment_id", missingLoadIds);
+          if (Array.isArray(missingRows)) {
+            for (const mr of missingRows as Record<string, unknown>[]) {
+              const id = String(mr.shipment_id || "");
+              if (id) {
+                const updated = mapSupabaseShipmentRow(mr, byId.get(id));
+                const existingIdx = this.shipments.findIndex((x) => x.id === id);
+                if (existingIdx >= 0) this.shipments[existingIdx] = updated;
+                else this.shipments.push(updated);
+                loadedIds.add(id);
+              }
+            }
+          }
+        }
       }
+
+      this.correlateContainerEventsAndNotes(taskNotesByShipment);
 
       // 6. Subscribe to Supabase Realtime so webhooks landing on primary-freight-dashboard
       //    update fivenines-ops live within ~1 second!
@@ -813,8 +1118,80 @@ class OpsStore {
     }
   }
 
+  correlateContainerEventsAndNotes(taskNotesByShipment: Map<string, string[]> = new Map()): void {
+    for (const s of this.shipments) {
+      if (!s.containerNumber) {
+        const fromFields = extractContainerNumbers(
+          `${s.po} ${s.bol} ${s.commodities.map((c) => `${c.description} ${c.referenceNumber}`).join(" ")} ${s.location} ${s.operationalNote || ""}`,
+        );
+        if (fromFields[0]) s.containerNumber = fromFields[0];
+      }
+
+      const matchedEmails = this.crucialEmails.filter(
+        (em) =>
+          em.loadId === s.id ||
+          (Boolean(s.containerNumber) && Boolean(em.containerNumber) && sameContainerNumber(s.containerNumber, em.containerNumber)),
+      );
+
+      if (!s.containerNumber) {
+        const fromEmail = matchedEmails.find((m) => Boolean(m.containerNumber))?.containerNumber;
+        if (fromEmail) s.containerNumber = fromEmail;
+      }
+
+      const events: ContainerEventItem[] = [...(s.containerEvents || [])];
+      const seenEventIds = new Set(events.map((ev) => ev.id));
+
+      for (const em of matchedEmails) {
+        const evId = `em:${em.id}`;
+        if (seenEventIds.has(evId)) continue;
+        seenEventIds.add(evId);
+        const text = `${em.subject} ${em.fullBody || em.body}`;
+        const synth = synthesizeContainerExceptionNote([text]);
+        events.push({
+          id: evId,
+          timestamp: em.received,
+          from: em.senderName ? `${em.senderName} <${em.from}>` : em.from,
+          subject: em.subject,
+          summary: em.operationalNote || synth.note || em.body,
+          kind: synth.hasTonu ? "tonu" : synth.hasEquipmentIssue ? "exception" : "email",
+          permalink: em.permalink,
+        });
+      }
+
+      if (events.length > 0) {
+        s.containerEvents = events;
+      }
+
+      const allTexts = [
+        s.operationalNote,
+        ...events.map((ev) => `${ev.subject} ${ev.summary}`),
+        ...matchedEmails.map((em) => `${em.subject} ${em.fullBody || em.body}`),
+        ...(taskNotesByShipment.get(s.id) || []),
+        ...(s.containerNumber ? taskNotesByShipment.get(s.containerNumber) || [] : []),
+      ];
+      const synth = synthesizeContainerExceptionNote(allTexts);
+      if (synth.note && (!s.operationalNote || synth.hasTonu || synth.hasEquipmentIssue)) {
+        if (s.operationalNote && !s.operationalNote.includes(synth.note)) {
+          // Keep user/explicit details if not already summarized cleanly
+          if (!/forklift/i.test(s.operationalNote) && /forklift/i.test(synth.note)) {
+            s.operationalNote = synth.note;
+          }
+        } else {
+          s.operationalNote = synth.note;
+        }
+      }
+
+      // Propagate shipment operationalNote back to any correlated CrucialEmailItem so the inbox tile shows it immediately!
+      for (const em of matchedEmails) {
+        if (!em.containerNumber && s.containerNumber) em.containerNumber = s.containerNumber;
+        if (!em.operationalNote && s.operationalNote) em.operationalNote = s.operationalNote;
+      }
+    }
+  }
+
   async getBootstrap(user?: BootstrapPayload["user"]): Promise<BootstrapPayload> {
     await this.initSupabaseSyncAndRealtime();
+    this.correlateContainerEventsAndNotes();
     const poller = pollerConfigStatus();
     return {
       mode: {

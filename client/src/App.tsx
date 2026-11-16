@@ -1,22 +1,27 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { useLocation } from "wouter";
 import type { LoadEntry } from "@shared/load-entry";
-import type { BootstrapPayload, CrucialEmailItem } from "@shared/tai-webhook-schema";
+import type { BootstrapPayload, CrucialEmailItem, OpsShipment } from "@shared/tai-webhook-schema";
+import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
 import { CompactLoadBuilder } from "./components/CompactLoadBuilder";
 import { UnifiedDispatchView } from "./components/UnifiedDispatchView";
 import { GmailToolkitPanel } from "./components/GmailToolkitPanel";
 import {
   Activity,
   Bot,
+  ExternalLink,
   FileCheck2,
   Inbox,
   Layers,
+  Mail,
   Moon,
+  Package,
   PanelRight,
   PlusCircle,
   Search,
   Send,
   Sun,
+  X,
   Zap,
 } from "lucide-react";
 
@@ -116,6 +121,9 @@ export const App: React.FC = () => {
   const [inboxFilter, setInboxFilter] = useState<string>("all");
   const [toast, setToast] = useState<string | null>(null);
   const [builderEntry, setBuilderEntry] = useState<LoadEntry>(() => createDefaultBuilderEntry());
+  const [reviewEmail, setReviewEmail] = useState<CrucialEmailItem | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [pasteEmailDraft, setPasteEmailDraft] = useState("");
   const [authGateUrl, setAuthGateUrl] = useState<string | null>(null);
   const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; text: string }>>([
     {
@@ -259,17 +267,88 @@ export const App: React.FC = () => {
     await refreshBootstrap();
   };
 
+  const handleSaveLoadNote = async (
+    shipmentId: string,
+    payload: { note?: string; pastedEmailText?: string; containerNumber?: string },
+  ) => {
+    const res = await fetch(`/api/loads/${shipmentId}/note`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const out = await res.json();
+    showToast(out.message || "Saved exception note");
+    setNoteDraft("");
+    setPasteEmailDraft("");
+    await refreshBootstrap();
+  };
+
   const handleApplyEmailAction = async (em: CrucialEmailItem) => {
     if (em.diffType === "new_tender") {
       extractMultiStopTender();
+      setReviewEmail(null);
       setLocation("/load-builder");
       return;
     }
     const res = await fetch(`/api/inbox/${em.id}/apply`, { method: "POST" });
     const out = await res.json();
     showToast(out.message || "Applied email diff");
+    setReviewEmail((prev) => (prev && prev.id === em.id ? { ...prev, applied: true } : prev));
     await refreshBootstrap();
   };
+
+  const openLoadInDispatch = useCallback(
+    (loadId: string) => {
+      setReviewEmail(null);
+      setExpandedLoadId(loadId);
+      setLocation("/dispatch");
+    },
+    [setLocation],
+  );
+
+  const loadShipmentIntoBuilder = useCallback(
+    (s: OpsShipment, em?: CrucialEmailItem) => {
+      setBuilderEntry({
+        shipmentType: "Truckload",
+        status: "Committed",
+        customer: { name: s.customer, taiOrganizationId: s.taiOrgId || "" },
+        references: {
+          customerPO: em?.extractedPo || s.po || "",
+          bolNumber: s.bol || "",
+          invoiceRef: em?.extractedInvoice || s.bol || "",
+          carrierProNumber: s.pro || "",
+          pickupNumber: "",
+        },
+        stops: s.stops.length >= 2 ? s.stops : createDefaultBuilderEntry().stops,
+        items: s.commodities.length >= 1 ? s.commodities : createDefaultBuilderEntry().items,
+        accessorials: [],
+        equipment: {
+          trailerSize: s.trailerSize || "Full",
+          trailerType: s.equip || "53 ft Van | Dry",
+          equipmentLength: "53",
+          mileage: s.mileage || 0,
+          stackable: false,
+        },
+        pricing: {
+          linehaulSell: em?.extractedAmount && em.extractedAmount > s.sell ? em.extractedAmount : s.sell,
+          fuelSell: 0,
+          linehaulBuy: s.buy,
+          fuelBuy: 0,
+        },
+        carrier: {
+          name: em?.extractedCarrier || s.carrier || "",
+          mcNumber: s.mc || "",
+          serviceLevel: "Normal",
+        },
+        specialInstructions: "",
+        sendToTai: true,
+      });
+      setReviewEmail(null);
+      setLocation("/load-builder");
+      showToast(`Loaded #${s.id} (${s.origin} → ${s.dest}) into Compact Builder.`);
+    },
+    [setLocation, showToast],
+  );
 
   const handleAskAi = async (q: string) => {
     const trimmed = q.trim();
@@ -606,51 +685,117 @@ export const App: React.FC = () => {
                 <div className="grid lg:grid-cols-2 gap-3.5">
                   {data.crucialEmails
                     .filter((e) => inboxFilter === "all" || e.category === inboxFilter)
-                    .map((em) => (
-                      <div
-                        key={em.id}
-                        className="p-4 rounded-xl flex flex-col justify-between gap-3"
-                        style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
-                      >
-                        <div className="space-y-1.5">
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="font-mono font-bold" style={{ color: "var(--pf-action)" }}>
-                              {em.loadId === "NEW" ? "NEW TENDER" : `LOAD #${em.loadId}`}
-                            </span>
-                            <span style={{ color: "var(--pf-text-subtle)" }}>
-                              {em.from} · {em.received}
-                            </span>
+                    .map((em) => {
+                      const matchedLoad = em.loadId !== "NEW" ? data.shipments.find((s) => s.id === em.loadId) : undefined;
+                      return (
+                        <div
+                          key={em.id}
+                          onClick={() => setReviewEmail(em)}
+                          className="p-4 rounded-xl flex flex-col justify-between gap-3 cursor-pointer transition-all hover:border-[#F0641E]"
+                          style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                        >
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between gap-2 text-xs">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {em.loadId === "NEW" ? (
+                                  <span className="font-mono font-bold" style={{ color: "var(--pf-action)" }}>
+                                    NEW TENDER
+                                  </span>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      openLoadInDispatch(em.loadId);
+                                    }}
+                                    className="font-mono font-bold underline-offset-2 hover:underline inline-flex items-center gap-1"
+                                    style={{ color: "var(--pf-action)" }}
+                                    title={`Open Load #${em.loadId} in Unified Dispatch`}
+                                  >
+                                    <Package size={12} /> LOAD #{em.loadId}
+                                  </button>
+                                )}
+                                {(em.containerNumber || matchedLoad?.containerNumber) && (
+                                  <span
+                                    className="font-mono text-[10px] px-1.5 py-0.5 rounded font-semibold"
+                                    style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)" }}
+                                  >
+                                    📦 {em.containerNumber || matchedLoad?.containerNumber}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="truncate" style={{ color: "var(--pf-text-subtle)" }}>
+                                {em.from} · {em.received}
+                              </span>
+                            </div>
+                            <div className="text-sm font-semibold leading-snug">{em.subject}</div>
+                            {(em.operationalNote || matchedLoad?.operationalNote) && (
+                              <div
+                                className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold leading-snug"
+                                style={{
+                                  background: "var(--pf-warning-dim)",
+                                  color: "var(--pf-warning)",
+                                  border: "1px solid rgba(212,160,74,0.35)",
+                                }}
+                              >
+                                {em.operationalNote || matchedLoad?.operationalNote}
+                              </div>
+                            )}
+                            {matchedLoad && (
+                              <div className="text-[11px] font-mono truncate" style={{ color: "var(--pf-primary)" }}>
+                                {matchedLoad.customer} · {matchedLoad.origin} → {matchedLoad.dest} · {matchedLoad.stage}
+                              </div>
+                            )}
+                            <p className="text-xs leading-relaxed line-clamp-3" style={{ color: "var(--pf-text-muted)" }}>
+                              {em.body}
+                            </p>
                           </div>
-                          <div className="text-sm font-semibold">{em.subject}</div>
-                          <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
-                            {em.body}
-                          </p>
-                        </div>
 
-                        <div className="space-y-2">
-                          <div
-                            className="p-2 rounded-lg text-xs flex items-center justify-between"
-                            style={{ background: "var(--pf-surface-raised)" }}
-                          >
-                            <span>{em.diffLabel}</span>
-                            <strong className="font-mono" style={{ color: "var(--pf-primary)" }}>
-                              {em.diffValue}
-                            </strong>
+                          <div className="space-y-2">
+                            <div
+                              className="p-2 rounded-lg text-xs flex items-center justify-between gap-2"
+                              style={{ background: "var(--pf-surface-raised)" }}
+                            >
+                              <span className="truncate">{em.diffLabel}</span>
+                              <strong className="font-mono shrink-0" style={{ color: "var(--pf-primary)" }}>
+                                {em.diffValue}
+                              </strong>
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setReviewEmail(em);
+                                }}
+                                className="py-2 px-2.5 rounded-lg text-xs font-semibold inline-flex items-center justify-center gap-1.5"
+                                style={{
+                                  background: "var(--pf-surface-raised)",
+                                  color: "var(--pf-text)",
+                                  border: "1px solid var(--pf-border)",
+                                }}
+                              >
+                                <Mail size={12} /> Review Email &amp; Load
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleApplyEmailAction(em);
+                                }}
+                                className="py-2 px-2.5 rounded-lg text-xs font-bold truncate"
+                                style={{
+                                  background: em.applied ? "var(--pf-primary-dim)" : "var(--pf-action)",
+                                  color: em.applied ? "var(--pf-primary)" : "#ffffff",
+                                }}
+                              >
+                                {em.applied ? "✓ Synced" : em.ctaLabel}
+                              </button>
+                            </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => handleApplyEmailAction(em)}
-                            className="w-full py-2 rounded-lg text-xs font-bold"
-                            style={{
-                              background: em.applied ? "var(--pf-primary-dim)" : "var(--pf-action)",
-                              color: em.applied ? "var(--pf-primary)" : "#ffffff",
-                            }}
-                          >
-                            {em.applied ? "✓ Synced to Load" : em.ctaLabel}
-                          </button>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                 </div>
               </div>
             )}
@@ -665,6 +810,7 @@ export const App: React.FC = () => {
                 onToggleExpand={(id) => setExpandedLoadId(expandedLoadId === id ? null : id)}
                 onAssignCarrier={handleAssignCarrier}
                 onUploadPod={handleUploadPod}
+                onSaveNote={handleSaveLoadNote}
                 onAskAi={(q) => {
                   handleAskAi(q);
                   setLocation("/ai-assistant");
@@ -837,6 +983,396 @@ export const App: React.FC = () => {
             )}
           </main>
         </div>
+
+        {/* EMAIL & LOAD SIDE-BY-SIDE REVIEW MODAL */}
+        {reviewEmail && (() => {
+          const linkedLoad =
+            reviewEmail.loadId !== "NEW"
+              ? data.shipments.find((s) => s.id === reviewEmail.loadId)
+              : undefined;
+          const modalContainer = reviewEmail.containerNumber || linkedLoad?.containerNumber;
+          const gmailUrl =
+            reviewEmail.permalink ||
+            `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(
+              reviewEmail.loadId !== "NEW" ? reviewEmail.loadId : reviewEmail.subject,
+            )}`;
+          const containerSearchUrl = modalContainer
+            ? buildGmailContainerSearchUrl(modalContainer, reviewEmail.loadId, reviewEmail.subject)
+            : null;
+          const activeNote = linkedLoad?.operationalNote || reviewEmail.operationalNote;
+
+          return (
+            <div
+              onClick={() => setReviewEmail(null)}
+              className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+            >
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="max-w-5xl w-full max-h-[90vh] flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+                style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+              >
+                <div className="pf-brand-rule shrink-0">
+                  <div style={{ background: "#1D2C5E" }} />
+                  <div style={{ background: "#682C87" }} />
+                  <div style={{ background: "#D52A3B" }} />
+                  <div style={{ background: "#F0641E" }} />
+                  <div style={{ background: "#F5B841" }} />
+                </div>
+
+                <div
+                  className="px-5 py-3 flex flex-wrap items-center justify-between gap-3 shrink-0"
+                  style={{ borderBottom: "1px solid var(--pf-border)" }}
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                      <span
+                        className="px-2 py-0.5 rounded font-bold"
+                        style={{ background: "var(--pf-primary-dim)", color: "var(--pf-primary)" }}
+                      >
+                        {reviewEmail.loadId === "NEW" ? "NEW TENDER" : `LOAD #${reviewEmail.loadId}`}
+                      </span>
+                      {modalContainer && (
+                        <span
+                          className="px-2 py-0.5 rounded font-bold"
+                          style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)" }}
+                        >
+                          📦 {modalContainer}
+                        </span>
+                      )}
+                      <span style={{ color: "var(--pf-text-muted)" }}>
+                        {reviewEmail.senderName ? `${reviewEmail.senderName} <${reviewEmail.from}>` : reviewEmail.from} ·{" "}
+                        {reviewEmail.received}
+                      </span>
+                    </div>
+                    <h2 className="text-base font-semibold truncate mt-1">{reviewEmail.subject}</h2>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                    {containerSearchUrl && (
+                      <a
+                        href={containerSearchUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
+                        style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)", border: "1px solid var(--pf-border)" }}
+                      >
+                        <Search size={12} /> Search Container # in Gmail
+                      </a>
+                    )}
+                    <a
+                      href={gmailUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
+                      style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                    >
+                      <ExternalLink size={12} /> Open in Gmail
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => setReviewEmail(null)}
+                      className="p-1.5 rounded-lg"
+                      style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                      title="Close review modal"
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="p-5 grid lg:grid-cols-12 gap-4 overflow-y-auto pf-scroll">
+                  {/* Left 7 Columns: Full Email Body & Container Events */}
+                  <div className="lg:col-span-7 space-y-3">
+                    {activeNote && (
+                      <div
+                        className="p-3 rounded-xl text-xs font-semibold"
+                        style={{
+                          background: "var(--pf-warning-dim)",
+                          color: "var(--pf-warning)",
+                          border: "1px solid rgba(212,160,74,0.4)",
+                        }}
+                      >
+                        {activeNote}
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap gap-2 text-xs font-mono">
+                      {reviewEmail.extractedPo && (
+                        <span className="px-2.5 py-1 rounded-md" style={{ background: "var(--pf-surface-raised)" }}>
+                          PO: <strong style={{ color: "var(--pf-primary)" }}>{reviewEmail.extractedPo}</strong>
+                        </span>
+                      )}
+                      {reviewEmail.extractedAmount && (
+                        <span className="px-2.5 py-1 rounded-md" style={{ background: "var(--pf-surface-raised)" }}>
+                          Rate: <strong style={{ color: "var(--pf-primary)" }}>${reviewEmail.extractedAmount.toLocaleString()}</strong>
+                        </span>
+                      )}
+                      {reviewEmail.extractedCarrier && (
+                        <span className="px-2.5 py-1 rounded-md" style={{ background: "var(--pf-surface-raised)" }}>
+                          Carrier: <strong>{reviewEmail.extractedCarrier}</strong>
+                        </span>
+                      )}
+                      {reviewEmail.extractedInvoice && (
+                        <span className="px-2.5 py-1 rounded-md" style={{ background: "var(--pf-surface-raised)" }}>
+                          Inv: <strong>{reviewEmail.extractedInvoice}</strong>
+                        </span>
+                      )}
+                      {reviewEmail.attachments &&
+                        reviewEmail.attachments.map((att, idx) => (
+                          <span
+                            key={idx}
+                            className="px-2.5 py-1 rounded-md"
+                            style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)" }}
+                          >
+                            📎 {att.filename || "attachment"}
+                          </span>
+                        ))}
+                    </div>
+
+                    <div
+                      className="p-4 rounded-xl text-xs leading-relaxed whitespace-pre-wrap max-h-[280px] overflow-y-auto pf-scroll"
+                      style={{ background: "var(--pf-bg)", border: "1px solid var(--pf-border)" }}
+                    >
+                      {reviewEmail.fullBody || reviewEmail.body}
+                    </div>
+
+                    {/* Container Event Timeline */}
+                    {linkedLoad?.containerEvents && linkedLoad.containerEvents.length > 0 && (
+                      <div
+                        className="p-3.5 rounded-xl space-y-2"
+                        style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                      >
+                        <div className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--pf-text-muted)" }}>
+                          All Correlated Events for {modalContainer ? `Container ${modalContainer}` : `Load #${linkedLoad.id}`} ({linkedLoad.containerEvents.length})
+                        </div>
+                        <div className="space-y-1.5">
+                          {linkedLoad.containerEvents.map((ev) => (
+                            <div
+                              key={ev.id}
+                              className="p-2.5 rounded-lg text-xs space-y-0.5"
+                              style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span
+                                  className="font-mono text-[10px] font-bold uppercase px-1.5 py-0.5 rounded"
+                                  style={{
+                                    background: ev.kind === "tonu" ? "var(--pf-danger-dim)" : "var(--pf-info-dim)",
+                                    color: ev.kind === "tonu" ? "var(--pf-danger)" : "var(--pf-info)",
+                                  }}
+                                >
+                                  {ev.kind}
+                                </span>
+                                <span className="font-mono text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
+                                  {ev.from} · {ev.timestamp}
+                                </span>
+                              </div>
+                              <div className="font-semibold">{ev.subject}</div>
+                              <div style={{ color: "var(--pf-text-muted)" }}>{ev.summary}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Right 5 Columns: Linked Load Review + Inline Exception Note Editor */}
+                  <div className="lg:col-span-5 space-y-3">
+                    {linkedLoad ? (
+                      <div
+                        className="p-4 rounded-xl space-y-3"
+                        style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono text-xs font-bold" style={{ color: "var(--pf-action)" }}>
+                            LINKED LOAD #{linkedLoad.id}
+                          </span>
+                          <span
+                            className="px-2 py-0.5 rounded-full text-[11px] font-semibold"
+                            style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)" }}
+                          >
+                            {linkedLoad.stage} · {linkedLoad.rawStatus}
+                          </span>
+                        </div>
+
+                        <div>
+                          <div className="text-sm font-semibold">{linkedLoad.customer}</div>
+                          <div className="text-xs font-medium mt-0.5" style={{ color: "var(--pf-text-muted)" }}>
+                            {linkedLoad.origin} → {linkedLoad.dest}
+                          </div>
+                        </div>
+
+                        <div
+                          className="p-2.5 rounded-lg grid grid-cols-2 gap-2 text-xs font-mono"
+                          style={{ background: "var(--pf-surface)" }}
+                        >
+                          <div>
+                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
+                              DATES
+                            </div>
+                            <div>
+                              {linkedLoad.shipDate} → {linkedLoad.delivDate}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
+                              EQUIPMENT / WT
+                            </div>
+                            <div className="truncate">{linkedLoad.equip}</div>
+                          </div>
+                          <div>
+                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
+                              SELL / BUY / MGN
+                            </div>
+                            <div>
+                              ${linkedLoad.sell.toLocaleString()} / ${linkedLoad.buy.toLocaleString()}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
+                              CONTAINER / POD
+                            </div>
+                            <div>
+                              {linkedLoad.containerNumber || linkedLoad.po || "—"} · {linkedLoad.podCount} POD
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="text-xs space-y-1">
+                          <div>
+                            <strong style={{ color: "var(--pf-text-muted)" }}>Carrier:</strong>{" "}
+                            {linkedLoad.carrier || "Unassigned"}
+                          </div>
+                          <div>
+                            <strong style={{ color: "var(--pf-text-muted)" }}>BOL / Ref:</strong>{" "}
+                            <span className="font-mono">{linkedLoad.bol || "—"}</span>
+                          </div>
+                          <div>
+                            <strong style={{ color: "var(--pf-text-muted)" }}>Location:</strong> {linkedLoad.location}
+                          </div>
+                          <div className="font-mono text-[11px]" style={{ color: "var(--pf-primary)" }}>
+                            {linkedLoad.writebackState}
+                          </div>
+                        </div>
+
+                        {/* Operational Note & Paste Container Email Extractor */}
+                        <div className="p-2.5 rounded-lg space-y-2" style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}>
+                          <div className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--pf-text-muted)" }}>
+                            Operational Note / Paste Container Email
+                          </div>
+                          <textarea
+                            rows={2}
+                            value={pasteEmailDraft || noteDraft}
+                            onChange={(e) => setPasteEmailDraft(e.target.value)}
+                            placeholder="Paste email about CAAU724710-0 / forklift breakdown / TONU, or type an operational note…"
+                            className="pf-input"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const txt = (pasteEmailDraft || noteDraft).trim();
+                              if (!txt) return;
+                              handleSaveLoadNote(linkedLoad.id, {
+                                pastedEmailText: txt,
+                                containerNumber: modalContainer || undefined,
+                              });
+                            }}
+                            className="w-full py-1.5 px-2.5 rounded-lg text-xs font-semibold"
+                            style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
+                          >
+                            Extract Container # &amp; Save Exception Note
+                          </button>
+                        </div>
+
+                        <div className="space-y-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => handleApplyEmailAction(reviewEmail)}
+                            className="w-full py-2 px-3 rounded-lg text-xs font-bold"
+                            style={{
+                              background: reviewEmail.applied ? "var(--pf-primary-dim)" : "var(--pf-action)",
+                              color: reviewEmail.applied ? "var(--pf-primary)" : "#ffffff",
+                            }}
+                          >
+                            {reviewEmail.applied ? "✓ Email Update Synced" : reviewEmail.ctaLabel}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openLoadInDispatch(linkedLoad.id)}
+                            className="w-full py-2 px-3 rounded-lg text-xs font-semibold"
+                            style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                          >
+                            ⇄ Open Full Load #{linkedLoad.id} in Unified Dispatch
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => loadShipmentIntoBuilder(linkedLoad, reviewEmail)}
+                            className="w-full py-2 px-3 rounded-lg text-xs font-semibold"
+                            style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                          >
+                            + Copy Load to Compact Builder
+                          </button>
+                        </div>
+                      </div>
+                    ) : reviewEmail.loadId === "NEW" ? (
+                      <div
+                        className="p-4 rounded-xl space-y-3"
+                        style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                      >
+                        <div className="font-mono text-xs font-bold" style={{ color: "var(--pf-action)" }}>
+                          UNBOOKED CUSTOMER TENDER
+                        </div>
+                        <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
+                          Ready to extract stops, origin/destination ZIPs, piece counts, weights, and commodity descriptions into the TAI Compact Load Builder.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => handleApplyEmailAction(reviewEmail)}
+                          className="w-full py-2 px-3 rounded-lg text-xs font-bold"
+                          style={{ background: "var(--pf-action)", color: "#ffffff" }}
+                        >
+                          + Extract to Compact Load Builder
+                        </button>
+                      </div>
+                    ) : (
+                      <div
+                        className="p-4 rounded-xl space-y-3"
+                        style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                      >
+                        <div className="font-mono text-xs font-bold" style={{ color: "var(--pf-action)" }}>
+                          LOAD #{reviewEmail.loadId}
+                        </div>
+                        <p className="text-xs" style={{ color: "var(--pf-text-muted)" }}>
+                          Search this shipment in Unified Dispatch or apply the extracted update directly.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => handleApplyEmailAction(reviewEmail)}
+                          className="w-full py-2 px-3 rounded-lg text-xs font-bold"
+                          style={{ background: "var(--pf-action)", color: "#ffffff" }}
+                        >
+                          {reviewEmail.applied ? "✓ Applied" : reviewEmail.ctaLabel}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const id = reviewEmail.loadId;
+                            setReviewEmail(null);
+                            setSearchQuery(id);
+                            setLocation("/dispatch");
+                          }}
+                          className="w-full py-2 px-3 rounded-lg text-xs font-semibold"
+                          style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                        >
+                          ↗ Search #{reviewEmail.loadId} in Unified Dispatch
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* DOCKABLE 410px SHARED-HOST GMAIL TOOLKIT PANEL */}
         {dockToolkit && (

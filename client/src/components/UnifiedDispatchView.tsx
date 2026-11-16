@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import type { CarrierOption, OpsShipment } from "@shared/tai-webhook-schema";
-import { CheckCircle2, ChevronDown, ChevronRight, MapPin, Upload } from "lucide-react";
+import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
+import { CheckCircle2, ChevronDown, ChevronRight, MapPin, Search, Upload } from "lucide-react";
 
 interface UnifiedDispatchViewProps {
   shipments: OpsShipment[];
@@ -10,6 +11,10 @@ interface UnifiedDispatchViewProps {
   onToggleExpand: (id: string) => void;
   onAssignCarrier: (shipmentId: string, carrierName: string, buyRate: number) => Promise<void>;
   onUploadPod: (shipmentId: string) => Promise<void>;
+  onSaveNote: (
+    shipmentId: string,
+    payload: { note?: string; pastedEmailText?: string; containerNumber?: string },
+  ) => Promise<void>;
   onAskAi: (question: string) => void;
 }
 
@@ -23,18 +28,22 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
   onToggleExpand,
   onAssignCarrier,
   onUploadPod,
+  onSaveNote,
   onAskAi,
 }) => {
   const [stageFilter, setStageFilter] = useState<string>("All");
   const [draftCarrier, setDraftCarrier] = useState<Record<string, string>>({});
   const [draftBuy, setDraftBuy] = useState<Record<string, number>>({});
+  const [draftNotes, setDraftNotes] = useState<Record<string, string>>({});
 
   const filtered = shipments.filter((s) => {
     if (stageFilter === "Missing POD" && !(s.stage === "Delivered" && s.podCount === 0)) return false;
     if (stageFilter !== "All" && stageFilter !== "Missing POD" && s.stage !== stageFilter) return false;
     if (!searchQuery) return true;
     const q = searchQuery.toLowerCase();
-    return `${s.id} ${s.customer} ${s.origin} ${s.dest} ${s.carrier} ${s.po} ${s.equip}`.toLowerCase().includes(q);
+    return `${s.id} ${s.customer} ${s.origin} ${s.dest} ${s.carrier} ${s.po} ${s.equip} ${s.containerNumber || ""} ${s.operationalNote || ""}`
+      .toLowerCase()
+      .includes(q);
   });
 
   const badgeStyle = (s: OpsShipment): React.CSSProperties => {
@@ -112,6 +121,14 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                     <span className="text-sm font-semibold">
                       {s.customer} · {s.origin} → {s.dest}
                     </span>
+                    {s.containerNumber && (
+                      <span
+                        className="font-mono text-[11px] px-2 py-0.5 rounded font-semibold"
+                        style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)" }}
+                      >
+                        📦 {s.containerNumber}
+                      </span>
+                    )}
                     {s.po ? (
                       <span
                         className="font-mono text-[11px] px-2 py-0.5 rounded"
@@ -141,6 +158,18 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                       <MapPin size={11} /> {s.location}
                     </span>
                   </div>
+                  {s.operationalNote && (
+                    <div
+                      className="mt-1 px-2.5 py-1 rounded text-[11px] font-semibold inline-block"
+                      style={{
+                        background: "var(--pf-warning-dim)",
+                        color: "var(--pf-warning)",
+                        border: "1px solid rgba(212,160,74,0.35)",
+                      }}
+                    >
+                      {s.operationalNote}
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-4 shrink-0">
@@ -172,6 +201,29 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                   className="p-4 space-y-3.5"
                   style={{ background: "var(--pf-surface-raised)", borderTop: "1px solid var(--pf-border)" }}
                 >
+                  {s.operationalNote && (
+                    <div
+                      className="px-3.5 py-2 rounded-lg text-xs font-semibold flex flex-wrap items-center justify-between gap-2"
+                      style={{
+                        background: "var(--pf-warning-dim)",
+                        color: "var(--pf-warning)",
+                        border: "1px solid rgba(212,160,74,0.4)",
+                      }}
+                    >
+                      <span>{s.operationalNote}</span>
+                      {s.containerNumber && (
+                        <a
+                          href={buildGmailContainerSearchUrl(s.containerNumber, s.id)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 underline font-mono"
+                        >
+                          <Search size={11} /> Search {s.containerNumber} in Gmail
+                        </a>
+                      )}
+                    </div>
+                  )}
+
                   <div
                     className="px-3 py-2 rounded-lg flex flex-wrap items-center justify-between gap-2 text-xs"
                     style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
@@ -181,7 +233,7 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                       <span className="font-mono">{s.writebackState}</span>
                     </div>
                     <div className="font-mono" style={{ color: "var(--pf-text-muted)" }}>
-                      BOL: {s.bol || "—"} · PRO: {s.pro || "—"} · RateCon: {s.rateconStatus}
+                      {s.containerNumber ? `Container: ${s.containerNumber} · ` : ""}BOL: {s.bol || "—"} · PRO: {s.pro || "—"} · RateCon: {s.rateconStatus}
                       {s.invoiceStatus ? ` · ${s.invoiceStatus}` : ""}
                     </div>
                   </div>
@@ -310,6 +362,67 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                           ✦ Ask Copilot
                         </button>
                       </div>
+                    </div>
+                  </div>
+
+                  {/* Container Event History & Operational Note Box */}
+                  <div
+                    className="p-3 rounded-xl space-y-2.5"
+                    style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--pf-text-muted)" }}>
+                        Container Events &amp; Exception Note {s.containerNumber ? `(${s.containerNumber})` : ""}
+                      </span>
+                      {s.containerNumber && (
+                        <a
+                          href={buildGmailContainerSearchUrl(s.containerNumber, s.id)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[11px] font-mono inline-flex items-center gap-1 hover:underline"
+                          style={{ color: "var(--pf-info)" }}
+                        >
+                          <Search size={11} /> Search All Container Emails in Gmail
+                        </a>
+                      )}
+                    </div>
+
+                    {s.containerEvents && s.containerEvents.length > 0 && (
+                      <div className="space-y-1.5">
+                        {s.containerEvents.map((ev) => (
+                          <div key={ev.id} className="p-2 rounded text-xs" style={{ background: "var(--pf-surface-raised)" }}>
+                            <div className="flex items-center justify-between gap-2 text-[11px] font-mono">
+                              <strong style={{ color: ev.kind === "tonu" ? "var(--pf-danger)" : "var(--pf-primary)" }}>
+                                [{ev.kind.toUpperCase()}] {ev.subject}
+                              </strong>
+                              <span style={{ color: "var(--pf-text-subtle)" }}>{ev.timestamp}</span>
+                            </div>
+                            <div style={{ color: "var(--pf-text-muted)" }}>{ev.summary}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="flex gap-2">
+                      <input
+                        value={draftNotes[s.id] ?? s.operationalNote ?? ""}
+                        onChange={(e) => setDraftNotes({ ...draftNotes, [s.id]: e.target.value })}
+                        placeholder="Add/update TONU or equipment breakdown note (or paste container email)…"
+                        className="pf-input flex-1"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onSaveNote(s.id, {
+                            pastedEmailText: draftNotes[s.id] ?? s.operationalNote ?? "",
+                            containerNumber: s.containerNumber,
+                          })
+                        }
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold shrink-0"
+                        style={{ background: "var(--pf-action)", color: "#ffffff" }}
+                      >
+                        Save Note
+                      </button>
                     </div>
                   </div>
                 </div>

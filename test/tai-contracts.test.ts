@@ -13,6 +13,13 @@ import {
   verifyWebhookSecretIfConfigured,
 } from "../server/tai-service";
 import { isPendingReadBack } from "../server/tai-writeback-poller";
+import {
+  buildGmailContainerSearchUrl,
+  extractContainerNumbers,
+  formatContainerCompact,
+  sameContainerNumber,
+  synthesizeContainerExceptionNote,
+} from "../shared/container-extractor";
 
 function makeSampleEntry(): LoadEntry {
   return {
@@ -172,4 +179,25 @@ test("pending read-back marker is detected so parked rows are re-read without re
   assert.equal(marker.readBackRounds, 2);
   assert.equal(isPendingReadBack({ ok: true }), null);
   assert.equal(verifyWebhookSecretIfConfigured({}), true);
+});
+
+test("container extractor correlates CAAU724710-0 / CAAU7247100 and synthesizes TONU forklift breakdown notes", () => {
+  const extracted = extractContainerNumbers("Subject: IMC CAAU724710-0 — Shipment ID: 132702126");
+  assert.deepEqual(extracted, ["CAAU724710-0"]);
+  assert.equal(formatContainerCompact(extracted[0]), "CAAU7247100");
+  assert.equal(sameContainerNumber("CAAU724710-0", "caau7247100"), true);
+
+  const searchUrl = buildGmailContainerSearchUrl("CAAU724710-0", "132702126");
+  assert.match(searchUrl, /CAAU724710-0/);
+  assert.match(searchUrl, /CAAU7247100/);
+  assert.match(searchUrl, /132702126/);
+
+  const synth = synthesizeContainerExceptionNote([
+    "Here is the Carrier Confirmation TONU for shipment 132702126",
+    "This one didn't pickup because forklift went down, paid a TONU and waiting for the forklift to be repaired",
+  ]);
+  assert.equal(synth.hasTonu, true);
+  assert.equal(synth.hasEquipmentIssue, true);
+  assert.match(String(synth.note), /TONU PAID/i);
+  assert.match(String(synth.note), /forklift/i);
 });

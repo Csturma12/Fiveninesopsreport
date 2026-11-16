@@ -2,6 +2,16 @@ import type { LoadEntryItem, LoadEntryStop } from "./load-entry";
 
 export type DispatchStage = "Needs truck" | "Assigned" | "In transit" | "Delivered";
 
+export interface ContainerEventItem {
+  id: string;
+  timestamp: string;
+  from: string;
+  subject: string;
+  summary: string;
+  kind: "tonu" | "exception" | "email" | "status";
+  permalink?: string;
+}
+
 export interface OpsShipment {
   id: string;
   customer: string;
@@ -18,6 +28,9 @@ export interface OpsShipment {
   po: string;
   bol: string;
   pro: string;
+  containerNumber?: string;
+  operationalNote?: string;
+  containerEvents?: ContainerEventItem[];
   shipDate: string;
   delivDate: string;
   equip: string;
@@ -39,6 +52,7 @@ export interface CrucialEmailItem {
   category: "tenders" | "diffs" | "pod";
   subject: string;
   from: string;
+  senderName?: string;
   received: string;
   loadId: string; // 'NEW' for unbooked tenders
   diffType: "new_tender" | "missing_po" | "rate_mismatch" | "missing_pod";
@@ -46,6 +60,16 @@ export interface CrucialEmailItem {
   diffValue: string;
   ctaLabel: string;
   body: string;
+  fullBody?: string;
+  threadId?: string;
+  permalink?: string;
+  containerNumber?: string;
+  operationalNote?: string;
+  extractedPo?: string;
+  extractedAmount?: number;
+  extractedCarrier?: string;
+  extractedInvoice?: string;
+  attachments?: Array<{ filename?: string; mimeType?: string }>;
   applied?: boolean;
 }
 

@@ -8,7 +8,8 @@ import type {
   SavedFacility,
 } from "@shared/tai-webhook-schema";
 import { CompactLoadBuilder } from "./CompactLoadBuilder";
-import { Send } from "lucide-react";
+import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
+import { ExternalLink, Search, Send } from "lucide-react";
 
 interface GmailToolkitPanelProps {
   shipments: OpsShipment[];
@@ -118,39 +119,104 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
                 className="p-3 rounded-xl space-y-2"
                 style={{ background: "var(--pf-surface)", border: "2px solid var(--pf-action)" }}
               >
-                <div className="flex items-center justify-between text-[11px]">
+                <div className="flex items-center justify-between text-[11px] gap-2">
                   <span className="font-bold uppercase tracking-wider" style={{ color: "var(--pf-action)" }}>
-                    Open Gmail Thread
+                    Selected Email &amp; Load
                   </span>
-                  <span className="font-mono" style={{ color: "var(--pf-text-muted)" }}>
-                    {openEmail.loadId === "NEW" ? "New Tender" : `#${openEmail.loadId}`}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    {openEmail.containerNumber && (
+                      <a
+                        href={buildGmailContainerSearchUrl(openEmail.containerNumber, openEmail.loadId)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 hover:underline font-mono"
+                        style={{ color: "var(--pf-info)" }}
+                        title="Search all emails mentioning this container #"
+                      >
+                        <Search size={10} /> {openEmail.containerNumber}
+                      </a>
+                    )}
+                    <a
+                      href={
+                        openEmail.permalink ||
+                        `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(
+                          openEmail.loadId !== "NEW" ? openEmail.loadId : openEmail.subject,
+                        )}`
+                      }
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 hover:underline"
+                      style={{ color: "var(--pf-primary)" }}
+                    >
+                      <ExternalLink size={11} /> Gmail
+                    </a>
+                    <span className="font-mono" style={{ color: "var(--pf-text-muted)" }}>
+                      {openEmail.loadId === "NEW" ? "New Tender" : `#${openEmail.loadId}`}
+                    </span>
+                  </div>
                 </div>
+
                 <div className="text-xs font-semibold leading-snug">{openEmail.subject}</div>
+                <div className="text-[11px]" style={{ color: "var(--pf-text-subtle)" }}>
+                  {openEmail.senderName || openEmail.from} · {openEmail.received}
+                </div>
+
+                {openEmail.operationalNote && (
+                  <div
+                    className="p-2 rounded text-[11px] font-semibold"
+                    style={{ background: "var(--pf-warning-dim)", color: "var(--pf-warning)" }}
+                  >
+                    {openEmail.operationalNote}
+                  </div>
+                )}
+
+                <div
+                  className="p-2 rounded text-[11px] leading-relaxed whitespace-pre-wrap max-h-36 overflow-y-auto pf-scroll"
+                  style={{ background: "var(--pf-bg)", border: "1px solid var(--pf-border)", color: "var(--pf-text-muted)" }}
+                >
+                  {openEmail.fullBody || openEmail.body}
+                </div>
+
                 <div
                   className="p-2 rounded text-[11px] flex items-center justify-between gap-2"
                   style={{ background: "var(--pf-surface-raised)" }}
                 >
-                  <span>{openEmail.diffLabel}</span>
-                  <strong className="font-mono" style={{ color: "var(--pf-primary)" }}>
+                  <span className="truncate">{openEmail.diffLabel}</span>
+                  <strong className="font-mono shrink-0" style={{ color: "var(--pf-primary)" }}>
                     {openEmail.diffValue}
                   </strong>
                 </div>
-                <button
-                  type="button"
-                  onClick={async () => {
-                    if (openEmail.diffType === "new_tender") {
-                      onExtractTender();
-                      setTab("builder");
-                    } else {
-                      await onApplyEmailAction(openEmail);
-                    }
-                  }}
-                  className="w-full py-2 rounded-lg text-xs font-bold"
-                  style={{ background: "var(--pf-action)", color: "#ffffff" }}
-                >
-                  {openEmail.applied ? "✓ Synced" : openEmail.ctaLabel}
-                </button>
+
+                <div className="flex gap-1.5">
+                  {openEmail.loadId !== "NEW" && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setExpandedId(openEmail.loadId);
+                        setTab("dispatch");
+                      }}
+                      className="px-2.5 py-2 rounded-lg text-xs font-semibold shrink-0"
+                      style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                    >
+                      View Load #{openEmail.loadId}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (openEmail.diffType === "new_tender") {
+                        onExtractTender();
+                        setTab("builder");
+                      } else {
+                        await onApplyEmailAction(openEmail);
+                      }
+                    }}
+                    className="flex-1 py-2 px-2.5 rounded-lg text-xs font-bold truncate"
+                    style={{ background: "var(--pf-action)", color: "#ffffff" }}
+                  >
+                    {openEmail.applied ? "✓ Synced" : openEmail.ctaLabel}
+                  </button>
+                </div>
               </div>
             )}
 
@@ -215,7 +281,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
                       {s.origin} → {s.dest}
                     </div>
                     <div className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>
-                      {s.stage} · {s.carrier || "Needs carrier"} · {totWt.toLocaleString()} lbs
+                      {s.containerNumber ? `📦 ${s.containerNumber} · ` : ""}{s.stage} · {s.carrier || "Needs carrier"} · {totWt.toLocaleString()} lbs
                     </div>
                   </button>
                   {exp && (
@@ -223,6 +289,11 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
                       className="p-2.5 space-y-1.5 text-[11px]"
                       style={{ background: "var(--pf-surface-raised)", borderTop: "1px solid var(--pf-border)" }}
                     >
+                      {s.operationalNote && (
+                        <div className="p-1.5 rounded font-semibold" style={{ background: "var(--pf-warning-dim)", color: "var(--pf-warning)" }}>
+                          {s.operationalNote}
+                        </div>
+                      )}
                       {s.stops.map((st, idx) => (
                         <div key={idx}>
                           <strong>{st.stopType}:</strong> {st.companyName} ({st.city}, {st.state}{" "}
