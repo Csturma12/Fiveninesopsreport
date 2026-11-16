@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import type { LoadEntry } from "@shared/load-entry";
 import type {
   CarrierOption,
@@ -9,7 +9,7 @@ import type {
 } from "@shared/tai-webhook-schema";
 import { CompactLoadBuilder } from "./CompactLoadBuilder";
 import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
-import { ExternalLink, Search, Send, Trash2, UserPlus } from "lucide-react";
+import { ClipboardPaste, ExternalLink, Search, Send, Sparkles, Trash2, UserPlus } from "lucide-react";
 
 interface GmailToolkitPanelProps {
   shipments: OpsShipment[];
@@ -50,6 +50,77 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
   const [activeEmailIdx, setActiveEmailIdx] = useState<number>(0);
   const [expandedId, setExpandedId] = useState<string | null>(shipments[0]?.id ?? null);
   const [aiInput, setAiInput] = useState("");
+  const [liveSubject, setLiveSubject] = useState<string>("");
+  const [showPasteBox, setShowPasteBox] = useState<boolean>(false);
+  const [pasteEmailText, setPasteEmailText] = useState<string>("");
+  const [extracting, setExtracting] = useState<boolean>(false);
+  const [alternateEquip, setAlternateEquip] = useState<string[]>([]);
+  const [panelNotice, setPanelNotice] = useState<string>("");
+
+  const notify = (msg: string) => {
+    setPanelNotice(msg);
+    onToast(msg);
+  };
+
+  const extractEmailToBuilder = async (payload: { subject?: string; sender?: string; bodyText: string }) => {
+    setExtracting(true);
+    try {
+      const res = await fetch("/api/extract-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const out = await res.json();
+      if (!out.ok || !out.entry) {
+        notify(out.message || "Could not extract load from email");
+        return;
+      }
+      onBuilderChange(out.entry);
+      setAlternateEquip(Array.isArray(out.alternateEquipment) ? out.alternateEquipment : []);
+      setTab("builder");
+      setShowPasteBox(false);
+      notify(out.summary || "Extracted open email into Compact Builder");
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      if (window.parent !== window && event.source !== window.parent) return;
+      const data = event.data;
+      if (!data || typeof data !== "object") return;
+      if (data.type === "FIVENINES_GMAIL_CONTEXT" && data.payload?.subject) {
+        setLiveSubject(String(data.payload.subject));
+      }
+      if (data.type === "FIVENINES_GMAIL_CAPTURED") {
+        if (!data.ok || !data.payload) {
+          setShowPasteBox(true);
+          notify(data.error || "No open Gmail thread detected — paste email text below.");
+          return;
+        }
+        if (data.payload.subject) setLiveSubject(String(data.payload.subject));
+        void extractEmailToBuilder({
+          subject: data.payload.subject,
+          sender: data.payload.sender,
+          bodyText: data.payload.bodyText || "",
+        });
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
+  const requestOpenGmailCapture = () => {
+    if (window.parent !== window) {
+      const requestId = `cap-${Date.now()}`;
+      window.parent.postMessage({ type: "FIVENINES_CAPTURE_GMAIL_REQ", requestId }, "*");
+      notify("Reading open Gmail conversation…");
+    } else {
+      setShowPasteBox((v) => !v);
+      notify("Paste Gmail tender text below to extract directly into TAI fields.");
+    }
+  };
 
   const openEmail = crucialEmails[activeEmailIdx] || crucialEmails[0];
   const openCount = crucialEmails.filter((e) => !e.applied).length;
@@ -114,6 +185,17 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
       </div>
 
       {/* Body */}
+      {panelNotice && (
+        <div
+          className="px-2.5 py-1.5 text-[11px] flex items-center justify-between gap-2 shrink-0"
+          style={{ background: "#163528", color: "#8ce6b8", borderBottom: "1px solid #255943" }}
+        >
+          <span className="truncate">✓ {panelNotice}</span>
+          <button type="button" onClick={() => setPanelNotice("")} className="underline shrink-0">
+            ×
+          </button>
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto pf-scroll p-2.5 space-y-2.5">
         {tab === "inbox" && (
           <>
@@ -357,21 +439,104 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
         )}
 
         {tab === "builder" && (
-          <CompactLoadBuilder
-            compact={true}
-            entry={builderEntry}
-            onChange={onBuilderChange}
-            facilities={facilities}
-            customers={customers}
-            carriers={carriers}
-            onBooked={(ids, msg) => {
-              onBooked(ids, msg);
-              setTab("dispatch");
-              if (ids[0]) setExpandedId(ids[0]);
-            }}
-            onToast={onToast}
-            onExtractSampleTender={onExtractTender}
-          />
+          <div className="space-y-2">
+            {/* Live Gmail Thread Capture & Quick Email Paste */}
+            <div
+              className="p-2 rounded-lg space-y-1.5"
+              style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+            >
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={extracting}
+                  onClick={requestOpenGmailCapture}
+                  className="flex-1 py-1.5 px-2.5 rounded text-[11px] font-bold inline-flex items-center justify-center gap-1"
+                  style={{ background: "var(--pf-action)", color: "#ffffff" }}
+                >
+                  <Sparkles size={11} /> {extracting ? "Extracting…" : "Capture Open Gmail"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowPasteBox((v) => !v)}
+                  className="py-1.5 px-2.5 rounded text-[11px] font-medium inline-flex items-center gap-1"
+                  style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                  title="Paste email or tender text manually"
+                >
+                  <ClipboardPaste size={11} /> Paste
+                </button>
+              </div>
+              {liveSubject && (
+                <div className="text-[10px] truncate" style={{ color: "var(--pf-primary)" }}>
+                  📧 Open Thread: {liveSubject}
+                </div>
+              )}
+              {alternateEquip.length > 0 && (
+                <div className="flex items-center gap-1 flex-wrap pt-0.5">
+                  <span className="text-[10px]" style={{ color: "var(--pf-text-muted)" }}>
+                    Alt Equip:
+                  </span>
+                  {alternateEquip.slice(0, 3).map((eq) => (
+                    <button
+                      key={eq}
+                      type="button"
+                      onClick={() =>
+                        onBuilderChange({
+                          ...builderEntry,
+                          equipment: { ...builderEntry.equipment, trailerType: eq },
+                        })
+                      }
+                      className="px-1.5 py-0.5 rounded text-[10px]"
+                      style={{
+                        background:
+                          builderEntry.equipment.trailerType === eq ? "var(--pf-primary-dim)" : "var(--pf-surface-raised)",
+                        color: builderEntry.equipment.trailerType === eq ? "var(--pf-primary)" : "var(--pf-text-muted)",
+                        border: "1px solid var(--pf-border)",
+                      }}
+                    >
+                      {eq}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {showPasteBox && (
+                <div className="space-y-1.5 pt-1">
+                  <textarea
+                    rows={3}
+                    value={pasteEmailText}
+                    onChange={(e) => setPasteEmailText(e.target.value)}
+                    placeholder="Paste Gmail tender email here (pickup, delivery, weight, tarps/conestoga)…"
+                    className="pf-input w-full text-[11px]"
+                  />
+                  <button
+                    type="button"
+                    disabled={extracting || !pasteEmailText.trim()}
+                    onClick={() => extractEmailToBuilder({ subject: liveSubject, bodyText: pasteEmailText })}
+                    className="w-full py-1.5 rounded text-[11px] font-bold"
+                    style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
+                  >
+                    Extract Pasted Email → Compact Builder
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <CompactLoadBuilder
+              compact={true}
+              entry={builderEntry}
+              onChange={onBuilderChange}
+              facilities={facilities}
+              customers={customers}
+              carriers={carriers}
+              onBooked={(ids, msg) => {
+                notify(msg);
+                onBooked(ids, msg);
+                setTab("dispatch");
+                if (ids[0]) setExpandedId(ids[0]);
+              }}
+              onToast={notify}
+              onExtractSampleTender={onExtractTender}
+            />
+          </div>
         )}
 
         {tab === "ai" && (

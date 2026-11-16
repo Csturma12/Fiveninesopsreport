@@ -1,10 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Five Nines Freight Toolkit (Compact v2)",
-  "version": "2.0.0",
-  "description": "Compact shared-host Gmail side panel for Primary Freight / Five Nines Operations (TAI-valid Load Builder, Crucial Action Inbox, Unified Dispatch & AI Copilot).",
-  "permissions": ["sidePanel", "storage"],
-  "host_permissions": ["https://mail.google.com/*", "https://fivenines-ops.fly.dev/*", "http://127.0.0.1:5090/*"],
+  "version": "2.1.0",
+  "description": "Compact shared-host Gmail side panel for Primary Freight / Five Nines Operations with live Gmail thread capture, TAI-valid Load Builder, Crucial Inbox, Unified Dispatch & SalesOps CRM.",
+  "permissions": ["sidePanel", "storage", "tabs", "scripting"],
+  "host_permissions": [
+    "https://mail.google.com/*",
+    "https://fivenines-ops.fly.dev/*",
+    "http://127.0.0.1:5090/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
@@ -13,5 +17,12 @@
   },
   "action": {
     "default_title": "Open Five Nines Freight Toolkit"
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://mail.google.com/*"],
+      "js": ["capture.js"],
+      "run_at": "document_idle"
+    }
+  ]
 }

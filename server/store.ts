@@ -103,6 +103,28 @@ const SEEDED_FACILITIES: SavedFacility[] = [
     contactName: "Receiving Gate 2",
     phone: "(318) 362-2000",
   },
+  {
+    id: "fac-6",
+    label: "Larkin Zelienople Plant — Zelienople, PA 16063",
+    companyName: "Larkin Refractory (Zelienople)",
+    streetAddress: "300 Tomlinson Drive",
+    city: "Zelienople",
+    state: "PA",
+    zipCode: "16063",
+    contactName: "Shipping",
+    phone: "",
+  },
+  {
+    id: "fac-7",
+    label: "West Monroe Receiving — 6551 Cypress St, West Monroe, LA 71291",
+    companyName: "West Monroe Receiving",
+    streetAddress: "6551 Cypress St",
+    city: "West Monroe",
+    state: "LA",
+    zipCode: "71291",
+    contactName: "",
+    phone: "",
+  },
 ];
 
 const SEEDED_CARRIERS: CarrierOption[] = [
@@ -742,8 +764,88 @@ const SEEDED_EMAILS: CrucialEmailItem[] = [
   },
 ];
 
-function mapSupabaseShipmentRow(r: Record<string, unknown>, existing?: OpsShipment): OpsShipment {
+const CITY_STATE_ZIP_FALLBACK: Record<string, string> = {
+  "BEAVER FALLS|PA": "15010",
+  "MONONGAHELA|PA": "15063",
+  "ZELIENOPLE|PA": "16063",
+  "LITHONIA|GA": "30058",
+  "MCDONOUGH|GA": "30253",
+  "ATLANTA|GA": "30301",
+  "SAVANNAH|GA": "31401",
+  "WILMINGTON|CA": "90744",
+  "LOS ANGELES|CA": "90058",
+  "LONG BEACH|CA": "90802",
+  "COMPTON|CA": "90220",
+  "MEMPHIS|TN": "38141",
+  "NASHVILLE|TN": "37210",
+  "NEWARK|NJ": "07114",
+  "TOLEDO|OH": "43612",
+  "CLEVELAND|OH": "44101",
+  "CINCINNATI|OH": "45202",
+  "MARKHAM|IL": "60428",
+  "CHICAGO|IL": "60601",
+  "ETHEL|LA": "70730",
+  "WEST MONROE|LA": "71291",
+  "NEW ORLEANS|LA": "70112",
+  "BATON ROUGE|LA": "70801",
+  "PHOENIX|AZ": "85043",
+  "HOUSTON|TX": "77013",
+  "LA PORTE|TX": "77571",
+  "DALLAS|TX": "75201",
+  "EL PASO|TX": "79927",
+  "NORTH CHARLESTON|SC": "29405",
+  "CHARLESTON|SC": "29405",
+  "LITTLE ROCK|AR": "72202",
+  "SALEM|VA": "24153",
+  "BIRMINGHAM|AL": "35203",
+};
+
+function resolveFacilityStopInfo(
+  city: string,
+  state: string,
+  customerName: string,
+  facilities: SavedFacility[],
+): { companyName: string; streetAddress: string; zipCode: string; savedFacilityMatched: boolean } {
+  const cNorm = String(city || "").trim().toUpperCase();
+  const sNorm = String(state || "").trim().toUpperCase();
+  const custNorm = String(customerName || "").trim().toUpperCase();
+
+  // Prefer facility matching both city+state and customer name if possible
+  const matches = facilities.filter(
+    (f) =>
+      f.city.trim().toUpperCase() === cNorm &&
+      f.state.trim().toUpperCase() === sNorm &&
+      /^\d{5}/.test(f.zipCode.trim()),
+  );
+  const exactCustMatch = custNorm
+    ? matches.find((f) => f.companyName.toUpperCase().includes(custNorm.split(" ")[0] || ""))
+    : undefined;
+  const hit = exactCustMatch || matches[0];
+  if (hit) {
+    return {
+      companyName: hit.companyName,
+      streetAddress: hit.streetAddress,
+      zipCode: hit.zipCode.slice(0, 5),
+      savedFacilityMatched: true,
+    };
+  }
+
+  const fallbackZip = CITY_STATE_ZIP_FALLBACK[`${cNorm}|${sNorm}`] || "";
+  return {
+    companyName: customerName || "",
+    streetAddress: "",
+    zipCode: fallbackZip,
+    savedFacilityMatched: false,
+  };
+}
+
+function mapSupabaseShipmentRow(
+  r: Record<string, unknown>,
+  existing?: OpsShipment,
+  facilities: SavedFacility[] = SEEDED_FACILITIES,
+): OpsShipment {
   const id = String(r.shipment_id || existing?.id || "");
+  const customerName = String(r.customer_name || existing?.customer || "Customer");
   const fromCity = String(r.from_city || existing?.stops[0]?.city || "");
   const fromState = String(r.from_state || existing?.stops[0]?.state || "");
   const toCity = String(r.to_city || existing?.stops[existing.stops.length - 1]?.city || "");
@@ -759,46 +861,58 @@ function mapSupabaseShipmentRow(r: Record<string, unknown>, existing?: OpsShipme
   const detectedContainers = extractContainerNumbers(`${poStr} ${bolStr} ${dbNotes} ${locStr}`);
   const containerNumber = detectedContainers[0] || existing?.containerNumber;
 
+  const puResolved = resolveFacilityStopInfo(fromCity, fromState, customerName, facilities);
+  const delResolved = resolveFacilityStopInfo(toCity, toState, customerName, facilities);
+
+  const stops =
+    existing?.stops &&
+    existing.stops.length >= 2 &&
+    existing.stops.every((s) => /^\d{5}/.test(s.zipCode) && s.zipCode !== "00000")
+      ? existing.stops
+      : [
+          {
+            stopType: "First Pickup" as const,
+            companyName: puResolved.companyName || customerName,
+            streetAddress: puResolved.streetAddress,
+            city: fromCity,
+            state: fromState,
+            zipCode: puResolved.zipCode,
+            country: "USA",
+            contactName: "",
+            phone: "",
+            instructions: "",
+            readyDate: String(r.ship_date || "2026-11-16").slice(0, 10),
+            timeOpen: "08:00",
+            timeClose: "15:00",
+            appointmentRequired: false,
+            savedFacilityMatched: puResolved.savedFacilityMatched,
+          },
+          {
+            stopType: "Last Drop" as const,
+            companyName: delResolved.companyName || "Consignee",
+            streetAddress: delResolved.streetAddress,
+            city: toCity,
+            state: toState,
+            zipCode: delResolved.zipCode,
+            country: "USA",
+            contactName: "",
+            phone: "",
+            instructions: "",
+            readyDate: String(r.delivery_date || "2026-11-17").slice(0, 10),
+            timeOpen: "09:00",
+            timeClose: "16:00",
+            appointmentRequired: false,
+            savedFacilityMatched: delResolved.savedFacilityMatched,
+          },
+        ];
+
   return {
     id,
-    customer: String(r.customer_name || existing?.customer || "Customer"),
+    customer: customerName,
     taiOrgId: r.customer_tai_organization_id ? String(r.customer_tai_organization_id) : existing?.taiOrgId,
     origin: `${fromCity}, ${fromState}`.replace(/^,\s*/, "") || existing?.origin || "Origin",
     dest: `${toCity}, ${toState}`.replace(/^,\s*/, "") || existing?.dest || "Destination",
-    stops: existing?.stops || [
-      {
-        stopType: "First Pickup",
-        companyName: String(r.customer_name || "Shipper"),
-        streetAddress: "",
-        city: fromCity,
-        state: fromState,
-        zipCode: "00000",
-        country: "USA",
-        contactName: "",
-        phone: "",
-        instructions: "",
-        readyDate: String(r.ship_date || "2026-11-16").slice(0, 10),
-        timeOpen: "08:00",
-        timeClose: "15:00",
-        appointmentRequired: false,
-      },
-      {
-        stopType: "Last Drop",
-        companyName: "Consignee",
-        streetAddress: "",
-        city: toCity,
-        state: toState,
-        zipCode: "00000",
-        country: "USA",
-        contactName: "",
-        phone: "",
-        instructions: "",
-        readyDate: String(r.delivery_date || "2026-11-17").slice(0, 10),
-        timeOpen: "09:00",
-        timeClose: "16:00",
-        appointmentRequired: false,
-      },
-    ],
+    stops,
     commodities: existing?.commodities || [
       {
         description: containerNumber ? `Containerized Freight (${containerNumber})` : "General Freight",
@@ -900,7 +1014,32 @@ class OpsStore {
     this.supabaseSyncedOnce = true;
 
     try {
-      // 1. Live Shipments
+      // 1. Live Facilities w/ ZIP codes first so live shipments inherit real addresses & ZIPs
+      const { data: facRows } = await sb
+        .from("facilities")
+        .select("id,company_name,street_address,city,state,zip_code,contact_name")
+        .neq("zip_code", "")
+        .limit(500);
+      if (Array.isArray(facRows) && facRows.length > 0) {
+        const remoteFacs = facRows.map((f: Record<string, unknown>) => ({
+          id: String(f.id),
+          label: `${f.company_name} — ${f.city}, ${f.state} ${f.zip_code}`,
+          companyName: String(f.company_name || ""),
+          streetAddress: String(f.street_address || ""),
+          city: String(f.city || ""),
+          state: String(f.state || ""),
+          zipCode: String(f.zip_code || ""),
+          contactName: String(f.contact_name || ""),
+          phone: "",
+        }));
+        const seenLabels = new Set(remoteFacs.map((f) => f.label.toLowerCase()));
+        this.facilities = [
+          ...remoteFacs,
+          ...SEEDED_FACILITIES.filter((f) => !seenLabels.has(f.label.toLowerCase())),
+        ];
+      }
+
+      // 2. Live Shipments
       const { data: shipRows } = await sb
         .from("shipments")
         .select(SHIPMENT_SELECT_COLS)
@@ -913,13 +1052,13 @@ class OpsStore {
         for (const r of shipRows as Record<string, unknown>[]) {
           const id = String(r.shipment_id || "");
           if (!id) continue;
-          merged.push(mapSupabaseShipmentRow(r, byId.get(id)));
+          merged.push(mapSupabaseShipmentRow(r, byId.get(id), this.facilities));
           byId.delete(id);
         }
         this.shipments = [...merged, ...byId.values()];
       }
 
-      // 2. Live Customers w/ TAI Organization IDs
+      // 3. Live Customers w/ TAI Organization IDs
       const { data: custRows } = await sb
         .from("customers")
         .select("name,tai_organization_id")
@@ -931,26 +1070,6 @@ class OpsStore {
           taiOrgId: c.tai_organization_id ? String(c.tai_organization_id) : "",
           city: "",
           state: "",
-        }));
-      }
-
-      // 3. Live Facilities w/ ZIP codes
-      const { data: facRows } = await sb
-        .from("facilities")
-        .select("id,company_name,street_address,city,state,zip_code,contact_name")
-        .neq("zip_code", "")
-        .limit(150);
-      if (Array.isArray(facRows) && facRows.length > 0) {
-        this.facilities = facRows.map((f: Record<string, unknown>) => ({
-          id: String(f.id),
-          label: `${f.company_name} — ${f.city}, ${f.state} ${f.zip_code}`,
-          companyName: String(f.company_name || ""),
-          streetAddress: String(f.street_address || ""),
-          city: String(f.city || ""),
-          state: String(f.state || ""),
-          zipCode: String(f.zip_code || ""),
-          contactName: String(f.contact_name || ""),
-          phone: "",
         }));
       }
 
@@ -1146,7 +1265,7 @@ class OpsStore {
             for (const mr of missingRows as Record<string, unknown>[]) {
               const id = String(mr.shipment_id || "");
               if (id) {
-                const updated = mapSupabaseShipmentRow(mr, byId.get(id));
+                const updated = mapSupabaseShipmentRow(mr, byId.get(id), this.facilities);
                 const existingIdx = this.shipments.findIndex((x) => x.id === id);
                 if (existingIdx >= 0) this.shipments[existingIdx] = updated;
                 else this.shipments.push(updated);
@@ -1170,7 +1289,7 @@ class OpsStore {
             const id = String(row?.shipment_id || "");
             if (!row || !id || this.deletedShipmentIds.has(id)) return;
             const idx = this.shipments.findIndex((s) => s.id === id);
-            const updated = mapSupabaseShipmentRow(row, idx >= 0 ? this.shipments[idx] : undefined);
+            const updated = mapSupabaseShipmentRow(row, idx >= 0 ? this.shipments[idx] : undefined, this.facilities);
             if (idx >= 0) this.shipments[idx] = updated;
             else this.shipments.unshift(updated);
 

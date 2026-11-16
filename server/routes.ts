@@ -4,6 +4,7 @@ import {
   sameContainerNumber,
   synthesizeContainerExceptionNote,
 } from "../shared/container-extractor";
+import { extractLoadEntryFromEmail } from "../shared/email-extractor";
 import { addSseClient, broadcastOpsEvent } from "./events";
 import { store } from "./store";
 import {
@@ -30,6 +31,22 @@ export function registerApiRoutes(app: Express): void {
   app.get("/api/bootstrap", async (req: Request, res: Response) => {
     const data = await store.getBootstrap(req.staffUser || null);
     res.json(data);
+  });
+
+  app.post("/api/extract-email", (req: Request, res: Response) => {
+    const bodyText = String(req.body?.bodyText || req.body?.text || "").trim();
+    const subject = String(req.body?.subject || "").trim();
+    const sender = String(req.body?.sender || req.body?.from || "").trim();
+    if (!bodyText && !subject) {
+      res.status(400).json({ ok: false, message: "Paste email text or open a Gmail thread first." });
+      return;
+    }
+    const result = extractLoadEntryFromEmail(
+      { subject, sender, bodyText },
+      store.customers,
+      store.facilities,
+    );
+    res.json({ ok: true, ...result });
   });
 
   app.post("/api/loads/preview", (req: Request, res: Response) => {

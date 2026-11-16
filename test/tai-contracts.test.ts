@@ -21,6 +21,7 @@ import {
   sameContainerNumber,
   synthesizeContainerExceptionNote,
 } from "../shared/container-extractor";
+import { extractLoadEntryFromEmail } from "../shared/email-extractor";
 
 function makeSampleEntry(): LoadEntry {
   return {
@@ -227,4 +228,36 @@ test("SalesOps CRM CRUD and inbox/shipment delete operations persist cleanly on 
     assert.equal(store.dismissEmail(firstEmailId), true);
     assert.equal(store.dismissedEmailIds.has(firstEmailId), true);
   }
+});
+
+test("email extractor parses Larkin Zelienople PA 16063 -> Lithonia GA 30058 4ft tarp tender with TAI-valid ZIPs", () => {
+  const result = extractLoadEntryFromEmail(
+    {
+      subject: "Pickup tomorrow Zelienople PA to Lithonia GA",
+      sender: "shipping@larkinrefractory.com",
+      bodyText: [
+        "Please book truck to pick up tomorrow at 300 Tomlinson Drive, Zelienople, PA 16063",
+        "Deliver to Larkin Refractory Solutions, 2331 Varkel Way, Lithonia, GA 30058.",
+        "16 pallets - refractory brick and Insulating Fire Brick, 45,727 lbs. PO P261110BD / P260914BD.",
+        "Flatbed or Conestoga OK, if flatbed take 4' tarps.",
+      ].join("\n"),
+    },
+    store.customers,
+    store.facilities,
+  );
+
+  assert.equal(result.entry.customer.name, "LARKIN REFRACTORY SOLUTIONS");
+  assert.equal(result.entry.customer.taiOrganizationId, "698049");
+  assert.equal(result.entry.stops[0].city, "Zelienople");
+  assert.equal(result.entry.stops[0].state, "PA");
+  assert.equal(result.entry.stops[0].zipCode, "16063");
+  assert.equal(result.entry.stops[1].city, "Lithonia");
+  assert.equal(result.entry.stops[1].state, "GA");
+  assert.equal(result.entry.stops[1].zipCode, "30058");
+  assert.equal(result.entry.items[0].piecesTotal, 16);
+  assert.equal(result.entry.items[0].weightTotal, 45727);
+  assert.equal(result.entry.equipment.trailerType, "48 ft Flatbed | Tarp");
+  assert.match(result.entry.specialInstructions, /4ft Tarps Required/i);
+  assert.ok(result.alternateEquipment.includes("53 ft Conestoga / Curtain Side"));
+  assert.equal(validateTaiLoadEntry(result.entry).length, 0);
 });

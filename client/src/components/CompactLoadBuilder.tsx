@@ -28,6 +28,7 @@ interface CompactLoadBuilderProps {
 }
 
 const INSTRUCTION_CHIPS = [
+  "4ft Tarps Required",
   "8ft Tarps Required",
   "Call 1 hr Prior",
   "MacroPoint Tracking",
@@ -65,6 +66,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   const [showExtras, setShowExtras] = useState<boolean>(false);
   const [showMoreMenu, setShowMoreMenu] = useState<boolean>(false);
   const [showJsonPreview, setShowJsonPreview] = useState<boolean>(false);
+  const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
   const [duplicateCount, setDuplicateCount] = useState<number>(1);
   const [submitting, setSubmitting] = useState<boolean>(false);
 
@@ -187,11 +189,15 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
     onChange({ ...entry, accessorials: nextAcc });
   };
 
-  const submitToTai = async () => {
+  const requestTaiBookingConfirm = () => {
     if (issues.length > 0) {
       onToast(`Complete required TAI field: ${issues[0].message}`);
       return;
     }
+    setShowConfirmModal(true);
+  };
+
+  const executeTaiBooking = async () => {
     setSubmitting(true);
     try {
       const res = await fetch("/api/loads/book", {
@@ -203,6 +209,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       if (!data.ok) {
         onToast(data.message || "TAI validation blocked booking");
       } else {
+        setShowConfirmModal(false);
         onBooked(data.createdIds, data.message);
       }
     } finally {
@@ -810,7 +817,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
           <button
             type="button"
             disabled={submitting}
-            onClick={submitToTai}
+            onClick={requestTaiBookingConfirm}
             className="flex-1 max-w-[260px] py-2 px-3 rounded-lg text-xs font-bold inline-flex items-center justify-center gap-1.5 transition-opacity"
             style={{ background: "var(--pf-action)", color: "#ffffff" }}
           >
@@ -890,6 +897,147 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
         >
           {JSON.stringify(taiRequestPreview, null, 2)}
         </pre>
+      )}
+
+      {showConfirmModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-3"
+          style={{ background: "rgba(9, 12, 18, 0.78)" }}
+          onClick={() => !submitting && setShowConfirmModal(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-xl p-4 space-y-3 shadow-2xl text-xs"
+            style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)", color: "var(--pf-text)" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-2 pb-2" style={{ borderBottom: "1px solid var(--pf-border)" }}>
+              <div>
+                <div className="font-serif font-bold text-sm">Generate this load in TAI?</div>
+                <div className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>
+                  Verify stops, equipment &amp; commodity before sending to TAI
+                  {duplicateCount > 1 ? ` (${duplicateCount} duplicate orders)` : ""}
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => setShowConfirmModal(false)}
+                className="p-1 rounded"
+                style={{ color: "var(--pf-text-muted)" }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            <div className="space-y-1.5 leading-relaxed">
+              <div>
+                <strong style={{ color: "var(--pf-text-muted)" }}>Customer:</strong>{" "}
+                <span className="font-semibold">{entry.customer.name || "Unlinked Spot Customer"}</span>{" "}
+                <span className="font-mono text-[11px]" style={{ color: "var(--pf-primary)" }}>
+                  ({entry.customer.taiOrganizationId ? `TAI Org #${entry.customer.taiOrganizationId}` : "Unlinked OK"})
+                </span>
+              </div>
+
+              {entry.stops.map((st, idx) => {
+                const roleLabel =
+                  idx === 0 ? "Pickup" : idx === entry.stops.length - 1 ? "Delivery" : `Stop ${idx + 1}`;
+                return (
+                  <div key={idx}>
+                    <strong style={{ color: "var(--pf-text-muted)" }}>{roleLabel}:</strong>{" "}
+                    <span>
+                      {st.companyName} — {[st.streetAddress, st.city, st.state, st.zipCode].filter(Boolean).join(", ")}{" "}
+                      <span className="font-mono text-[11px]" style={{ color: "var(--pf-text-subtle)" }}>
+                        ({st.readyDate}T{st.timeOpen || "08:00"})
+                      </span>
+                    </span>
+                  </div>
+                );
+              })}
+
+              <div>
+                <strong style={{ color: "var(--pf-text-muted)" }}>Equipment:</strong>{" "}
+                <span className="font-semibold" style={{ color: "var(--pf-action)" }}>
+                  {entry.equipment.trailerType}
+                </span>{" "}
+                · {totals.totalWeight.toLocaleString()} lbs ({entry.items[0]?.packagingType || "Pallet"})
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {[
+                    "48 ft Flatbed | Tarp",
+                    "53 ft Flatbed | Tarp",
+                    "53 ft Conestoga / Curtain Side",
+                    "48 ft Flatbed",
+                    "53 ft Van | Dry",
+                  ].map((eqOption) => {
+                    const active = entry.equipment.trailerType === eqOption;
+                    return (
+                      <button
+                        key={eqOption}
+                        type="button"
+                        onClick={() =>
+                          onChange({
+                            ...entry,
+                            equipment: { ...entry.equipment, trailerType: eqOption },
+                          })
+                        }
+                        className="px-2 py-0.5 rounded text-[10px] font-medium"
+                        style={{
+                          background: active ? "var(--pf-action)" : "var(--pf-surface-raised)",
+                          color: active ? "#ffffff" : "var(--pf-text-muted)",
+                          border: `1px solid ${active ? "var(--pf-action)" : "var(--pf-border)"}`,
+                        }}
+                      >
+                        {eqOption}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <strong style={{ color: "var(--pf-text-muted)" }}>Commodity:</strong>{" "}
+                {entry.items.map((it) => `${it.piecesTotal} ${it.packagingType} — ${it.description}`).join("; ")}
+              </div>
+
+              {entry.specialInstructions && (
+                <div>
+                  <strong style={{ color: "var(--pf-text-muted)" }}>Instructions:</strong>{" "}
+                  <span style={{ color: "var(--pf-warning)" }}>{entry.specialInstructions}</span>
+                </div>
+              )}
+
+              <div>
+                <strong style={{ color: "var(--pf-text-muted)" }}>Customer Rate:</strong>{" "}
+                <span className="font-mono font-bold" style={{ color: totals.totalSell > 0 ? "var(--pf-primary)" : "var(--pf-text-muted)" }}>
+                  {totals.totalSell > 0
+                    ? `$${totals.totalSell.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                    : "Pending / TBD"}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2" style={{ borderTop: "1px solid var(--pf-border)" }}>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => setShowConfirmModal(false)}
+                className="px-3 py-1.5 rounded-lg font-medium"
+                style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={executeTaiBooking}
+                className="px-4 py-1.5 rounded-lg font-bold inline-flex items-center gap-1.5"
+                style={{ background: "var(--pf-action)", color: "#ffffff" }}
+              >
+                <Rocket size={12} />
+                {submitting ? "Sending to TAI…" : "OK · Generate in TAI"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
