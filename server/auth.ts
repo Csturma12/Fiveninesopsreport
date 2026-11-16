@@ -178,7 +178,7 @@ export function registerAuth(app: Express): void {
       }
       const user = await verifyGoogleBearerToken(tokenJson.id_token);
       if (!user) {
-        res.status(403).send("Access restricted to verified Primary Freight / Five Nines Google Workspace accounts.");
+        res.status(403).send("Access is restricted to authorized Five Nines owner Google accounts during testing.");
         return;
       }
 

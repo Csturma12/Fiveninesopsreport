@@ -51,7 +51,7 @@ foreach ($key in $keysToSync) {
 }
 
 $secretPairs.Add("ALLOW_LIVE_TAI_WRITES=true")
-$secretPairs.Add("TAI_WRITEBACK_POLLER_ENABLED=false")
+$secretPairs.Add("TAI_WRITEBACK_POLLER_ENABLED=true")
 
 if ($syncedNames.Count -eq 0) {
   Write-Error "None of the expected keys were found in '$EnvFile'."

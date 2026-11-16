@@ -16,7 +16,9 @@ import { broadcastOpsEvent } from "./events";
 import { store } from "./store";
 import {
   isPendingReadBack,
+  pollerConfigStatus,
   READ_BACK_PENDING_SAVE_MESSAGE,
+  runPollerForAssignmentId,
   SAVE_WAIT_MS,
 } from "./tai-writeback-poller";
 
@@ -263,10 +265,17 @@ export async function enqueueCarrierWriteback(params: {
       return { ok: false, status: 502, message: `Could not queue write-back: ${insertError?.message || "unknown"}` };
     }
 
-    // 4. Wait up to SAVE_WAIT_MS (45s) for the active Fly poller to PUT CarrierCharges & verify GET /Shipments/{id}
+    // 4. Immediately trigger local poller on save when enabled (avoids 15s wait & racing),
+    // then wait up to SAVE_WAIT_MS (45s) for PUT CarrierCharges + GET /Shipments/{id} read-back
+    if (pollerConfigStatus().enabled) {
+      await runPollerForAssignmentId(inserted.id);
+    }
+
     const deadline = Date.now() + SAVE_WAIT_MS;
+    let firstCheck = true;
     while (Date.now() < deadline) {
-      await wait(1_500);
+      if (!firstCheck) await wait(1_500);
+      firstCheck = false;
       const { data: outcome } = await sb
         .from("tai_carrier_assignments")
         .select("status,error_message,response_body")

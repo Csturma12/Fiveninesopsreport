@@ -6,7 +6,7 @@ import {
   validateTaiLoadEntry,
   type LoadEntry,
 } from "../shared/load-entry";
-import { isStaffGoogleIdentity } from "../shared/staff-domains";
+import { isAllowedOwnerEmail, isStaffGoogleIdentity } from "../shared/staff-domains";
 import {
   handleTaiInvoiceWebhook,
   handleTaiShipmentWebhook,
@@ -151,11 +151,14 @@ test("inbound TAI ShipmentDetailUpdateUrl & InvoiceCreateWithShipmentUrl webhook
   assert.match(String(inv.shipment?.invoiceStatus), /INV-99401/);
 });
 
-test("staff Google Workspace domain gate allows primarycompanies.com & shipfivenines.com only", () => {
-  assert.equal(isStaffGoogleIdentity("chriss@primarycompanies.com", "primarycompanies.com"), true);
-  assert.equal(isStaffGoogleIdentity("ops@shipfivenines.com", "shipfivenines.com"), true);
-  assert.equal(isStaffGoogleIdentity("stranger@gmail.com", "gmail.com"), false);
-  assert.equal(isStaffGoogleIdentity("chriss@primarycompanies.com", "evil.com"), false);
+test("staff gate allows Chris owner emails by default and blocks others unless in ALLOWED_STAFF_EMAILS", () => {
+  assert.equal(isStaffGoogleIdentity("chriss@primarycompanies.com", "primarycompanies.com", ""), true);
+  assert.equal(isStaffGoogleIdentity("chris@shipfivenines.com", "shipfivenines.com", ""), true);
+  assert.equal(isStaffGoogleIdentity("other@primarycompanies.com", "primarycompanies.com", ""), false);
+  assert.equal(isAllowedOwnerEmail("other@primarycompanies.com", "other@primarycompanies.com"), true);
+  assert.equal(isStaffGoogleIdentity("other@primarycompanies.com", "primarycompanies.com", "*"), true);
+  assert.equal(isStaffGoogleIdentity("stranger@gmail.com", "gmail.com", "*"), false);
+  assert.equal(isStaffGoogleIdentity("chriss@primarycompanies.com", "evil.com", "*"), false);
 });
 
 test("pending read-back marker is detected so parked rows are re-read without re-sending PUT", () => {

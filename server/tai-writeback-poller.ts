@@ -50,6 +50,27 @@ function getTaiCred(): string {
   return String(process.env[["TAI", "API", "KEY"].join("_")] || "").trim();
 }
 
+async function logAuditEvent(
+  db: SupabaseClient,
+  row: AssignmentRow,
+  event: string,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  try {
+    const { error } = await db.from("tai_carrier_assignment_log").insert({
+      assignment_id: row.id,
+      shipment_id: row.shipment_id,
+      event,
+      ...extra,
+    });
+    if (error) {
+      console.warn(`[tai-writeback-poller] could not write audit log for #${row.id}: ${error.message}`);
+    }
+  } catch (err) {
+    console.warn("[tai-writeback-poller] audit log insert error:", err instanceof Error ? err.message : err);
+  }
+}
+
 function buildCarrierChargesPayload(row: AssignmentRow) {
   const price = Number(row.buy_rate ?? 0);
   return {
@@ -124,23 +145,29 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
           error_message: null,
         })
         .eq("id", row.id);
+      await logAuditEvent(db, row, "sent", {
+        http_status: row.response_http_status ?? 200,
+        payload: buildCarrierChargesPayload(row),
+      });
       broadcastOpsEvent("writeback_verified", { shipmentId: row.shipment_id, verifiedBuy: check.taiBuy });
       return;
     }
 
     const elapsed = Date.now() - Date.parse(parked.writeSentAt);
+    const expired = elapsed >= READ_BACK_GIVE_UP_MS;
+    const reason = expired
+      ? "TAI accepted write, but read-back did not confirm within 10 minutes"
+      : READ_BACK_PENDING_SAVE_MESSAGE;
     await db
       .from("tai_carrier_assignments")
       .update({
-        status: elapsed >= READ_BACK_GIVE_UP_MS ? "needs_human" : "failed",
+        status: expired ? "needs_human" : "failed",
         response_body: { ...parked, readBackRounds: rounds },
-        error_message:
-          elapsed >= READ_BACK_GIVE_UP_MS
-            ? "TAI accepted write, but read-back did not confirm within 10 minutes"
-            : READ_BACK_PENDING_SAVE_MESSAGE,
+        error_message: reason,
         next_attempt_at: new Date(Date.now() + READ_BACK_RECHECK_MS).toISOString(),
       })
       .eq("id", row.id);
+    await logAuditEvent(db, row, expired ? "failed_terminal" : "read_back_pending", { error: reason });
     return;
   }
 
@@ -177,14 +204,16 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
     });
   } catch (err) {
     // Ambiguous network outcome is NEVER auto-retried
+    const errMsg = `Network error during PUT CarrierCharges (not auto-retried): ${err instanceof Error ? err.message : String(err)}`;
     await db
       .from("tai_carrier_assignments")
       .update({
         status: "needs_human",
-        error_message: `Network error during PUT CarrierCharges (not auto-retried): ${err instanceof Error ? err.message : String(err)}`,
+        error_message: errMsg,
         sent_at: new Date().toISOString(),
       })
       .eq("id", row.id);
+    await logAuditEvent(db, row, "failed_terminal", { error: errMsg });
     return;
   }
 
@@ -199,16 +228,21 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
   if (!resp.ok) {
     const attempts = row.attempts + 1;
     const terminal = attempts >= (row.max_attempts || 3) || (resp.status >= 400 && resp.status < 500);
+    const errMsg = `TAI HTTP ${resp.status}: ${rawText.slice(0, 240)}`;
     await db
       .from("tai_carrier_assignments")
       .update({
         status: terminal ? "needs_human" : "failed",
         response_http_status: resp.status,
         response_body: parsedBody,
-        error_message: `TAI HTTP ${resp.status}: ${rawText.slice(0, 240)}`,
+        error_message: errMsg,
         next_attempt_at: new Date(Date.now() + 5 * 60_000).toISOString(),
       })
       .eq("id", row.id);
+    await logAuditEvent(db, row, terminal ? "failed_terminal" : "failed_retryable", {
+      http_status: resp.status,
+      error: errMsg,
+    });
     return;
   }
 
@@ -225,6 +259,7 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
         error_message: null,
       })
       .eq("id", row.id);
+    await logAuditEvent(db, row, "sent", { http_status: resp.status, payload });
     broadcastOpsEvent("writeback_verified", { shipmentId: row.shipment_id, verifiedBuy: check.taiBuy });
   } else {
     await db
@@ -238,19 +273,51 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
         next_attempt_at: new Date(Date.now() + READ_BACK_RECHECK_MS).toISOString(),
       })
       .eq("id", row.id);
+    await logAuditEvent(db, row, "read_back_pending", {
+      http_status: resp.status,
+      error: READ_BACK_PENDING_SAVE_MESSAGE,
+    });
   }
 }
 
 export function pollerConfigStatus() {
-  const enabled = process.env.TAI_WRITEBACK_POLLER_ENABLED === "true";
+  const enabled = process.env.TAI_WRITEBACK_POLLER_ENABLED !== "false";
   const scope = process.env.TAI_WRITEBACK_POLLER_SCOPE || "own"; // 'own' (fivenines-ops rows only) | 'all'
   return { enabled, scope };
+}
+
+/**
+ * Immediately processes a newly queued assignment on save so fivenines-ops claims
+ * and sends its own write-backs right away without waiting for the 15s tick.
+ */
+export async function runPollerForAssignmentId(assignmentId: number): Promise<void> {
+  if (!pollerConfigStatus().enabled) return;
+  const sbUrl = process.env.SUPABASE_URL?.trim();
+  const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+  const taiKey = getTaiCred();
+  const taiBase = (process.env.TAI_BASE_URL || "https://primaryfreightllc.taicloud.net").replace(/\/+$/, "");
+  if (!sbUrl || !sbKey || !taiKey) return;
+
+  try {
+    const db = createClient(sbUrl, sbKey, { auth: { persistSession: false } });
+    const { data: row } = await db
+      .from("tai_carrier_assignments")
+      .select("*")
+      .eq("id", assignmentId)
+      .in("status", ["pending", "failed"])
+      .maybeSingle();
+    if (row) {
+      await processRow(db, row as AssignmentRow, taiBase, taiKey);
+    }
+  } catch (err) {
+    console.error(`[tai-writeback-poller] immediate run failed for #${assignmentId}:`, err instanceof Error ? err.message : err);
+  }
 }
 
 export function startTaiWritebackPollerIfEnabled(): void {
   const { enabled, scope } = pollerConfigStatus();
   if (!enabled) {
-    console.log("[tai-writeback-poller] Disabled (delegating queue drain to primary-freight-dashboard poller; set TAI_WRITEBACK_POLLER_ENABLED=true to run here).");
+    console.log("[tai-writeback-poller] Disabled via TAI_WRITEBACK_POLLER_ENABLED=false.");
     return;
   }
   const sbUrl = process.env.SUPABASE_URL?.trim();

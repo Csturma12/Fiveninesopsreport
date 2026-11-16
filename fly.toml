@@ -9,11 +9,10 @@
 #        GOOGLE_CLIENT_SECRET="..." \
 #        SESSION_SECRET="..." \
 #        ALLOW_LIVE_TAI_WRITES="true" \
-#        TAI_WRITEBACK_POLLER_ENABLED="false"
-#      (Also pass your TAI credential secret; keep TAI_WRITEBACK_POLLER_ENABLED="false"
-#       while primary-freight-dashboard is running so both apps share the single active
-#       poller on tai_carrier_assignments, or set TAI_WRITEBACK_POLLER_ENABLED="true"
-#       and TAI_WRITEBACK_POLLER_SCOPE="own" to process only fivenines-ops writes!)
+#        TAI_WRITEBACK_POLLER_ENABLED="true"
+#      (fivenines-ops claims & processes its own queued writes immediately on save
+#       via runPollerForAssignmentId and re-checks parked awaitingReadBack rows on its 15s tick;
+#       set TAI_WRITEBACK_POLLER_SCOPE="all" when retiring the legacy app.)
 #   3. flyctl deploy -a fivenines-ops
 
 app = "fivenines-ops"
@@ -25,7 +24,7 @@ primary_region = "dfw"
 [env]
   APP_BASE_URL = "https://fivenines-ops.fly.dev"
   GMAIL_FREIGHT_TOOLKIT_OAUTH_CLIENT_IDS = "1093823548746-u96k7b3qro0a2vs6g5m1b9hfbn3441be.apps.googleusercontent.com,413556084944-jp47ckqu854t3cpccu318eqmn8c5ck50.apps.googleusercontent.com"
-  TAI_WRITEBACK_POLLER_ENABLED = "false"
+  TAI_WRITEBACK_POLLER_ENABLED = "true"
   TAI_WRITEBACK_POLLER_SCOPE = "own"
 
 [http_service]
