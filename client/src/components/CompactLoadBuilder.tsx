@@ -388,8 +388,9 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       onToast(`Complete required TAI field: ${issues[0].message}`);
       return;
     }
+    // reconcileNotice is deliberately NOT cleared here: an unknown TAI outcome stays
+    // on this form until the operator confirms they checked TAI (resolveReconcile).
     setBookingError(null);
-    setReconcileNotice(null);
     setDuplicatePrompt(null);
     setShowConfirmModal(true);
   };
@@ -398,8 +399,12 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
     if (submitting) return;
     setShowConfirmModal(false);
     setBookingError(null);
-    setReconcileNotice(null);
     setDuplicatePrompt(null);
+  };
+
+  const resolveReconcile = () => {
+    if (submitting) return;
+    setReconcileNotice(null);
   };
 
   const readJson = async (res: Response): Promise<Record<string, unknown>> => {
@@ -1601,7 +1606,11 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
             style={{ background: "var(--pf-action)", color: "#ffffff" }}
           >
             <Rocket size={13} />
-            {submitting ? "Generating…" : `Generate Load in TAI${duplicateCount > 1 ? ` (×${duplicateCount})` : ""}`}
+            {submitting
+              ? "Generating…"
+              : reconcileNotice
+              ? "Check TAI · Outcome Unknown"
+              : `Generate Load in TAI${duplicateCount > 1 ? ` (×${duplicateCount})` : ""}`}
           </button>
 
           <button
@@ -1852,6 +1861,18 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                     ))}
                   </span>{" "}
                   before generating again, or you will create a second shipment.
+                </div>
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={resolveReconcile}
+                    data-testid="button-clb-reconcile-resolved"
+                    className="px-2.5 py-1 rounded font-semibold"
+                    style={{ background: "var(--pf-surface)", color: "var(--pf-text)", border: "1px solid var(--pf-warning)" }}
+                  >
+                    I checked TAI — the load is not there, allow Generate
+                  </button>
                 </div>
               </div>
             )}

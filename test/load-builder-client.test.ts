@@ -199,7 +199,10 @@ test("the action is labelled Generate Load in TAI and opens the existing confirm
     assert.match(h.find("dialog-clb-confirm").textContent ?? "", /Generate this load in TAI\?/);
     assert.equal(h.find("text-clb-confirm-customer").textContent, "Larkin Refractory");
     assert.equal(h.find("text-clb-confirm-lane").textContent, "Beaver Falls, PA 15010 → Lithonia, GA 30058");
-    assert.equal(h.find("text-clb-confirm-rate").textContent, "$3,000.00");
+    assert.equal(
+      h.find("text-clb-confirm-rate").textContent,
+      `$${(3000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+    );
     assert.equal(fetchCalls.length, 0, "opening the confirm sends nothing");
   } finally {
     await h.close();
@@ -325,6 +328,20 @@ test("an uncertain outcome (TAI accepted without an id, or the create answer was
     assert.equal(fetchCalls.filter((c) => c.url === BOOK_URL).length, 1);
     await h.click("button-clb-confirm-cancel");
     assert.equal(h.has("dialog-clb-confirm"), false);
+
+    // Closing does not clear the guard: reopening shows the same notice and still no OK.
+    assert.match(h.find("button-clb-generate").textContent ?? "", /Check TAI · Outcome Unknown/);
+    await h.click("button-clb-generate");
+    h.find("panel-clb-reconcile");
+    assert.equal(h.has("button-clb-confirm-ok"), false, "still no retry after close + reopen");
+    assert.equal(fetchCalls.length, 2, "reopening sends nothing");
+
+    // Only the explicit 'I checked TAI' acknowledgement restores Generate.
+    await h.click("button-clb-reconcile-resolved");
+    assert.equal(h.has("panel-clb-reconcile"), false);
+    h.find("button-clb-confirm-ok");
+    await h.click("button-clb-confirm-cancel");
+    assert.match(h.find("button-clb-generate").textContent ?? "", /^Generate Load in TAI/);
   } finally {
     await h.close();
   }
