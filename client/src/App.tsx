@@ -129,6 +129,7 @@ export const App: React.FC = () => {
   const [noteDraft, setNoteDraft] = useState("");
   const [pasteEmailDraft, setPasteEmailDraft] = useState("");
   const [authGateUrl, setAuthGateUrl] = useState<string | null>(null);
+  const [authUnavailableMessage, setAuthUnavailableMessage] = useState<string | null>(null);
   const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; text: string }>>([
     {
       role: "assistant",
@@ -148,7 +149,14 @@ export const App: React.FC = () => {
       setAuthGateUrl(errJson.loginUrl || `/auth/google?returnTo=${encodeURIComponent(window.location.pathname)}`);
       return;
     }
+    if (res.status === 503) {
+      const errJson = (await res.json().catch(() => ({}))) as { message?: string };
+      setAuthUnavailableMessage(errJson.message || "Server authentication is not configured.");
+      setAuthGateUrl(null);
+      return;
+    }
     setAuthGateUrl(null);
+    setAuthUnavailableMessage(null);
     const json = (await res.json()) as BootstrapPayload;
     setData(json);
   }, []);
@@ -159,7 +167,7 @@ export const App: React.FC = () => {
 
   // Live SSE listener for Supabase Realtime & Inbound TAI Webhooks
   useEffect(() => {
-    if (authGateUrl) return;
+    if (authGateUrl || authUnavailableMessage) return;
     const es = new EventSource("/api/events");
     const onLiveUpdate = () => {
       refreshBootstrap().catch(() => {});
@@ -170,7 +178,7 @@ export const App: React.FC = () => {
     es.addEventListener("invoice_updated", onLiveUpdate);
     es.addEventListener("crm_updated", onLiveUpdate);
     return () => es.close();
-  }, [authGateUrl, refreshBootstrap]);
+  }, [authGateUrl, authUnavailableMessage, refreshBootstrap]);
 
   const extractMultiStopTender = useCallback(() => {
     setBuilderEntry({
@@ -475,7 +483,7 @@ export const App: React.FC = () => {
     await refreshBootstrap();
   };
 
-  if (authGateUrl) {
+  if (authGateUrl || authUnavailableMessage) {
     return (
       <div data-theme={theme} className="pf-app min-h-screen flex flex-col items-center justify-center p-6">
         <div
@@ -490,16 +498,24 @@ export const App: React.FC = () => {
             <div style={{ background: "#F5B841" }} />
           </div>
           <div className="font-serif font-bold text-lg">Five Nines Operations</div>
-          <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
-            Sign in with your verified <code>@primarycompanies.com</code> or <code>@shipfivenines.com</code> Google Workspace account to access live shipments and TAI write-back.
-          </p>
-          <a
-            href={authGateUrl}
-            className="block w-full py-2.5 px-4 rounded-lg text-xs font-bold"
-            style={{ background: "var(--pf-action)", color: "#ffffff" }}
-          >
-            Sign in with Google Workspace
-          </a>
+          {authGateUrl ? (
+            <>
+              <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
+                Sign in with your verified <code>@primarycompanies.com</code> or <code>@shipfivenines.com</code> Google Workspace account to access live shipments and TAI write-back.
+              </p>
+              <a
+                href={authGateUrl}
+                className="block w-full py-2.5 px-4 rounded-lg text-xs font-bold"
+                style={{ background: "var(--pf-action)", color: "#ffffff" }}
+              >
+                Sign in with Google Workspace
+              </a>
+            </>
+          ) : (
+            <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
+              {authUnavailableMessage}
+            </p>
+          )}
         </div>
       </div>
     );
