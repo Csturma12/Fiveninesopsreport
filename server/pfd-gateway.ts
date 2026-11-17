@@ -201,6 +201,8 @@ export function registerPfdGateway(app: Express, options: RegisterPfdGatewayOpti
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("timeout")), result.config.timeoutMs);
     res.on("close", () => {
+      // Fires on every finish, error or disconnect, so the deadline never outlives the response.
+      clearTimeout(timer);
       if (!res.writableFinished) controller.abort(new Error("client closed"));
     });
 
@@ -247,7 +249,10 @@ export function registerPfdGateway(app: Express, options: RegisterPfdGatewayOpti
     }
     try {
       const stream = Readable.fromWeb(upstream.body as import("node:stream/web").ReadableStream);
-      stream.on("error", () => res.destroy());
+      stream.on("error", () => {
+        clearTimeout(timer);
+        res.destroy();
+      });
       stream.on("end", () => clearTimeout(timer));
       stream.pipe(res);
     } catch {
