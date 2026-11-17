@@ -83,6 +83,8 @@ export interface TaiBookResult {
   duplicateOf?: string;
   matchedOn?: string;
   requiresReconciliation?: boolean;
+  /** The exact references of the order whose outcome in TAI is unknown (set with requiresReconciliation). */
+  pendingReference?: { customerPO: string; bolNumber: string };
   liveWritesEnabled?: boolean;
   tai?: TaiHttpDetail;
 }
@@ -97,7 +99,17 @@ export interface BookTaiLoadsDependencies {
   fetchImpl?: typeof fetch;
 }
 
-export function previewTaiBooking(entry: LoadEntry) {
+export function normalizeDuplicateCount(value: unknown): number {
+  return Math.max(1, Math.min(10, Math.floor(Number(value) || 1)));
+}
+
+/**
+ * Validate + build the exact TAI request, and bind a token to entry, request AND
+ * the number of orders that will be generated, so a book with a different Qty
+ * than was previewed is refused.
+ */
+export function previewTaiBooking(entry: LoadEntry, duplicateCount: unknown = 1) {
+  const count = normalizeDuplicateCount(duplicateCount);
   const issues = validateTaiLoadEntry(entry);
   const request = buildTaiShipmentRequest(entry);
   const url = `${TAI_BASE}${TAI_SHIPMENTS_PATH}`;
@@ -108,8 +120,9 @@ export function previewTaiBooking(entry: LoadEntry) {
     url,
     issues,
     request,
+    duplicateCount: count,
     message: ok ? "" : issues[0].message,
-    previewToken: ok ? loadEntryPreviewToken(entry, { url, request }) : undefined,
+    previewToken: ok ? loadEntryPreviewToken(entry, { url, request }, count) : undefined,
   };
 }
 
@@ -179,8 +192,14 @@ async function createTaiShipment(
       signal: AbortSignal.timeout(TAI_TIMEOUT_MS),
     });
   } catch (error) {
+    // A timeout or dropped connection can land after TAI already created the
+    // load, so this outcome is unknown, not a clean refusal.
     const reason = error instanceof Error ? error.message : String(error);
-    return { kind: "unreachable", message: `TAI unreachable: ${reason}`, tai: detail(null, "", null) };
+    return {
+      kind: "unreachable",
+      message: `TAI unreachable: ${reason}. The request may still have reached TAI — check TAI for this load before generating again.`,
+      tai: detail(null, "", null),
+    };
   }
 
   let text = "";
@@ -247,7 +266,8 @@ async function bookTaiLoadsUnlocked(
   dependencies: BookTaiLoadsDependencies,
 ): Promise<TaiBookResult> {
   const fetchImpl = dependencies.fetchImpl ?? fetch;
-  const preview = previewTaiBooking(entry);
+  const count = normalizeDuplicateCount(options.duplicateCount);
+  const preview = previewTaiBooking(entry, count);
   const requestTemplate = preview.request;
   const base = { issues: [] as TaiValidationIssue[], request: requestTemplate, createdIds: [] as string[] };
 
@@ -259,7 +279,6 @@ async function bookTaiLoadsUnlocked(
     return { ...base, ok: false, status: 409, requiresPreview: true, message: TAI_PREVIEW_STALE_MESSAGE };
   }
 
-  const count = Math.max(1, Math.min(10, Math.floor(Number(options.duplicateCount) || 1)));
   // Qty > 1 suffixes the customer PO per order (PO-1, PO-2, …); those are the references
   // TAI and the local store will actually hold, so that is what a repeat must be checked against.
   const perLoadEntries: LoadEntry[] = Array.from({ length: count }, (_, i) => ({
@@ -307,13 +326,31 @@ async function bookTaiLoadsUnlocked(
     const body = buildTaiShipmentRequest(perLoadEntry);
     const outcome = await createTaiShipment(body, fetchImpl);
 
-    if (outcome.kind === "refused" || outcome.kind === "unreachable") {
+    const pendingReference = { customerPO: poVal, bolNumber: entry.references.bolNumber };
+
+    if (outcome.kind === "refused") {
       if (createdIds.length > 0) broadcastOpsEvent("shipment_booked", { createdIds });
       return {
         ...base,
         ok: false,
         status: 502,
         createdIds,
+        issues: [{ field: "tai", message: outcome.message }],
+        request: body,
+        tai: outcome.tai,
+        message: `${outcome.message}${partialNote()}`,
+      };
+    }
+
+    if (outcome.kind === "unreachable") {
+      if (createdIds.length > 0) broadcastOpsEvent("shipment_booked", { createdIds });
+      return {
+        ...base,
+        ok: false,
+        status: 502,
+        createdIds,
+        requiresReconciliation: true,
+        pendingReference,
         issues: [{ field: "tai", message: outcome.message }],
         request: body,
         tai: outcome.tai,
@@ -329,6 +366,7 @@ async function bookTaiLoadsUnlocked(
         status: 409,
         createdIds,
         requiresReconciliation: true,
+        pendingReference,
         request: body,
         tai: outcome.tai,
         message: `${TAI_RECONCILE_MESSAGE}${partialNote()}`,

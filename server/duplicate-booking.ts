@@ -27,7 +27,7 @@ export function findDuplicateBooking(
 
   for (const load of loads) {
     if (!/^\d+$/.test(String(load.id || ""))) continue;
-    if (/^cancel/i.test(String(load.rawStatus || ""))) continue;
+    if (/cancel/i.test(String(load.rawStatus || ""))) continue;
     if (norm(load.customer) !== customer) continue;
     if (reference && norm(load.bol) === reference) {
       return { shipmentId: load.id, matchedOn: "shipper reference", value: String(load.bol).trim() };

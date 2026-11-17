@@ -10,6 +10,10 @@ import type { LoadEntry } from "../shared/load-entry";
  * This is a freshness binding, not an authorization credential: anyone who can
  * call /preview can obtain one. Authorization stays with the staff session.
  */
-export function loadEntryPreviewToken(entry: LoadEntry, preview: { url: string; request: unknown }): string {
-  return createHash("sha256").update(JSON.stringify({ entry, preview })).digest("hex");
+export function loadEntryPreviewToken(
+  entry: LoadEntry,
+  preview: { url: string; request: unknown },
+  duplicateCount = 1,
+): string {
+  return createHash("sha256").update(JSON.stringify({ entry, duplicateCount, preview })).digest("hex");
 }

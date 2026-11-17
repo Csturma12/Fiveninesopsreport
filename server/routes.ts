@@ -85,12 +85,20 @@ export function registerApiRoutes(app: Express): void {
     res.json({ ok: true, ...result });
   });
 
+  // Shape guard at the route boundary: every nested block the preview/book path
+  // dereferences must be a real object, so malformed input fails here with a 400
+  // instead of throwing after TAI has already created the load.
+  const isRecord = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === "object" && !Array.isArray(v);
   const readLoadEntry = (body: unknown): LoadEntry | null => {
     const entry = (body as { entry?: unknown } | undefined)?.entry;
-    if (!entry || typeof entry !== "object") return null;
-    const e = entry as Partial<LoadEntry>;
-    if (!Array.isArray(e.stops) || !Array.isArray(e.items) || !e.customer || !e.references || !e.equipment) return null;
-    return { ...e, accessorials: Array.isArray(e.accessorials) ? e.accessorials : [] } as LoadEntry;
+    if (!isRecord(entry)) return null;
+    if (!Array.isArray(entry.stops) || !entry.stops.every(isRecord)) return null;
+    if (!Array.isArray(entry.items) || !entry.items.every(isRecord)) return null;
+    for (const key of ["customer", "references", "equipment", "pricing", "carrier"]) {
+      if (!isRecord(entry[key])) return null;
+    }
+    const accessorials = Array.isArray(entry.accessorials) ? entry.accessorials.filter(isRecord) : [];
+    return { ...(entry as unknown as LoadEntry), accessorials: accessorials as unknown as LoadEntry["accessorials"] };
   };
 
   app.get("/api/tai/booking/status", (_req: Request, res: Response) => {
@@ -105,7 +113,7 @@ export function registerApiRoutes(app: Express): void {
       res.status(400).json({ ok: false, message: "A load entry is required." });
       return;
     }
-    const result = previewTaiBooking(entry);
+    const result = previewTaiBooking(entry, req.body?.duplicateCount);
     res.status(result.ok ? 200 : 422).json(result);
   });
 
@@ -118,7 +126,7 @@ export function registerApiRoutes(app: Express): void {
       return;
     }
     const result = await bookTaiLoads(entry, {
-      duplicateCount: Number(req.body?.duplicateCount) || 1,
+      duplicateCount: req.body?.duplicateCount,
       previewToken: req.body?.previewToken,
       confirmDuplicate: req.body?.confirmDuplicate === true,
     });

@@ -247,6 +247,7 @@ test("OK runs the server preview first and sends its token with the create", asy
 
     assert.deepEqual(fetchCalls.map((c) => c.url), [PREVIEW_URL, BOOK_URL]);
     assert.deepEqual(fetchCalls[0].body.entry, sampleEntry(), "preview sees the exact entry");
+    assert.equal(fetchCalls[0].body.duplicateCount, 1, "preview is told the order Qty the token must cover");
     assert.equal(fetchCalls[1].body.previewToken, TOKEN);
     assert.equal(fetchCalls[1].body.duplicateCount, 1);
     assert.equal("confirmDuplicate" in fetchCalls[1].body, false);
@@ -313,7 +314,9 @@ test("an uncertain outcome (TAI accepted without an id, or the create answer was
     const notice = h.find("panel-clb-reconcile").textContent ?? "";
     assert.match(notice, /TAI may already hold this load/);
     assert.match(notice, /no Shipment ID/);
-    assert.match(notice, /PO 42705/);
+    assert.match(notice, /Nothing was saved here/);
+    assert.match(notice, /PO 42705 · BOL 42705/);
+    assert.equal(h.has("text-clb-reconcile-saved"), false);
     assert.equal(h.has("button-clb-confirm-ok"), false, "no ordinary retry while the outcome is unknown");
     assert.equal(h.has("button-clb-confirm-duplicate"), false);
     assert.equal(h.has("text-clb-booking-error"), false);
@@ -326,14 +329,54 @@ test("an uncertain outcome (TAI accepted without an id, or the create answer was
     await h.close();
   }
 
+  // Partial batch: TAI confirmed the first order, the second is uncertain. The notice must
+  // name what was saved and the exact suffixed PO still to check — not the base PO.
+  fetchCalls = [];
+  script = {
+    [PREVIEW_URL]: [previewOk()],
+    [BOOK_URL]: [
+      {
+        status: 409,
+        body: {
+          ok: false,
+          createdIds: ["132799020"],
+          requiresReconciliation: true,
+          pendingReference: { customerPO: "ORDER-2", bolNumber: "" },
+          message: "TAI accepted the request but its answer carried no Shipment ID. TAI did confirm 1 load(s) before this: #132799020.",
+        },
+      },
+    ],
+  };
+  const batchEntry = sampleEntry();
+  batchEntry.references.customerPO = "ORDER";
+  batchEntry.references.bolNumber = "";
+  const batch = harness(batchEntry);
+  try {
+    await batch.render();
+    await batch.click("button-clb-generate");
+    await batch.click("button-clb-confirm-ok");
+    assert.match(batch.find("text-clb-reconcile-saved").textContent ?? "", /#132799020/);
+    const pending = batch.find("text-clb-reconcile-pending").textContent ?? "";
+    assert.match(pending, /remaining order was not saved here/);
+    assert.match(pending, /PO ORDER-2/);
+    assert.doesNotMatch(pending, /PO ORDER\b(?!-)/, "the base PO is not what needs checking");
+    assert.equal(batch.has("button-clb-confirm-ok"), false);
+    assert.equal(batch.booked.length, 0);
+  } finally {
+    await batch.close();
+  }
+
   // Lost create answer: the request left the browser, so TAI may have it.
+  fetchCalls = [];
   script = { [PREVIEW_URL]: [previewOk()], [BOOK_URL]: [] };
   const lost = harness(sampleEntry());
   try {
     await lost.render();
     await lost.click("button-clb-generate");
     await lost.click("button-clb-confirm-ok");
-    assert.match(lost.find("panel-clb-reconcile").textContent ?? "", /answer never arrived/);
+    const lostText = lost.find("panel-clb-reconcile").textContent ?? "";
+    assert.match(lostText, /answer never arrived/);
+    assert.match(lostText, /PO 42705/);
     assert.equal(lost.has("button-clb-confirm-ok"), false);
     assert.equal(lost.booked.length, 0);
   } finally {

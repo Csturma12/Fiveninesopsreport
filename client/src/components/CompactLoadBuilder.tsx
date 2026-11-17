@@ -132,7 +132,12 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   const [bookingError, setBookingError] = useState<string | null>(null);
   // TAI may already hold this load (accepted without an id, or the create answer was lost):
   // no ordinary retry is offered until the operator has checked TAI.
-  const [reconcileNotice, setReconcileNotice] = useState<string | null>(null);
+  const [reconcileNotice, setReconcileNotice] = useState<{
+    message: string;
+    createdIds: string[];
+    /** Exact references of the order whose TAI outcome is unknown. */
+    pending: { customerPO: string; bolNumber: string }[];
+  } | null>(null);
   const [duplicatePrompt, setDuplicatePrompt] = useState<{ message: string; duplicateOf?: string } | null>(null);
 
   const issues = useMemo(() => validateTaiLoadEntry(entry), [entry]);
@@ -427,7 +432,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       const previewRes = await fetch("/api/loads/preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ entry }),
+        body: JSON.stringify({ entry, duplicateCount }),
       });
       const preview = await readJson(previewRes);
       if (!previewRes.ok || preview.ok !== true || typeof preview.previewToken !== "string" || !preview.previewToken) {
@@ -458,8 +463,18 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       });
       const data = await readJson(bookRes);
       if (data.requiresReconciliation === true) {
+        const pendingRef = data.pendingReference as { customerPO?: unknown; bolNumber?: unknown } | undefined;
         setDuplicatePrompt(null);
-        setReconcileNotice(firstMessage(data, "TAI accepted the request but returned no Shipment ID."));
+        setReconcileNotice({
+          message: firstMessage(data, "TAI accepted the request but returned no Shipment ID."),
+          createdIds: Array.isArray(data.createdIds) ? data.createdIds.map(String) : [],
+          pending: [
+            {
+              customerPO: typeof pendingRef?.customerPO === "string" ? pendingRef.customerPO : entry.references.customerPO,
+              bolNumber: typeof pendingRef?.bolNumber === "string" ? pendingRef.bolNumber : entry.references.bolNumber,
+            },
+          ],
+        });
         return;
       }
       if (data.requiresDuplicateConfirmation === true) {
@@ -478,11 +493,18 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       setDuplicatePrompt(null);
       onBooked(data.createdIds.map(String), typeof data.message === "string" ? data.message : "Generated in TAI");
     } catch (err) {
-      // The create request left this browser; its answer was lost. TAI may hold the load.
+      // The create request left this browser; its answer was lost. TAI may hold any
+      // of the orders that were requested (PO, or PO-1 … PO-N for a batch).
       setDuplicatePrompt(null);
-      setReconcileNotice(
-        `The Generate request was sent but its answer never arrived (${err instanceof Error ? err.message : String(err)}).`,
-      );
+      const basePo = entry.references.customerPO;
+      setReconcileNotice({
+        message: `The Generate request was sent but its answer never arrived (${err instanceof Error ? err.message : String(err)}).`,
+        createdIds: [],
+        pending:
+          duplicateCount > 1 && basePo
+            ? Array.from({ length: duplicateCount }, (_, i) => ({ customerPO: `${basePo}-${i + 1}`, bolNumber: entry.references.bolNumber }))
+            : [{ customerPO: basePo, bolNumber: entry.references.bolNumber }],
+      });
     } finally {
       setSubmitting(false);
     }
@@ -1811,13 +1833,23 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                 }}
               >
                 <div className="font-bold">⚠ Outcome unknown — TAI may already hold this load</div>
-                <div>{reconcileNotice}</div>
-                <div>
-                  Nothing was saved here. Check TAI for{" "}
+                <div>{reconcileNotice.message}</div>
+                {reconcileNotice.createdIds.length > 0 && (
+                  <div data-testid="text-clb-reconcile-saved">
+                    TAI confirmed and this dashboard saved:{" "}
+                    <span className="font-mono">#{reconcileNotice.createdIds.join(", #")}</span>. Do not generate those again.
+                  </div>
+                )}
+                <div data-testid="text-clb-reconcile-pending">
+                  {reconcileNotice.createdIds.length > 0 ? "The remaining order was not saved here." : "Nothing was saved here."} Check TAI for{" "}
                   <span className="font-mono">
                     {entry.customer.name || "this customer"}
-                    {entry.references.customerPO ? ` · PO ${entry.references.customerPO}` : ""}
-                    {entry.references.bolNumber ? ` · BOL ${entry.references.bolNumber}` : ""}
+                    {reconcileNotice.pending.map((p, i) => (
+                      <span key={i}>
+                        {p.customerPO ? ` · PO ${p.customerPO}` : ""}
+                        {p.bolNumber && (i === 0 || p.bolNumber !== reconcileNotice.pending[0].bolNumber) ? ` · BOL ${p.bolNumber}` : ""}
+                      </span>
+                    ))}
                   </span>{" "}
                   before generating again, or you will create a second shipment.
                 </div>

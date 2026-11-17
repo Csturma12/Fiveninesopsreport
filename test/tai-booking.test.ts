@@ -185,6 +185,13 @@ test("book refuses a missing or stale previewToken before touching TAI (409 requ
 
   const garbage = await bookTaiLoads(entry, { previewToken: 12345 }, { fetchImpl: neverCalled });
   assert.equal(garbage.status, 409);
+
+  // The token covers the order Qty: a batch that was never previewed as a batch is refused.
+  const countMismatch = await bookTaiLoads(entry, { previewToken: token, duplicateCount: 3 }, { fetchImpl: neverCalled });
+  assert.equal(countMismatch.status, 409);
+  assert.equal(countMismatch.requiresPreview, true);
+  assert.notEqual(previewTaiBooking(entry, 3).previewToken, token);
+  assert.equal(previewTaiBooking(entry, 3).duplicateCount, 3);
   assert.deepEqual(storeIds(), before);
 });
 
@@ -211,7 +218,7 @@ test("sandbox (ALLOW_LIVE_TAI_WRITES not true, or no key) refuses loudly and nev
   assert.equal(off.liveWritesEnabled, false);
   assert.equal(off.message, LIVE_TAI_WRITES_OFF_MESSAGE);
   assert.deepEqual(off.createdIds, []);
-  assert.equal(JSON.stringify(off).includes("1327425"), false, "no sandbox-minted TAI-looking id anywhere in the answer");
+  assert.equal(/\b1327\d{5}\b/.test(JSON.stringify(off)), false, "no sandbox-minted TAI-looking id anywhere in the answer");
 
   process.env.ALLOW_LIVE_TAI_WRITES = "true";
   const noKey = await bookTaiLoads(entry, { previewToken: token, confirmDuplicate: true }, { fetchImpl: neverCalled });
@@ -242,6 +249,7 @@ test("TAI 4xx/5xx returns ok:false 502 with TAI's own status and body; nothing i
   assert.equal(tai.calls[0].headers["x-api-key"], FAKE_KEY, "key goes on the server-side request only");
   assert.equal((tai.calls[0].body as { shipmentType: string }).shipmentType, "Truckload");
 
+  // A dropped connection may land after TAI created the load: uncertain, not a clean refusal.
   const down = await bookTaiLoads(entry, { previewToken: token, confirmDuplicate: true }, {
     fetchImpl: (async () => {
       throw new Error("ECONNRESET");
@@ -249,7 +257,9 @@ test("TAI 4xx/5xx returns ok:false 502 with TAI's own status and body; nothing i
   });
   assert.equal(down.ok, false);
   assert.equal(down.status, 502);
-  assert.match(down.message, /TAI unreachable: ECONNRESET/);
+  assert.equal(down.requiresReconciliation, true);
+  assert.deepEqual(down.pendingReference, { customerPO: "PO-GEN-1", bolNumber: "BOL-GEN-1" });
+  assert.match(down.message, /TAI unreachable: ECONNRESET\. The request may still have reached TAI/);
   assert.deepEqual(storeIds(), before);
 });
 
@@ -265,6 +275,7 @@ test("TAI 200 without a shipment id is a 409 requiresReconciliation — no inven
     assert.equal(result.ok, false, `body=${JSON.stringify(body)}`);
     assert.equal(result.status, 409);
     assert.equal(result.requiresReconciliation, true);
+    assert.deepEqual(result.pendingReference, { customerPO: "PO-GEN-1", bolNumber: "BOL-GEN-1" });
     assert.deepEqual(result.createdIds, []);
     assert.equal(result.tai?.httpStatus, 200);
     assert.match(result.message, /no Shipment ID/);
@@ -331,6 +342,10 @@ test("duplicate guard: same customer + PO/BOL already in TAI asks first (409) an
   blankRefs.references.customerPO = "";
   blankRefs.references.bolNumber = "";
   assert.equal(findDuplicateBooking(store.shipments, blankRefs), null, "blank references never match blank references");
+
+  // A cancelled load never counts, whatever position the word has in TAI's status string.
+  const cancelled = [{ id: "132700001", customer: "IMC LOGISTICS", po: "CAIU9456544", bol: "", rawStatus: "Committed · Cancelled" }];
+  assert.equal(findDuplicateBooking(cancelled, byPo), null);
 });
 
 test("multi-order generation stops at the first TAI failure and reports exactly what TAI confirmed", async () => {
@@ -338,7 +353,7 @@ test("multi-order generation stops at the first TAI failure and reports exactly 
   const entry = sampleEntry();
   entry.references.customerPO = "PO-MULTI";
   entry.references.bolNumber = "BOL-MULTI";
-  const token = previewTaiBooking(entry).previewToken!;
+  const token = previewTaiBooking(entry, 3).previewToken!;
   let n = 0;
   const fetchImpl = (async () => {
     n += 1;
@@ -363,24 +378,26 @@ test("duplicate guard checks the suffixed per-order references a Qty > 1 batch w
   entry.customer.name = "Batch Customer";
   entry.references.customerPO = "PO-BATCH";
   entry.references.bolNumber = "";
-  const token = previewTaiBooking(entry).previewToken!;
+  const batchToken = previewTaiBooking(entry, 2).previewToken!;
 
-  // First run: TAI confirms PO-BATCH-1, then refuses PO-BATCH-2 (partial batch).
+  // First run: TAI confirms PO-BATCH-1, then answers 200 with no id for PO-BATCH-2 (partial batch).
   let n = 0;
-  const first = await bookTaiLoads(entry, { previewToken: token, duplicateCount: 2 }, {
+  const first = await bookTaiLoads(entry, { previewToken: batchToken, duplicateCount: 2 }, {
     fetchImpl: (async () => {
       n += 1;
       return n === 1
         ? new Response('{"shipmentId":132799020}', { status: 200 })
-        : new Response('{"message":"boom"}', { status: 500 });
+        : new Response("{}", { status: 200 });
     }) as typeof fetch,
   });
   assert.equal(first.ok, false);
+  assert.equal(first.requiresReconciliation, true);
   assert.deepEqual(first.createdIds, ["132799020"]);
+  assert.deepEqual(first.pendingReference, { customerPO: "PO-BATCH-2", bolNumber: "" }, "the uncertain order is named by its exact suffixed PO");
   assert.ok(store.shipments.some((s) => s.id === "132799020" && s.po === "PO-BATCH-1"));
 
   // Repeating the same batch must be caught against PO-BATCH-1, not the unsuffixed PO-BATCH.
-  const repeat = await bookTaiLoads(entry, { previewToken: token, duplicateCount: 2 }, { fetchImpl: neverCalled });
+  const repeat = await bookTaiLoads(entry, { previewToken: batchToken, duplicateCount: 2 }, { fetchImpl: neverCalled });
   assert.equal(repeat.ok, false);
   assert.equal(repeat.status, 409);
   assert.equal(repeat.requiresDuplicateConfirmation, true);
@@ -388,7 +405,8 @@ test("duplicate guard checks the suffixed per-order references a Qty > 1 batch w
   assert.match(repeat.message, /PO-BATCH-1/);
 
   // A single-order retry of the same PO is not a match (TAI holds PO-BATCH-1, not PO-BATCH).
-  const single = await bookTaiLoads(entry, { previewToken: token, duplicateCount: 1 }, { fetchImpl: fakeTai(200, '{"id":132799021}').fetchImpl });
+  const singleToken = previewTaiBooking(entry, 1).previewToken!;
+  const single = await bookTaiLoads(entry, { previewToken: singleToken, duplicateCount: 1 }, { fetchImpl: fakeTai(200, '{"id":132799021}').fetchImpl });
   assert.equal(single.ok, true);
 });
 
@@ -460,12 +478,24 @@ test("HTTP routes: preview hands back the token; book maps refusals to 400/409/5
 
     assert.equal((await post("/api/loads/preview", {})).status, 400);
     assert.equal((await post("/api/loads/book", { entry: null })).status, 400);
+    // Every nested block the booking path dereferences must be an object, or the route answers 400 (never a 500 mid-flight).
+    for (const broken of [
+      { ...sampleEntry(), carrier: undefined },
+      { ...sampleEntry(), customer: "Larkin" },
+      { ...sampleEntry(), pricing: null },
+      { ...sampleEntry(), stops: ["Beaver Falls", "Lithonia"] },
+    ]) {
+      assert.equal((await post("/api/loads/preview", { entry: broken })).status, 400);
+      assert.equal((await post("/api/loads/book", { entry: broken, previewToken: "x" })).status, 400);
+    }
 
     const entry = sampleEntry();
-    const previewRes = await post("/api/loads/preview", { entry });
+    const previewRes = await post("/api/loads/preview", { entry, duplicateCount: 2 });
     assert.equal(previewRes.status, 200);
     const preview = await previewRes.json();
     assert.match(preview.previewToken, /^[a-f0-9]{64}$/);
+    assert.equal(preview.duplicateCount, 2);
+    assert.equal(preview.previewToken, previewTaiBooking(entry, 2).previewToken);
 
     const invalid = sampleEntry();
     invalid.stops[1].zipCode = "";
@@ -475,7 +505,10 @@ test("HTTP routes: preview hands back the token; book maps refusals to 400/409/5
     assert.equal(noToken.status, 409);
     assert.equal((await noToken.json()).requiresPreview, true);
 
-    const sandbox = await post("/api/loads/book", { entry, previewToken: preview.previewToken });
+    const wrongCount = await post("/api/loads/book", { entry, duplicateCount: 1, previewToken: preview.previewToken });
+    assert.equal(wrongCount.status, 409, "previewed as 2 orders, booked as 1: stale");
+
+    const sandbox = await post("/api/loads/book", { entry, duplicateCount: 2, previewToken: preview.previewToken });
     assert.equal(sandbox.status, 503);
     const body = await sandbox.json();
     assert.equal(body.ok, false);
