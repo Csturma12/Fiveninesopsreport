@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import type { LoadEntry } from "@shared/load-entry";
 import type { BootstrapPayload, CrmLeadItem, CrucialEmailItem, OpsShipment } from "@shared/tai-webhook-schema";
 import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
+import { POD_FILE_ACCEPT, podMimeTypeForFile } from "./lib/pod-file";
 import { CompactLoadBuilder } from "./components/CompactLoadBuilder";
 import { UnifiedDispatchView } from "./components/UnifiedDispatchView";
 import { GmailToolkitPanel } from "./components/GmailToolkitPanel";
@@ -124,6 +125,7 @@ export const App: React.FC = () => {
   const [expandedLoadId, setExpandedLoadId] = useState<string | null>("132738007");
   const [inboxFilter, setInboxFilter] = useState<string>("all");
   const [toast, setToast] = useState<string | null>(null);
+  const [toastKind, setToastKind] = useState<"ok" | "error">("ok");
   const [builderEntry, setBuilderEntry] = useState<LoadEntry>(() => createDefaultBuilderEntry());
   const [reviewEmail, setReviewEmail] = useState<CrucialEmailItem | null>(null);
   const [noteDraft, setNoteDraft] = useState("");
@@ -137,7 +139,8 @@ export const App: React.FC = () => {
   ]);
   const [aiDraft, setAiDraft] = useState("");
 
-  const showToast = useCallback((msg: string) => {
+  const showToast = useCallback((msg: string, kind: "ok" | "error" = "ok") => {
+    setToastKind(kind);
     setToast(msg);
   }, []);
 
@@ -265,12 +268,43 @@ export const App: React.FC = () => {
     await refreshBootstrap();
   };
 
-  const handleUploadPod = async (shipmentId: string) => {
-    const res = await fetch(`/api/loads/${shipmentId}/pod`, { method: "POST" });
-    const out = await res.json();
-    showToast(out.message || "Uploaded POD");
-    await refreshBootstrap();
-  };
+  // Streams the chosen file through the server (never the TAI key to the browser); only a TAI read-back marks it verified.
+  const handleUploadPod = useCallback(
+    async (shipmentId: string, file: File) => {
+      const mimeType = podMimeTypeForFile(file);
+      if (!mimeType) {
+        showToast("Only PDF or JPEG POD files can be uploaded to TAI.", "error");
+        return;
+      }
+      showToast(`Uploading ${file.name} to TAI for #${shipmentId}…`);
+      let res: Response;
+      try {
+        res = await fetch(`/api/loads/${encodeURIComponent(shipmentId)}/pod?fileName=${encodeURIComponent(file.name)}`, {
+          method: "POST",
+          headers: { "Content-Type": mimeType },
+          body: file,
+        });
+      } catch (err) {
+        showToast(`POD upload failed before reaching the server: ${err instanceof Error ? err.message : String(err)}`, "error");
+        return;
+      }
+      const out = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string };
+      const verified = res.ok && out.ok === true;
+      showToast(
+        out.message || (verified ? `POD verified in TAI on #${shipmentId}` : `POD upload failed (HTTP ${res.status})`),
+        verified ? "ok" : "error",
+      );
+      if (verified) await refreshBootstrap();
+    },
+    [refreshBootstrap, showToast],
+  );
+
+  const podFileInputRef = useRef<HTMLInputElement | null>(null);
+  const podFileTargetRef = useRef<string | null>(null);
+  const promptPodUpload = useCallback((shipmentId: string) => {
+    podFileTargetRef.current = shipmentId;
+    podFileInputRef.current?.click();
+  }, []);
 
   const handleSaveLoadNote = async (
     shipmentId: string,
@@ -346,8 +380,9 @@ export const App: React.FC = () => {
 
   const handlePushCrmLead = async (id: string) => {
     const res = await fetch(`/api/crm/leads/${encodeURIComponent(id)}/push`, { method: "POST" });
-    const out = await res.json();
-    showToast(out.message || "Pushed lead to SalesOps CRM");
+    const out = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string };
+    const pushed = res.ok && out.ok === true;
+    showToast(out.message || (pushed ? "Pushed lead to SalesOps CRM" : `CRM push failed (HTTP ${res.status})`), pushed ? "ok" : "error");
     await refreshBootstrap();
   };
 
@@ -389,6 +424,15 @@ export const App: React.FC = () => {
       extractMultiStopTender();
       setReviewEmail(null);
       setLocation("/load-builder");
+      return;
+    }
+    if (em.diffType === "missing_pod") {
+      // The server cannot read Gmail attachments; the POD file must be chosen and streamed to TAI for real.
+      if (em.loadId === "NEW") {
+        showToast("This email is not linked to a TAI shipment ID, so a POD cannot be uploaded from it.");
+        return;
+      }
+      promptPodUpload(em.loadId);
       return;
     }
     const res = await fetch(`/api/inbox/${em.id}/apply`, { method: "POST" });
@@ -513,30 +557,72 @@ export const App: React.FC = () => {
     );
   }
 
+  const podFileInput = (
+    <input
+      ref={podFileInputRef}
+      type="file"
+      accept={POD_FILE_ACCEPT}
+      className="hidden"
+      aria-label="Choose POD file to upload to TAI"
+      onChange={(e) => {
+        const file = e.target.files?.[0];
+        const target = podFileTargetRef.current;
+        e.target.value = "";
+        podFileTargetRef.current = null;
+        if (file && target) void handleUploadPod(target, file);
+      }}
+    />
+  );
+
+  // Toast Banner (errors render red so a failed TAI write never looks like a success)
+  const toastBanner = toast ? (
+    <div
+      role={toastKind === "error" ? "alert" : "status"}
+      className="px-4 py-2 text-xs font-medium flex items-center justify-between gap-3 shrink-0"
+      style={
+        toastKind === "error"
+          ? { background: "#3a1a1a", color: "#f3a3a3", borderBottom: "1px solid #6b2a2a" }
+          : { background: "#163528", color: "#8ce6b8", borderBottom: "1px solid #255943" }
+      }
+    >
+      <span>
+        {toastKind === "error" ? "✕" : "✓"} {toast}
+      </span>
+      <button type="button" onClick={() => setToast(null)} className="underline opacity-80 hover:opacity-100">
+        Dismiss
+      </button>
+    </div>
+  ) : null;
+
   // Standalone Chrome Extension Side-Panel Route (/gmail-panel)
   if (location.startsWith("/gmail-panel")) {
     return (
-      <div data-theme={theme} className="pf-app h-screen w-full overflow-hidden">
-        <GmailToolkitPanel
-          shipments={data.shipments}
-          crucialEmails={data.crucialEmails}
-          facilities={data.facilities}
-          customers={data.customers}
-          carriers={data.carriers}
-          builderEntry={builderEntry}
-          onBuilderChange={setBuilderEntry}
-          onApplyEmailAction={handleApplyEmailAction}
-          onBooked={async (_ids, msg) => {
-            showToast(msg);
-            await refreshBootstrap();
-          }}
-          onToast={showToast}
-          onExtractTender={extractMultiStopTender}
-          chatHistory={chatHistory}
-          onAskAi={handleAskAi}
-          onDeleteEmail={handleDeleteInboxItem}
-          onSaveToCrm={handleSaveSenderToCrm}
-        />
+      <div data-theme={theme} className="pf-app h-screen w-full overflow-hidden flex flex-col">
+        {podFileInput}
+        {toastBanner}
+        <div className="flex-1 min-h-0">
+          <GmailToolkitPanel
+            shipments={data.shipments}
+            crucialEmails={data.crucialEmails}
+            facilities={data.facilities}
+            customers={data.customers}
+            carriers={data.carriers}
+            builderEntry={builderEntry}
+            onBuilderChange={setBuilderEntry}
+            onApplyEmailAction={handleApplyEmailAction}
+            onUploadPod={promptPodUpload}
+            onBooked={async (_ids, msg) => {
+              showToast(msg);
+              await refreshBootstrap();
+            }}
+            onToast={showToast}
+            onExtractTender={extractMultiStopTender}
+            chatHistory={chatHistory}
+            onAskAi={handleAskAi}
+            onDeleteEmail={handleDeleteInboxItem}
+            onSaveToCrm={handleSaveSenderToCrm}
+          />
+        </div>
       </div>
     );
   }
@@ -553,6 +639,7 @@ export const App: React.FC = () => {
 
   return (
     <div data-theme={theme} className="pf-app min-h-screen flex flex-col">
+      {podFileInput}
       {/* Top 5-Stroke Primary Freight Brand Rule */}
       <div className="pf-brand-rule shrink-0">
         <div style={{ background: "#1D2C5E" }} />
@@ -562,18 +649,7 @@ export const App: React.FC = () => {
         <div style={{ background: "#F5B841" }} />
       </div>
 
-      {/* Toast Banner */}
-      {toast && (
-        <div
-          className="px-4 py-2 text-xs font-medium flex items-center justify-between gap-3 shrink-0"
-          style={{ background: "#163528", color: "#8ce6b8", borderBottom: "1px solid #255943" }}
-        >
-          <span>✓ {toast}</span>
-          <button type="button" onClick={() => setToast(null)} className="underline opacity-80 hover:opacity-100">
-            Dismiss
-          </button>
-        </div>
-      )}
+      {toastBanner}
 
       <div className="flex-1 flex min-h-0">
         {/* Left Consolidated Sidebar */}
@@ -927,7 +1003,7 @@ export const App: React.FC = () => {
                 expandedLoadId={expandedLoadId}
                 onToggleExpand={(id) => setExpandedLoadId(expandedLoadId === id ? null : id)}
                 onAssignCarrier={handleAssignCarrier}
-                onUploadPod={handleUploadPod}
+                onUploadPod={promptPodUpload}
                 onSaveNote={handleSaveLoadNote}
                 onDeleteLoad={handleDeleteLoad}
                 onAskAi={(q) => {
@@ -1538,6 +1614,7 @@ export const App: React.FC = () => {
               builderEntry={builderEntry}
               onBuilderChange={setBuilderEntry}
               onApplyEmailAction={handleApplyEmailAction}
+              onUploadPod={promptPodUpload}
               onBooked={async (_ids, msg) => {
                 showToast(msg);
                 await refreshBootstrap();
