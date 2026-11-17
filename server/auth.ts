@@ -19,6 +19,9 @@ declare global {
 const COOKIE_NAME = "fivenines_staff_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Unauthenticated by staff session. TAI cannot sign in, so the webhook routes are instead
+// gated by the TAI_WEBHOOK_SECRET shared secret in server/routes.ts (verifyTaiWebhookAuth).
+// /api/webhooks/tai/simulate is intentionally NOT here: it stays behind staff auth.
 const PUBLIC_PATHS = new Set([
   "/healthz",
   "/api/webhooks/tai",

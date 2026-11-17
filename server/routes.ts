@@ -13,8 +13,9 @@ import {
   enqueueCarrierWriteback,
   handleTaiInvoiceWebhook,
   handleTaiShipmentWebhook,
+  isWebhookSimulationEnabled,
   previewTaiBooking,
-  verifyWebhookSecretIfConfigured,
+  verifyTaiWebhookAuth,
 } from "./tai-service";
 import type { LoadEntry } from "../shared/load-entry";
 
@@ -446,12 +447,20 @@ export function registerApiRoutes(app: Express): void {
     res.json({ ok: true, answer });
   });
 
-  // Canonical TAI Inbound Webhooks (both /shipment and root alias supported)
-  const shipmentWebhookHandler = (req: Request, res: Response) => {
-    if (!verifyWebhookSecretIfConfigured(req.headers, req.query.secret)) {
-      res.status(401).json({ ok: false, message: "Invalid TAI webhook secret" });
-      return;
+  // Canonical TAI Inbound Webhooks (both /shipment and root alias supported).
+  // These paths bypass staff auth (server/auth.ts PUBLIC_PATHS) and are gated by TAI_WEBHOOK_SECRET instead.
+  const requireTaiWebhookAuth = (req: Request, res: Response, label: string): boolean => {
+    const auth = verifyTaiWebhookAuth(req.headers, req.query.secret);
+    if (auth.ok) return true;
+    if (auth.status === 401) {
+      console.warn(`[${label}] rejected request from ${req.ip}: invalid or missing webhook authorization`);
     }
+    res.status(auth.status).json({ ok: false, message: auth.message });
+    return false;
+  };
+
+  const shipmentWebhookHandler = (req: Request, res: Response) => {
+    if (!requireTaiWebhookAuth(req, res, "tai-webhook")) return;
     const result = handleTaiShipmentWebhook(req.body || {}, req.headers);
     res.status(result.status).json(result);
   };
@@ -459,15 +468,20 @@ export function registerApiRoutes(app: Express): void {
   app.post("/api/webhooks/tai/shipment", shipmentWebhookHandler);
 
   app.post("/api/webhooks/tai/invoice", (req: Request, res: Response) => {
-    if (!verifyWebhookSecretIfConfigured(req.headers, req.query.secret)) {
-      res.status(401).json({ ok: false, message: "Invalid TAI webhook secret" });
-      return;
-    }
+    if (!requireTaiWebhookAuth(req, res, "tai-invoice-webhook")) return;
     const result = handleTaiInvoiceWebhook(req.body || {}, req.headers);
     res.status(result.status).json(result);
   });
 
+  // Staff-only (behind auth middleware). Disabled in production unless TAI_WEBHOOK_SIMULATE_ENABLED=true.
   app.post("/api/webhooks/tai/simulate", (req: Request, res: Response) => {
+    if (!isWebhookSimulationEnabled()) {
+      res.status(403).json({
+        ok: false,
+        message: "Webhook simulation is disabled in production (set TAI_WEBHOOK_SIMULATE_ENABLED=true to allow it).",
+      });
+      return;
+    }
     const kind = String(req.body?.kind || "gps");
     if (kind === "invoice") {
       const target = store.shipments[0];

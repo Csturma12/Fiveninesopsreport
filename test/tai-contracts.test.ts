@@ -7,11 +7,17 @@ import {
   type LoadEntry,
 } from "../shared/load-entry";
 import { isAllowedOwnerEmail, isStaffGoogleIdentity } from "../shared/staff-domains";
+import express from "express";
+import type { AddressInfo } from "node:net";
 import {
   handleTaiInvoiceWebhook,
   handleTaiShipmentWebhook,
-  verifyWebhookSecretIfConfigured,
+  isWebhookSimulationEnabled,
+  safeSecretEqual,
+  verifyTaiWebhookAuth,
 } from "../server/tai-service";
+import { registerApiRoutes } from "../server/routes";
+import { registerAuth } from "../server/auth";
 import { isPendingReadBack } from "../server/tai-writeback-poller";
 import { store } from "../server/store";
 import {
@@ -187,7 +193,227 @@ test("pending read-back marker is detected so parked rows are re-read without re
   assert.ok(marker);
   assert.equal(marker.readBackRounds, 2);
   assert.equal(isPendingReadBack({ ok: true }), null);
-  assert.equal(verifyWebhookSecretIfConfigured({}), true);
+});
+
+const WEBHOOK_ENV_KEYS = [
+  "NODE_ENV",
+  "TAI_WEBHOOK_SECRET",
+  "TAI_WEBHOOK_ALLOW_QUERY_SECRET",
+  "TAI_WEBHOOK_SIMULATE_ENABLED",
+  "GOOGLE_CLIENT_ID",
+  "GOOGLE_CLIENT_SECRET",
+  "AUTH_DISABLED",
+] as const;
+
+function withWebhookEnv<T>(overrides: Partial<Record<(typeof WEBHOOK_ENV_KEYS)[number], string | undefined>>, fn: () => T): T {
+  const saved = Object.fromEntries(WEBHOOK_ENV_KEYS.map((k) => [k, process.env[k]]));
+  for (const key of WEBHOOK_ENV_KEYS) {
+    const next = key in overrides ? overrides[key] : undefined;
+    if (next === undefined) delete process.env[key];
+    else process.env[key] = next;
+  }
+  const restore = () => {
+    for (const key of WEBHOOK_ENV_KEYS) {
+      const prev = saved[key];
+      if (prev === undefined) delete process.env[key];
+      else process.env[key] = prev;
+    }
+  };
+  try {
+    const out = fn();
+    if (out instanceof Promise) return out.finally(restore) as T;
+    restore();
+    return out;
+  } catch (err) {
+    restore();
+    throw err;
+  }
+}
+
+const TEST_SECRET = "test-only-webhook-secret-0123456789abcdef";
+
+test("safeSecretEqual is a constant-time compare with a length guard and rejects empty input", () => {
+  assert.equal(safeSecretEqual(TEST_SECRET, TEST_SECRET), true);
+  assert.equal(safeSecretEqual(TEST_SECRET.slice(0, -1), TEST_SECRET), false);
+  assert.equal(safeSecretEqual(`${TEST_SECRET}x`, TEST_SECRET), false);
+  assert.equal(safeSecretEqual("", ""), false);
+  assert.equal(safeSecretEqual("", TEST_SECRET), false);
+});
+
+test("TAI webhook auth: unset secret is rejected 503 in production but open in local dev", () => {
+  withWebhookEnv({ NODE_ENV: "production" }, () => {
+    const out = verifyTaiWebhookAuth({});
+    assert.equal(out.ok, false);
+    assert.equal(!out.ok && out.status, 503);
+    const withHeader = verifyTaiWebhookAuth({ authorization: `Bearer ${TEST_SECRET}` });
+    assert.equal(withHeader.ok, false);
+    assert.equal(!withHeader.ok && withHeader.status, 503);
+  });
+  withWebhookEnv({ NODE_ENV: "production", TAI_WEBHOOK_SECRET: "   " }, () => {
+    const out = verifyTaiWebhookAuth({});
+    assert.equal(!out.ok && out.status, 503);
+  });
+  withWebhookEnv({ NODE_ENV: "development" }, () => {
+    const out = verifyTaiWebhookAuth({});
+    assert.equal(out.ok, true);
+    assert.equal(out.ok && out.mode, "open_dev");
+  });
+});
+
+test("TAI webhook auth: configured secret requires a header match (constant-time), query string only behind flag", () => {
+  withWebhookEnv({ NODE_ENV: "production", TAI_WEBHOOK_SECRET: TEST_SECRET }, () => {
+    const missing = verifyTaiWebhookAuth({});
+    assert.equal(!missing.ok && missing.status, 401);
+
+    const wrong = verifyTaiWebhookAuth({ authorization: "Bearer nope" });
+    assert.equal(!wrong.ok && wrong.status, 401);
+
+    const wrongLengthMatch = verifyTaiWebhookAuth({ "x-tai-webhook-secret": TEST_SECRET.slice(0, -1) + "X" });
+    assert.equal(!wrongLengthMatch.ok && wrongLengthMatch.status, 401);
+
+    assert.equal(verifyTaiWebhookAuth({ authorization: `Bearer ${TEST_SECRET}` }).ok, true);
+    assert.equal(verifyTaiWebhookAuth({ authorization: TEST_SECRET }).ok, true);
+    assert.equal(verifyTaiWebhookAuth({ "x-tai-webhook-secret": TEST_SECRET }).ok, true);
+    assert.equal(verifyTaiWebhookAuth({ "x-api-key": TEST_SECRET }).ok, true);
+    assert.equal(verifyTaiWebhookAuth({ "x-tai-webhook-secret": [TEST_SECRET, "other"] }).ok, true);
+
+    // Legacy query-string form is ignored unless explicitly enabled.
+    const viaQuery = verifyTaiWebhookAuth({}, TEST_SECRET);
+    assert.equal(!viaQuery.ok && viaQuery.status, 401);
+  });
+  withWebhookEnv({ NODE_ENV: "production", TAI_WEBHOOK_SECRET: TEST_SECRET, TAI_WEBHOOK_ALLOW_QUERY_SECRET: "true" }, () => {
+    assert.equal(verifyTaiWebhookAuth({}, TEST_SECRET).ok, true);
+    const wrongQuery = verifyTaiWebhookAuth({}, "nope");
+    assert.equal(!wrongQuery.ok && wrongQuery.status, 401);
+  });
+});
+
+test("webhook simulation is allowed outside production and only behind TAI_WEBHOOK_SIMULATE_ENABLED in production", () => {
+  withWebhookEnv({ NODE_ENV: "development" }, () => assert.equal(isWebhookSimulationEnabled(), true));
+  withWebhookEnv({ NODE_ENV: "production" }, () => assert.equal(isWebhookSimulationEnabled(), false));
+  withWebhookEnv({ NODE_ENV: "production", TAI_WEBHOOK_SIMULATE_ENABLED: "true" }, () =>
+    assert.equal(isWebhookSimulationEnabled(), true),
+  );
+});
+
+test("HTTP: /api/webhooks/tai/* enforce the secret and /simulate is blocked in production", async () => {
+  const app = express();
+  app.use(express.json());
+  registerApiRoutes(app);
+  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+    const s = app.listen(0, "127.0.0.1", () => resolve(s));
+  });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const post = (path: string, headers: Record<string, string>, body: unknown) =>
+    fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+  const shipmentBody = { shipmentId: "132738007", status: "Delivered", locationString: "Lithonia, GA 30058" };
+  const invoiceBody = { shipmentId: "132738007", invoiceNumber: "INV-77001", invoiceType: "AR", totalAmount: 7000 };
+
+  try {
+    await withWebhookEnv({ NODE_ENV: "production" }, async () => {
+      for (const path of ["/api/webhooks/tai", "/api/webhooks/tai/shipment", "/api/webhooks/tai/invoice"]) {
+        const res = await post(path, { authorization: `Bearer ${TEST_SECRET}` }, path.endsWith("invoice") ? invoiceBody : shipmentBody);
+        assert.equal(res.status, 503, `${path} must fail closed when TAI_WEBHOOK_SECRET is unset in production`);
+      }
+      const sim = await post("/api/webhooks/tai/simulate", {}, { kind: "gps" });
+      assert.equal(sim.status, 403);
+    });
+
+    await withWebhookEnv({ NODE_ENV: "production", TAI_WEBHOOK_SECRET: TEST_SECRET }, async () => {
+      assert.equal((await post("/api/webhooks/tai/shipment", {}, shipmentBody)).status, 401);
+      assert.equal((await post("/api/webhooks/tai/shipment", { authorization: "Bearer wrong" }, shipmentBody)).status, 401);
+      assert.equal((await post("/api/webhooks/tai/invoice", { "x-tai-webhook-secret": "wrong" }, invoiceBody)).status, 401);
+      assert.equal((await post(`/api/webhooks/tai/shipment?secret=${TEST_SECRET}`, {}, shipmentBody)).status, 401);
+
+      const okShipment = await post("/api/webhooks/tai/shipment", { authorization: `Bearer ${TEST_SECRET}` }, shipmentBody);
+      assert.equal(okShipment.status, 200);
+      const shipmentJson = (await okShipment.json()) as { ok: boolean; shipment?: { stage?: string } };
+      assert.equal(shipmentJson.ok, true);
+      assert.equal(shipmentJson.shipment?.stage, "Delivered");
+
+      const okAlias = await post("/api/webhooks/tai", { "x-tai-webhook-secret": TEST_SECRET }, shipmentBody);
+      assert.equal(okAlias.status, 200);
+
+      const okInvoice = await post("/api/webhooks/tai/invoice", { "x-api-key": TEST_SECRET }, invoiceBody);
+      assert.equal(okInvoice.status, 200);
+      const invoiceJson = (await okInvoice.json()) as { ok: boolean; shipment?: { invoiceStatus?: string } };
+      assert.match(String(invoiceJson.shipment?.invoiceStatus), /INV-77001/);
+
+      const sim = await post("/api/webhooks/tai/simulate", {}, { kind: "gps" });
+      assert.equal(sim.status, 403);
+    });
+
+    await withWebhookEnv({ NODE_ENV: "production", TAI_WEBHOOK_SECRET: TEST_SECRET, TAI_WEBHOOK_SIMULATE_ENABLED: "true" }, async () => {
+      const sim = await post("/api/webhooks/tai/simulate", {}, { kind: "gps" });
+      assert.equal(sim.status, 200);
+    });
+
+    await withWebhookEnv({ NODE_ENV: "test" }, async () => {
+      const sim = await post("/api/webhooks/tai/simulate", {}, { kind: "invoice" });
+      assert.equal(sim.status, 200);
+    });
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("HTTP + staff auth: unsigned /simulate is 401 under OAuth enforcement even with TAI_WEBHOOK_SIMULATE_ENABLED=true", async () => {
+  // Mirrors server/index.ts: registerAuth runs before registerApiRoutes, so /simulate must hit the
+  // staff gate. If /simulate were ever added to PUBLIC_PATHS, the unsigned request below would get 200.
+  const app = express();
+  app.use(express.json());
+  registerAuth(app);
+  registerApiRoutes(app);
+  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+    const s = app.listen(0, "127.0.0.1", () => resolve(s));
+  });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const post = (path: string, headers: Record<string, string>, body: unknown) =>
+    fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+
+  try {
+    await withWebhookEnv(
+      {
+        NODE_ENV: "production",
+        TAI_WEBHOOK_SECRET: TEST_SECRET,
+        TAI_WEBHOOK_SIMULATE_ENABLED: "true",
+        GOOGLE_CLIENT_ID: "test-client-id.apps.googleusercontent.com",
+        GOOGLE_CLIENT_SECRET: "test-client-secret",
+      },
+      async () => {
+        for (const kind of ["gps", "invoice"]) {
+          const sim = await post("/api/webhooks/tai/simulate", {}, { kind });
+          assert.equal(sim.status, 401, `unsigned /simulate (${kind}) must require staff sign-in`);
+          const json = (await sim.json()) as { authenticated?: boolean };
+          assert.equal(json.authenticated, false);
+        }
+
+        // The TAI webhook secret is not a staff credential: it must not unlock /simulate.
+        const simWithWebhookSecret = await post(
+          "/api/webhooks/tai/simulate",
+          { "x-tai-webhook-secret": TEST_SECRET },
+          { kind: "gps" },
+        );
+        assert.equal(simWithWebhookSecret.status, 401);
+
+        // The real webhook routes stay reachable without a staff session (secret-gated instead).
+        const shipmentBody = { shipmentId: "132738007", status: "Delivered", locationString: "Lithonia, GA 30058" };
+        assert.equal((await post("/api/webhooks/tai/shipment", {}, shipmentBody)).status, 401);
+        const signed = await post("/api/webhooks/tai/shipment", { "x-tai-webhook-secret": TEST_SECRET }, shipmentBody);
+        assert.equal(signed.status, 200);
+      },
+    );
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 test("container extractor correlates CAAU724710-0 / CAAU7247100 and synthesizes TONU forklift breakdown notes", () => {
