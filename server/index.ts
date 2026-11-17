@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { registerAuth } from "./auth";
 import { registerApiRoutes } from "./routes";
 import { store } from "./store";
+import { describeTaiWebhookAuthMode } from "./tai-service";
 import { startTaiWritebackPollerIfEnabled } from "./tai-writeback-poller";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +33,9 @@ async function startServer() {
 
   registerAuth(app);
   registerApiRoutes(app);
+
+  const webhookAuthMode = describeTaiWebhookAuthMode();
+  console[webhookAuthMode.level](webhookAuthMode.message);
 
   // Hydrate Supabase & Realtime in background on startup, and start poller if enabled
   store.initSupabaseSyncAndRealtime().catch(() => {});

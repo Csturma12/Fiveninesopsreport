@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import {
   buildTaiShipmentRequest,
   extractTaiShipmentId,
@@ -363,13 +364,137 @@ export async function enqueueCarrierWriteback(params: {
   };
 }
 
-export function verifyWebhookSecretIfConfigured(headers: Record<string, string | string[] | undefined>, querySecret?: unknown): boolean {
-  const expected = process.env.TAI_WEBHOOK_SECRET?.trim();
-  if (!expected) return true;
-  const headerVal = String(headers["x-tai-webhook-secret"] || headers["x-webhook-secret"] || "").trim();
-  const authVal = String(headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
-  const qVal = typeof querySecret === "string" ? querySecret.trim() : "";
-  return headerVal === expected || authVal === expected || qVal === expected;
+/**
+ * Inbound TAI webhook authentication (ShipmentDetailUpdateUrl / InvoiceCreateWithShipmentUrl).
+ *
+ * TAI cannot sign in, so these routes are public in server/auth.ts and instead gate on the
+ * shared secret in TAI_WEBHOOK_SECRET, mirroring primary-freight-dashboard's authorizeTaiWebhook:
+ * TAI's Integration Source is configured with one Authorization value that is sent on both URLs.
+ *
+ *  - Production (NODE_ENV=production) with TAI_WEBHOOK_SECRET unset  -> every POST is rejected 503.
+ *  - Non-production with TAI_WEBHOOK_SECRET unset                     -> open mode (local dev only).
+ *  - TAI_WEBHOOK_SECRET set -> the request must carry it in `Authorization: Bearer <secret>`
+ *    (bare value also accepted), `x-tai-webhook-secret`, or `x-api-key`.
+ *  - `?secret=` is only honoured when TAI_WEBHOOK_ALLOW_QUERY_SECRET=true (legacy; lands in access logs).
+ *
+ * The secret value is never logged.
+ */
+export type TaiWebhookAuthResult =
+  | { ok: true; mode: "verified" | "open_dev" }
+  | { ok: false; status: 401 | 503; message: string };
+
+export const TAI_WEBHOOK_SECRET_HEADERS = ["authorization", "x-tai-webhook-secret", "x-api-key"] as const;
+
+export function isProductionRuntime(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+function configuredTaiWebhookSecret(): string {
+  return String(process.env.TAI_WEBHOOK_SECRET || "").trim();
+}
+
+export function isQuerySecretAllowed(): boolean {
+  return process.env.TAI_WEBHOOK_ALLOW_QUERY_SECRET === "true";
+}
+
+export function isWebhookSimulationEnabled(): boolean {
+  if (!isProductionRuntime()) return true;
+  return process.env.TAI_WEBHOOK_SIMULATE_ENABLED === "true";
+}
+
+/** Constant-time string equality; a length mismatch returns false without comparing bytes. */
+export function safeSecretEqual(provided: string, expected: string): boolean {
+  const left = Buffer.from(provided, "utf8");
+  const right = Buffer.from(expected, "utf8");
+  if (left.length === 0 || left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function firstHeaderValue(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return String(value[0] ?? "");
+  return String(value ?? "");
+}
+
+function presentedWebhookSecrets(
+  headers: Record<string, string | string[] | undefined>,
+  querySecret: unknown,
+): string[] {
+  const candidates: string[] = [];
+  for (const name of TAI_WEBHOOK_SECRET_HEADERS) {
+    const raw = firstHeaderValue(headers[name]).trim();
+    if (!raw) continue;
+    candidates.push(name === "authorization" ? raw.replace(/^Bearer\s+/i, "").trim() : raw);
+  }
+  if (isQuerySecretAllowed() && typeof querySecret === "string" && querySecret.trim()) {
+    candidates.push(querySecret.trim());
+  }
+  return candidates.filter(Boolean);
+}
+
+let openModeWarned = false;
+
+export function verifyTaiWebhookAuth(
+  headers: Record<string, string | string[] | undefined>,
+  querySecret?: unknown,
+): TaiWebhookAuthResult {
+  const expected = configuredTaiWebhookSecret();
+
+  if (!expected) {
+    if (isProductionRuntime()) {
+      console.error(
+        "[tai-webhook] REJECTED inbound webhook: TAI_WEBHOOK_SECRET is not set in production. " +
+          "Set the Fly secret TAI_WEBHOOK_SECRET to the value TAI sends in its Authorization header.",
+      );
+      return {
+        ok: false,
+        status: 503,
+        message: "TAI webhook secret is not configured on this server; inbound webhooks are disabled.",
+      };
+    }
+    if (!openModeWarned) {
+      openModeWarned = true;
+      console.warn(
+        "[tai-webhook] TAI_WEBHOOK_SECRET is not set; accepting unsigned webhooks because NODE_ENV is not 'production' (local dev open mode).",
+      );
+    }
+    return { ok: true, mode: "open_dev" };
+  }
+
+  const matched = presentedWebhookSecrets(headers, querySecret).some((candidate) => safeSecretEqual(candidate, expected));
+  if (!matched) {
+    return { ok: false, status: 401, message: "Invalid or missing TAI webhook authorization" };
+  }
+  return { ok: true, mode: "verified" };
+}
+
+/** Human-readable (secret-free) summary of the inbound webhook auth posture, logged at startup. */
+export function describeTaiWebhookAuthMode(): { level: "info" | "warn" | "error"; message: string } {
+  const hasSecret = Boolean(configuredTaiWebhookSecret());
+  const extras: string[] = [];
+  if (isQuerySecretAllowed()) extras.push("TAI_WEBHOOK_ALLOW_QUERY_SECRET=true (legacy ?secret= accepted; discouraged)");
+  if (isProductionRuntime() && process.env.TAI_WEBHOOK_SIMULATE_ENABLED === "true") {
+    extras.push("TAI_WEBHOOK_SIMULATE_ENABLED=true (/api/webhooks/tai/simulate enabled in production)");
+  }
+  const suffix = extras.length ? ` · ${extras.join(" · ")}` : "";
+
+  if (hasSecret) {
+    return {
+      level: "info",
+      message: `[tai-webhook] Inbound TAI webhooks require TAI_WEBHOOK_SECRET via ${TAI_WEBHOOK_SECRET_HEADERS.join(" / ")}${suffix}`,
+    };
+  }
+  if (isProductionRuntime()) {
+    return {
+      level: "error",
+      message:
+        "[tai-webhook] TAI_WEBHOOK_SECRET is NOT set in production: all inbound TAI webhooks will be rejected with 503 until the Fly secret is configured." +
+        suffix,
+    };
+  }
+  return {
+    level: "warn",
+    message: "[tai-webhook] TAI_WEBHOOK_SECRET is not set; unsigned webhooks accepted in local dev open mode." + suffix,
+  };
 }
 
 function teeWebhookIfConfigured(pathSuffix: string, payload: unknown, headers: Record<string, string | string[] | undefined>): void {
