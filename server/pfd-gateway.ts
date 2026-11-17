@@ -196,8 +196,6 @@ export function registerPfdGateway(app: Express, options: RegisterPfdGatewayOpti
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("timeout")), result.config.timeoutMs);
-    const isEventStream = String(req.headers.accept || "").includes("text/event-stream");
-    if (isEventStream) clearTimeout(timer);
     res.on("close", () => {
       if (!res.writableFinished) controller.abort(new Error("client closed"));
     });
@@ -223,18 +221,22 @@ export function registerPfdGateway(app: Express, options: RegisterPfdGatewayOpti
       return;
     }
 
+    // The deadline bounds the wait for response headers. A confirmed event
+    // stream is long-lived by design, so it is released only once it arrives.
+    if (String(upstream.headers.get("content-type") || "").includes("text/event-stream")) clearTimeout(timer);
+
     res.status(upstream.status);
     for (const name of FORWARDED_RESPONSE_HEADERS) {
       const value = upstream.headers.get(name);
       if (value) res.setHeader(name, value);
     }
-    if (upstream.status >= 300 && upstream.status < 400) {
+    if (upstream.status >= 300 && upstream.status < 400 && upstream.status !== 304) {
       // Never bounce the browser to the dashboard's own sign-in pages.
       clearTimeout(timer);
       res.status(502).json({ ok: false, message: "Dashboard redirected the gateway request; check PFD_GATEWAY_TOKEN." });
       return;
     }
-    if (!upstream.body || method === "HEAD") {
+    if (!upstream.body || method === "HEAD" || upstream.status === 304) {
       clearTimeout(timer);
       res.end();
       return;

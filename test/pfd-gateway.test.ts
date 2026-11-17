@@ -197,6 +197,36 @@ test("upstream redirects become 502 instead of bouncing the browser to the dashb
   );
 });
 
+test("passes 304 Not Modified through for cached reads", async () => {
+  await withHarness(
+    {
+      upstream: (req, res) => {
+        if (req.headers["if-none-match"] === '"v1"') {
+          res.statusCode = 304;
+          res.setHeader("etag", '"v1"');
+          return res.end();
+        }
+        res.end("{}");
+      },
+    },
+    async ({ base }) => {
+      const res = await fetch(`${base}/api/pfd/shipments`, { headers: { "if-none-match": '"v1"' } });
+      assert.equal(res.status, 304);
+      assert.equal(res.headers.get("etag"), '"v1"');
+    },
+  );
+});
+
+test("an event-stream request is still bounded by the timeout until the dashboard answers", async () => {
+  await withHarness(
+    { env: { PFD_GATEWAY_TIMEOUT_MS: "100" }, upstream: () => { /* never responds */ } },
+    async ({ base }) => {
+      const res = await fetch(`${base}/api/pfd/containers/alerts`, { headers: { accept: "text/event-stream" } });
+      assert.equal(res.status, 504);
+    },
+  );
+});
+
 test("passes upstream status codes through and reports an unreachable dashboard as 502", async () => {
   await withHarness(
     {
