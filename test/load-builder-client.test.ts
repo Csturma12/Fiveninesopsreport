@@ -276,12 +276,11 @@ test("a failed preview stops before create and shows the validator message", asy
   }
 });
 
-test("a TAI refusal or a missing-id answer on create is shown verbatim and nothing is treated as booked", async () => {
+test("a TAI refusal or sandbox answer on create is shown verbatim, offers a retry, and nothing is treated as booked", async () => {
   script = {
-    [PREVIEW_URL]: [previewOk(), previewOk(), previewOk()],
+    [PREVIEW_URL]: [previewOk(), previewOk()],
     [BOOK_URL]: [
       { status: 502, body: { ok: false, createdIds: [], message: "TAI answered 400: customerId: customerId is required" } },
-      { status: 409, body: { ok: false, createdIds: [], requiresReconciliation: true, message: "TAI accepted the request but its answer carried no Shipment ID." } },
       { status: 503, body: { ok: false, createdIds: [], liveWritesEnabled: false, message: "Live TAI writes are switched off on this server." } },
     ],
   };
@@ -291,14 +290,70 @@ test("a TAI refusal or a missing-id answer on create is shown verbatim and nothi
     await h.click("button-clb-generate");
     await h.click("button-clb-confirm-ok");
     assert.match(h.find("text-clb-booking-error").textContent ?? "", /TAI answered 400: customerId: customerId is required/);
-    await h.click("button-clb-confirm-ok");
-    assert.match(h.find("text-clb-booking-error").textContent ?? "", /no Shipment ID/);
+    assert.match(h.find("button-clb-confirm-ok").textContent ?? "", /Retry/, "a definite TAI refusal is safe to retry");
     await h.click("button-clb-confirm-ok");
     assert.match(h.find("text-clb-booking-error").textContent ?? "", /Live TAI writes are switched off/);
     assert.equal(h.booked.length, 0);
-    assert.equal(fetchCalls.filter((c) => c.url === BOOK_URL).length, 3);
+    assert.equal(fetchCalls.filter((c) => c.url === BOOK_URL).length, 2);
   } finally {
     await h.close();
+  }
+});
+
+test("an uncertain outcome (TAI accepted without an id, or the create answer was lost) offers no retry and tells the operator to check TAI", async () => {
+  script = {
+    [PREVIEW_URL]: [previewOk()],
+    [BOOK_URL]: [{ status: 409, body: { ok: false, createdIds: [], requiresReconciliation: true, message: "TAI accepted the request but its answer carried no Shipment ID." } }],
+  };
+  const h = harness(sampleEntry());
+  try {
+    await h.render();
+    await h.click("button-clb-generate");
+    await h.click("button-clb-confirm-ok");
+    const notice = h.find("panel-clb-reconcile").textContent ?? "";
+    assert.match(notice, /TAI may already hold this load/);
+    assert.match(notice, /no Shipment ID/);
+    assert.match(notice, /PO 42705/);
+    assert.equal(h.has("button-clb-confirm-ok"), false, "no ordinary retry while the outcome is unknown");
+    assert.equal(h.has("button-clb-confirm-duplicate"), false);
+    assert.equal(h.has("text-clb-booking-error"), false);
+    assert.match(h.find("button-clb-confirm-cancel").textContent ?? "", /Check TAI/);
+    assert.equal(h.booked.length, 0);
+    assert.equal(fetchCalls.filter((c) => c.url === BOOK_URL).length, 1);
+    await h.click("button-clb-confirm-cancel");
+    assert.equal(h.has("dialog-clb-confirm"), false);
+  } finally {
+    await h.close();
+  }
+
+  // Lost create answer: the request left the browser, so TAI may have it.
+  script = { [PREVIEW_URL]: [previewOk()], [BOOK_URL]: [] };
+  const lost = harness(sampleEntry());
+  try {
+    await lost.render();
+    await lost.click("button-clb-generate");
+    await lost.click("button-clb-confirm-ok");
+    assert.match(lost.find("panel-clb-reconcile").textContent ?? "", /answer never arrived/);
+    assert.equal(lost.has("button-clb-confirm-ok"), false);
+    assert.equal(lost.booked.length, 0);
+  } finally {
+    await lost.close();
+  }
+
+  // Lost preview answer: preview never touches TAI, so an ordinary retry stays available.
+  fetchCalls = [];
+  script = { [PREVIEW_URL]: [] };
+  const lostPreview = harness(sampleEntry());
+  try {
+    await lostPreview.render();
+    await lostPreview.click("button-clb-generate");
+    await lostPreview.click("button-clb-confirm-ok");
+    assert.match(lostPreview.find("text-clb-booking-error").textContent ?? "", /Could not reach the ops server/);
+    assert.equal(lostPreview.has("panel-clb-reconcile"), false);
+    assert.match(lostPreview.find("button-clb-confirm-ok").textContent ?? "", /Retry/);
+    assert.equal(fetchCalls.filter((c) => c.url === BOOK_URL).length, 0);
+  } finally {
+    await lostPreview.close();
   }
 });
 

@@ -130,6 +130,9 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   const [duplicateCount, setDuplicateCount] = useState<number>(1);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [bookingError, setBookingError] = useState<string | null>(null);
+  // TAI may already hold this load (accepted without an id, or the create answer was lost):
+  // no ordinary retry is offered until the operator has checked TAI.
+  const [reconcileNotice, setReconcileNotice] = useState<string | null>(null);
   const [duplicatePrompt, setDuplicatePrompt] = useState<{ message: string; duplicateOf?: string } | null>(null);
 
   const issues = useMemo(() => validateTaiLoadEntry(entry), [entry]);
@@ -381,6 +384,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       return;
     }
     setBookingError(null);
+    setReconcileNotice(null);
     setDuplicatePrompt(null);
     setShowConfirmModal(true);
   };
@@ -389,6 +393,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
     if (submitting) return;
     setShowConfirmModal(false);
     setBookingError(null);
+    setReconcileNotice(null);
     setDuplicatePrompt(null);
   };
 
@@ -414,9 +419,10 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
    * is treated as booked. The whole form is locked while this runs.
    */
   const executeTaiBooking = async (confirmDuplicate = false) => {
-    if (submitting) return;
+    if (submitting || reconcileNotice) return;
     setSubmitting(true);
     setBookingError(null);
+    let previewToken = "";
     try {
       const previewRes = await fetch("/api/loads/preview", {
         method: "POST",
@@ -428,18 +434,34 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
         setBookingError(firstMessage(preview, "TAI preview failed — nothing was generated in TAI."));
         return;
       }
+      previewToken = preview.previewToken;
+    } catch (err) {
+      // Preview never touches TAI, so a lost preview is safe to retry.
+      setBookingError(
+        `Could not reach the ops server (${err instanceof Error ? err.message : String(err)}). Nothing was generated in TAI.`,
+      );
+      return;
+    } finally {
+      if (!previewToken) setSubmitting(false);
+    }
 
+    try {
       const bookRes = await fetch("/api/loads/book", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           entry,
           duplicateCount,
-          previewToken: preview.previewToken,
+          previewToken,
           ...(confirmDuplicate ? { confirmDuplicate: true } : {}),
         }),
       });
       const data = await readJson(bookRes);
+      if (data.requiresReconciliation === true) {
+        setDuplicatePrompt(null);
+        setReconcileNotice(firstMessage(data, "TAI accepted the request but returned no Shipment ID."));
+        return;
+      }
       if (data.requiresDuplicateConfirmation === true) {
         setDuplicatePrompt({
           message: firstMessage(data, "A load with the same customer and reference already exists in TAI."),
@@ -456,8 +478,10 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       setDuplicatePrompt(null);
       onBooked(data.createdIds.map(String), typeof data.message === "string" ? data.message : "Generated in TAI");
     } catch (err) {
-      setBookingError(
-        `Could not reach the ops server (${err instanceof Error ? err.message : String(err)}). Nothing was generated in TAI.`,
+      // The create request left this browser; its answer was lost. TAI may hold the load.
+      setDuplicatePrompt(null);
+      setReconcileNotice(
+        `The Generate request was sent but its answer never arrived (${err instanceof Error ? err.message : String(err)}).`,
       );
     } finally {
       setSubmitting(false);
@@ -1775,7 +1799,32 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               </div>
             </div>
 
-            {bookingError && (
+            {reconcileNotice && (
+              <div
+                role="alert"
+                data-testid="panel-clb-reconcile"
+                className="px-2.5 py-2 rounded-lg text-[11px] leading-snug space-y-1"
+                style={{
+                  background: "var(--pf-warning-dim)",
+                  border: "1px solid var(--pf-warning)",
+                  color: "var(--pf-warning)",
+                }}
+              >
+                <div className="font-bold">⚠ Outcome unknown — TAI may already hold this load</div>
+                <div>{reconcileNotice}</div>
+                <div>
+                  Nothing was saved here. Check TAI for{" "}
+                  <span className="font-mono">
+                    {entry.customer.name || "this customer"}
+                    {entry.references.customerPO ? ` · PO ${entry.references.customerPO}` : ""}
+                    {entry.references.bolNumber ? ` · BOL ${entry.references.bolNumber}` : ""}
+                  </span>{" "}
+                  before generating again, or you will create a second shipment.
+                </div>
+              </div>
+            )}
+
+            {bookingError && !reconcileNotice && (
               <div
                 role="alert"
                 data-testid="text-clb-booking-error"
@@ -1790,7 +1839,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               </div>
             )}
 
-            {duplicatePrompt && !bookingError && (
+            {duplicatePrompt && !bookingError && !reconcileNotice && (
               <div
                 role="alert"
                 data-testid="panel-clb-duplicate"
@@ -1818,9 +1867,9 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                 className="px-3 py-1.5 rounded-lg font-medium"
                 style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
               >
-                Cancel
+                {reconcileNotice ? "Close · Check TAI" : "Cancel"}
               </button>
-              {duplicatePrompt && !bookingError ? (
+              {reconcileNotice ? null : duplicatePrompt && !bookingError ? (
                 <button
                   type="button"
                   disabled={submitting}

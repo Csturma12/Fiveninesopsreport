@@ -233,18 +233,32 @@ export async function bookTaiLoads(
     return { ...base, ok: false, status: 409, requiresPreview: true, message: TAI_PREVIEW_STALE_MESSAGE };
   }
 
+  const count = Math.max(1, Math.min(10, Math.floor(Number(options.duplicateCount) || 1)));
+  // Qty > 1 suffixes the customer PO per order (PO-1, PO-2, …); those are the references
+  // TAI and the local store will actually hold, so that is what a repeat must be checked against.
+  const perLoadEntries: LoadEntry[] = Array.from({ length: count }, (_, i) => ({
+    ...entry,
+    references: {
+      ...entry.references,
+      customerPO:
+        count > 1 && entry.references.customerPO ? `${entry.references.customerPO}-${i + 1}` : entry.references.customerPO,
+    },
+  }));
+
   if (options.confirmDuplicate !== true) {
-    const duplicate = findDuplicateBooking(store.shipments, entry);
-    if (duplicate) {
-      return {
-        ...base,
-        ok: false,
-        status: 409,
-        requiresDuplicateConfirmation: true,
-        duplicateOf: duplicate.shipmentId,
-        matchedOn: duplicate.matchedOn,
-        message: `Load #${duplicate.shipmentId} is already booked in TAI for ${entry.customer.name.trim()} with the same ${duplicate.matchedOn} (${duplicate.value}). Open that load to change it, or confirm to generate a second one.`,
-      };
+    for (const candidate of perLoadEntries) {
+      const duplicate = findDuplicateBooking(store.shipments, candidate);
+      if (duplicate) {
+        return {
+          ...base,
+          ok: false,
+          status: 409,
+          requiresDuplicateConfirmation: true,
+          duplicateOf: duplicate.shipmentId,
+          matchedOn: duplicate.matchedOn,
+          message: `Load #${duplicate.shipmentId} is already booked in TAI for ${entry.customer.name.trim()} with the same ${duplicate.matchedOn} (${duplicate.value}). Open that load to change it, or confirm to generate a second one.`,
+        };
+      }
     }
   }
 
@@ -253,7 +267,6 @@ export async function bookTaiLoads(
     return { ...base, ok: false, status: 503, liveWritesEnabled: false, message: LIVE_TAI_WRITES_OFF_MESSAGE };
   }
 
-  const count = Math.max(1, Math.min(10, Math.floor(Number(options.duplicateCount) || 1)));
   const totals = loadEntryTotals(entry);
   const firstStop = entry.stops[0];
   const lastStop = entry.stops[entry.stops.length - 1];
@@ -263,16 +276,8 @@ export async function bookTaiLoads(
   const partialNote = () =>
     createdIds.length > 0 ? ` TAI did confirm ${createdIds.length} load(s) before this: #${createdIds.join(", #")}.` : "";
 
-  for (let i = 0; i < count; i++) {
-    const poVal =
-      count > 1 && entry.references.customerPO
-        ? `${entry.references.customerPO}-${i + 1}`
-        : entry.references.customerPO;
-
-    const perLoadEntry: LoadEntry = {
-      ...entry,
-      references: { ...entry.references, customerPO: poVal },
-    };
+  for (const perLoadEntry of perLoadEntries) {
+    const poVal = perLoadEntry.references.customerPO;
     const body = buildTaiShipmentRequest(perLoadEntry);
     const outcome = await createTaiShipment(body, fetchImpl);
 

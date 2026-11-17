@@ -357,6 +357,41 @@ test("multi-order generation stops at the first TAI failure and reports exactly 
   assert.ok(store.shipments.some((s) => s.id === "132799010" && s.po === "PO-MULTI-1"));
 });
 
+test("duplicate guard checks the suffixed per-order references a Qty > 1 batch will actually send", async () => {
+  enableFakeLiveWrites();
+  const entry = sampleEntry();
+  entry.customer.name = "Batch Customer";
+  entry.references.customerPO = "PO-BATCH";
+  entry.references.bolNumber = "";
+  const token = previewTaiBooking(entry).previewToken!;
+
+  // First run: TAI confirms PO-BATCH-1, then refuses PO-BATCH-2 (partial batch).
+  let n = 0;
+  const first = await bookTaiLoads(entry, { previewToken: token, duplicateCount: 2 }, {
+    fetchImpl: (async () => {
+      n += 1;
+      return n === 1
+        ? new Response('{"shipmentId":132799020}', { status: 200 })
+        : new Response('{"message":"boom"}', { status: 500 });
+    }) as typeof fetch,
+  });
+  assert.equal(first.ok, false);
+  assert.deepEqual(first.createdIds, ["132799020"]);
+  assert.ok(store.shipments.some((s) => s.id === "132799020" && s.po === "PO-BATCH-1"));
+
+  // Repeating the same batch must be caught against PO-BATCH-1, not the unsuffixed PO-BATCH.
+  const repeat = await bookTaiLoads(entry, { previewToken: token, duplicateCount: 2 }, { fetchImpl: neverCalled });
+  assert.equal(repeat.ok, false);
+  assert.equal(repeat.status, 409);
+  assert.equal(repeat.requiresDuplicateConfirmation, true);
+  assert.equal(repeat.duplicateOf, "132799020");
+  assert.match(repeat.message, /PO-BATCH-1/);
+
+  // A single-order retry of the same PO is not a match (TAI holds PO-BATCH-1, not PO-BATCH).
+  const single = await bookTaiLoads(entry, { previewToken: token, duplicateCount: 1 }, { fetchImpl: fakeTai(200, '{"id":132799021}').fetchImpl });
+  assert.equal(single.ok, true);
+});
+
 test("taiRefusalMessage surfaces TAI's own reason from the usual .NET shapes", () => {
   assert.equal(taiRefusalMessage(400, { errors: { "stops[0].zipCode": ["required"] } }, ""), "TAI answered 400: stops[0].zipCode: required");
   assert.equal(taiRefusalMessage(401, null, "<html><body>Unauthorized</body></html>"), "TAI answered 401: Unauthorized");
