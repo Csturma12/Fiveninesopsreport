@@ -8,6 +8,7 @@ import { extractLoadEntryFromEmail } from "../shared/email-extractor";
 import { addSseClient, broadcastOpsEvent } from "./events";
 import { searchFacilityAndMapsCandidates } from "./facility-search";
 import { store } from "./store";
+import { registerPodUploadRoute } from "./tai-pod-routes";
 import {
   bookTaiLoads,
   enqueueCarrierWriteback,
@@ -108,17 +109,8 @@ export function registerApiRoutes(app: Express): void {
     res.status(result.status).json(result);
   });
 
-  app.post("/api/loads/:id/pod", (req: Request, res: Response) => {
-    const s = store.shipments.find((x) => x.id === req.params.id);
-    if (!s) {
-      res.status(404).json({ ok: false, message: "Shipment not found" });
-      return;
-    }
-    s.podCount = Math.max(1, s.podCount + 1);
-    s.writebackState = `✓ POD Uploaded & Read-Back Verified via GET /Shipments/${s.id}/Documents`;
-    store.kpis.emailPodReady = Math.max(0, store.kpis.emailPodReady - 1);
-    res.json({ ok: true, shipment: s, message: `POD uploaded & read-back verified on #${s.id}` });
-  });
+  // Real TAI POD upload (GET preflight → POST /DocumentAttachments → GET read-back). See tai-pod-routes.ts.
+  registerPodUploadRoute(app);
 
   app.post("/api/loads/:id/sell", (req: Request, res: Response) => {
     const s = store.shipments.find((x) => x.id === req.params.id);
@@ -225,11 +217,13 @@ export function registerApiRoutes(app: Express): void {
   // ============================================================================
   // SALESOPS CRM ROUTES
   // ============================================================================
-  const pushLeadWebhook = async (lead: ReturnType<typeof store.addCrmLead>["lead"]) => {
+  // pushedToVercelCrm is only ever set true after the remote webhook returns 2xx; otherwise the lead is local-only.
+  const pushLeadWebhook = async (
+    lead: ReturnType<typeof store.addCrmLead>["lead"],
+  ): Promise<{ pushedRemote: boolean; status: number; reason?: "not_configured" | "remote_failed" }> => {
     const secret = process.env.CRM_WEBHOOK_SECRET?.trim();
     if (!secret) {
-      store.updateCrmLead(lead.id, { pushedToVercelCrm: true });
-      return { pushedRemote: false, status: 200 };
+      return { pushedRemote: false, status: 0, reason: "not_configured" };
     }
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -253,8 +247,9 @@ export function registerApiRoutes(app: Express): void {
     });
     if (resp.ok) {
       store.updateCrmLead(lead.id, { pushedToVercelCrm: true });
+      return { pushedRemote: true, status: resp.status };
     }
-    return { pushedRemote: resp.ok, status: resp.status };
+    return { pushedRemote: false, status: resp.status, reason: "remote_failed" };
   };
 
   app.post("/api/crm/leads", async (req: Request, res: Response) => {
@@ -337,18 +332,33 @@ export function registerApiRoutes(app: Express): void {
     }
     try {
       const outcome = await pushLeadWebhook(lead);
-      broadcastOpsEvent("crm_updated", { id: lead.id });
-      res.json({
-        ok: true,
-        lead: store.crmLeads.find((l) => l.id === lead.id),
-        message: outcome.pushedRemote
-          ? `Pushed ${lead.company} live to SalesOps Vercel CRM!`
-          : `Marked ${lead.company} synced locally (set CRM_WEBHOOK_SECRET on Fly for remote Vercel webhook push).`,
+      const current = store.crmLeads.find((l) => l.id === lead.id);
+      if (outcome.pushedRemote) {
+        broadcastOpsEvent("crm_updated", { id: lead.id });
+        res.json({ ok: true, lead: current, pushedRemote: true, message: `Pushed ${lead.company} live to SalesOps Vercel CRM!` });
+        return;
+      }
+      if (outcome.reason === "not_configured") {
+        res.status(503).json({
+          ok: false,
+          lead: current,
+          pushedRemote: false,
+          message: `${lead.company} is saved locally only — CRM_WEBHOOK_SECRET is not configured on the server, so nothing was pushed to the Vercel CRM.`,
+        });
+        return;
+      }
+      res.status(502).json({
+        ok: false,
+        lead: current,
+        pushedRemote: false,
+        message: `${lead.company} is saved locally only — SalesOps Vercel CRM webhook returned HTTP ${outcome.status}.`,
       });
     } catch (err) {
       res.status(502).json({
         ok: false,
-        message: `SalesOps webhook push failed: ${err instanceof Error ? err.message : String(err)}`,
+        lead: store.crmLeads.find((l) => l.id === lead.id),
+        pushedRemote: false,
+        message: `${lead.company} is saved locally only — SalesOps webhook push failed: ${err instanceof Error ? err.message : String(err)}`,
       });
     }
   });
@@ -407,13 +417,14 @@ export function registerApiRoutes(app: Express): void {
       return;
     }
     if (item.diffType === "missing_pod") {
-      if (s) {
-        s.podCount = Math.max(1, s.podCount + 1);
-        s.writebackState = `✓ POD Uploaded & Read-Back Verified via GET /Shipments/${s.id}/Documents`;
-      }
-      item.applied = true;
-      store.kpis.emailPodReady = Math.max(0, store.kpis.emailPodReady - 1);
-      res.json({ ok: true, action: "pod_uploaded", shipment: s, message: `Attached & verified POD on #${item.loadId}` });
+      // The server has no access to the Gmail attachment bytes, so nothing can be sent to TAI from here.
+      // Never mark the POD as uploaded/verified without TAI confirming it: direct the user to the real upload.
+      res.status(501).json({
+        ok: false,
+        action: "pod_upload_required",
+        shipment: s,
+        message: `POD not uploaded: download the attachment from Gmail and use "Upload POD" on Load #${item.loadId} (POST /api/loads/${item.loadId}/pod). Only a TAI read-back marks it verified.`,
+      });
       return;
     }
     res.json({ ok: true, action: "extract_tender", message: "Extracted tender into Compact Load Builder" });

@@ -9,7 +9,7 @@ import type {
 } from "@shared/tai-webhook-schema";
 import { CompactLoadBuilder } from "./CompactLoadBuilder";
 import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
-import { ClipboardPaste, ExternalLink, Search, Send, Sparkles, Trash2, UserPlus } from "lucide-react";
+import { ClipboardPaste, ExternalLink, Search, Send, Sparkles, Trash2, Upload, UserPlus } from "lucide-react";
 
 interface GmailToolkitPanelProps {
   shipments: OpsShipment[];
@@ -27,6 +27,8 @@ interface GmailToolkitPanelProps {
   onAskAi: (q: string) => Promise<void>;
   onDeleteEmail?: (id: string) => Promise<void>;
   onSaveToCrm?: (email: CrucialEmailItem) => Promise<void>;
+  /** Opens the host's file picker; the POD is streamed through the server to TAI (key stays server-side). */
+  onUploadPod?: (shipmentId: string) => void;
 }
 
 export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
@@ -45,6 +47,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
   onAskAi,
   onDeleteEmail,
   onSaveToCrm,
+  onUploadPod,
 }) => {
   const [tab, setTab] = useState<"inbox" | "dispatch" | "builder" | "ai">("builder");
   const [activeEmailIdx, setActiveEmailIdx] = useState<number>(0);
@@ -430,6 +433,17 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
                       <div className="font-mono" style={{ color: "var(--pf-primary)" }}>
                         {s.writebackState}
                       </div>
+                      {onUploadPod && (
+                        <button
+                          type="button"
+                          onClick={() => onUploadPod(s.id)}
+                          className="w-full py-1.5 px-2 rounded text-[11px] font-semibold inline-flex items-center justify-center gap-1"
+                          style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                          title="Choose a PDF/JPEG POD; uploaded to TAI and only marked verified after TAI reads it back"
+                        >
+                          <Upload size={11} /> {s.podCount > 0 ? `POD (${s.podCount}) · Add to TAI` : "Upload POD to TAI"}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>

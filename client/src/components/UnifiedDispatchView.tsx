@@ -10,7 +10,8 @@ interface UnifiedDispatchViewProps {
   expandedLoadId: string | null;
   onToggleExpand: (id: string) => void;
   onAssignCarrier: (shipmentId: string, carrierName: string, buyRate: number) => Promise<void>;
-  onUploadPod: (shipmentId: string) => Promise<void>;
+  /** Opens a file picker; the chosen PDF/JPEG is streamed through the server to TAI and verified by read-back. */
+  onUploadPod: (shipmentId: string) => void;
   onSaveNote: (
     shipmentId: string,
     payload: { note?: string; pastedEmailText?: string; containerNumber?: string },
@@ -356,14 +357,15 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                           onClick={() => onUploadPod(s.id)}
                           className="py-1.5 px-2 rounded-lg text-xs font-medium inline-flex items-center justify-center gap-1"
                           style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                          title="Choose a PDF/JPEG POD; it is uploaded to TAI and only marked verified after TAI reads it back"
                         >
                           {s.podCount > 0 ? (
                             <>
-                              <CheckCircle2 size={12} style={{ color: "var(--pf-primary)" }} /> POD ({s.podCount})
+                              <CheckCircle2 size={12} style={{ color: "var(--pf-primary)" }} /> POD ({s.podCount}) · Add
                             </>
                           ) : (
                             <>
-                              <Upload size={12} /> Upload POD
+                              <Upload size={12} /> Upload POD to TAI
                             </>
                           )}
                         </button>
