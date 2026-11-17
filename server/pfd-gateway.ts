@@ -239,11 +239,13 @@ export function registerPfdGateway(app: Express, options: RegisterPfdGatewayOpti
     if (upstream.status >= 300 && upstream.status < 400 && upstream.status !== 304) {
       // Never bounce the browser to the dashboard's own sign-in pages.
       clearTimeout(timer);
+      void upstream.body?.cancel().catch(() => {});
       res.status(502).json({ ok: false, message: "Dashboard redirected the gateway request; check PFD_GATEWAY_TOKEN." });
       return;
     }
     if (!upstream.body || method === "HEAD" || upstream.status === 304) {
       clearTimeout(timer);
+      void upstream.body?.cancel().catch(() => {});
       res.end();
       return;
     }
