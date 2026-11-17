@@ -146,7 +146,12 @@ export interface OpsKpis {
 export interface WebhookEventLog {
   id: string;
   timestamp: string;
-  type: "ShipmentDetailUpdateUrl" | "InvoiceCreateWithShipmentUrl" | "CarrierWriteBackPoller" | "SupabaseRealtime";
+  type:
+    | "ShipmentDetailUpdateUrl"
+    | "InvoiceCreateWithShipmentUrl"
+    | "CarrierWriteBackPoller"
+    | "SupabaseRealtime"
+    | "DocumentAttachments";
   shipmentId: string;
   summary: string;
 }
