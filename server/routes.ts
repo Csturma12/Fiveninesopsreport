@@ -6,6 +6,7 @@ import {
 } from "../shared/container-extractor";
 import { extractLoadEntryFromEmail } from "../shared/email-extractor";
 import { addSseClient, broadcastOpsEvent } from "./events";
+import { searchFacilityAndMapsCandidates } from "./facility-search";
 import { store } from "./store";
 import {
   bookTaiLoads,
@@ -32,6 +33,40 @@ export function registerApiRoutes(app: Express): void {
     const data = await store.getBootstrap(req.staffUser || null);
     res.json(data);
   });
+
+  const handleFacilitySearch = async (req: Request, res: Response) => {
+    try {
+      const src = (req.method === "GET" ? req.query : req.body) as Record<string, unknown> | undefined;
+      const str = (key: string): string => {
+        const raw = src?.[key];
+        const v = Array.isArray(raw) ? raw[0] : raw;
+        return typeof v === "string" ? v.trim() : v != null ? String(v).trim() : "";
+      };
+      const rawLimit = Number(Array.isArray(src?.limit) ? src?.limit[0] : src?.limit);
+      const result = await searchFacilityAndMapsCandidates(
+        {
+          query: str("query") || str("q"),
+          companyName: str("companyName") || str("company"),
+          streetAddress: str("streetAddress") || str("address"),
+          city: str("city"),
+          state: str("state"),
+          zipCode: str("zipCode") || str("zip"),
+          limit: Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined,
+        },
+        store.facilities,
+        store.shipments,
+      );
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        message: err instanceof Error ? err.message : "Facility search failed",
+      });
+    }
+  };
+
+  app.get("/api/facilities/search", handleFacilitySearch);
+  app.post("/api/facilities/search", handleFacilitySearch);
 
   app.post("/api/extract-email", (req: Request, res: Response) => {
     const bodyText = String(req.body?.bodyText || req.body?.text || "").trim();

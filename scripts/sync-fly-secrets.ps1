@@ -36,6 +36,12 @@ $keysToSync = @(
   "TAI_WEBHOOK_SECRET",
   $taiKeyName
 )
+$optionalKeysToSync = @(
+  "GOOGLE_MAPS_API_KEY",
+  "CRM_WEBHOOK_SECRET",
+  "CRM_VERCEL_BYPASS_SECRET",
+  "CRM_LEADS_WEBHOOK_URL"
+)
 
 $secretPairs = New-Object System.Collections.Generic.List[string]
 $syncedNames = New-Object System.Collections.Generic.List[string]
@@ -47,6 +53,13 @@ foreach ($key in $keysToSync) {
     $syncedNames.Add($key)
   } else {
     $missingNames.Add($key)
+  }
+}
+
+foreach ($key in $optionalKeysToSync) {
+  if ($parsed.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace($parsed[$key])) {
+    $secretPairs.Add("$key=$($parsed[$key])")
+    $syncedNames.Add($key)
   }
 }
 

@@ -4,6 +4,7 @@ import {
   normalizeTaiTrailerType,
 } from "./tai-booking-enums";
 import type { AccessorialScope } from "./accessorial-options";
+import { validateStateZipMatch } from "./us-zip-ranges";
 
 export type TaiStopType = "First Pickup" | "Pick" | "Drop" | "Last Drop";
 
@@ -127,6 +128,14 @@ export function validateTaiLoadEntry(entry: LoadEntry): TaiValidationIssue[] {
       }
       if (!/^\d{5}(-\d{4})?$/.test(String(st.zipCode || "").trim())) {
         issues.push({ field: `stops.${idx}.zipCode`, message: `${role.toLowerCase()} zip code is required (5-digit US ZIP)` });
+      } else if (String(st.state || "").trim()) {
+        const check = validateStateZipMatch(st.state, st.zipCode);
+        if (!check.valid && check.message) {
+          issues.push({
+            field: `stops.${idx}.zipCode`,
+            message: `${role} ${check.message} — verify facility address/ZIP`,
+          });
+        }
       }
       if (!/^\d{4}-\d{2}-\d{2}$/.test(String(st.readyDate || "").trim())) {
         issues.push({ field: `stops.${idx}.readyDate`, message: `${role} date (YYYY-MM-DD) is required` });
@@ -223,6 +232,16 @@ function toTaiDateTime(date: string, time: string, fallbackTime: string): string
   return `${date}T${hhmm}:00`;
 }
 
+function formatTaiAccessorialName(row: LoadEntryAccessorial): string {
+  const rawName = String(row.name || "").trim();
+  const scopeLabel = `${row.scope[0].toUpperCase()}${row.scope.slice(1)}`;
+  if (!rawName) return scopeLabel;
+  if (/\s*-\s*(?:Pickup|Delivery|Shipment|Rating|Accounting|Fuel|Lumper)$/i.test(rawName)) {
+    return rawName;
+  }
+  return `${rawName} - ${scopeLabel}`;
+}
+
 /**
  * Builds the exact CommitDomesticShipmentRequest body for POST /PublicApi/Shipping/v2/Shipments.
  * Note: customerId is included ONLY when a numeric TAI Organization ID is linked;
@@ -231,12 +250,19 @@ function toTaiDateTime(date: string, time: string, fallbackTime: string): string
 export function buildTaiShipmentRequest(entry: LoadEntry): Record<string, unknown> {
   const trailerType = normalizeTaiTrailerType(entry.equipment.trailerType) ?? entry.equipment.trailerType;
   const serviceLevel = normalizeTaiServiceLevel(entry.carrier.serviceLevel);
+  const hasHazmat = (entry.items || []).some((item) => Boolean(item.hazardousMaterial));
 
   const stops = entry.stops.map((stop, idx) => {
     const type = taiStopType(stop, idx, entry.stops.length);
     const isPick = type.toLowerCase().includes("pick");
     const openDt = toTaiDateTime(stop.readyDate, stop.timeOpen, isPick ? "08:00" : "09:00");
     const closeDt = toTaiDateTime(stop.readyDate, stop.timeClose, isPick ? "15:00" : "16:00");
+    const instructionParts = [stop.instructions, idx === 0 ? entry.specialInstructions : ""]
+      .map((s) => String(s || "").trim())
+      .filter(Boolean);
+    if (idx === 0 && hasHazmat && !/hazmat/i.test(instructionParts.join(" | "))) {
+      instructionParts.unshift("HAZMAT");
+    }
     return {
       stopType: type,
       companyName: stop.companyName || null,
@@ -249,7 +275,7 @@ export function buildTaiShipmentRequest(entry: LoadEntry): Record<string, unknow
       contactName: stop.contactName || null,
       phone: stop.phone || null,
       email: stop.email || null,
-      instructions: [stop.instructions, idx === 0 ? entry.specialInstructions : ""].filter(Boolean).join(" | "),
+      instructions: instructionParts.join(" | "),
       notes: null,
       referenceNumber: stop.referenceNumber || null,
       estimatedReadyDateTime: stop.appointmentRequired ? null : openDt,
@@ -295,7 +321,7 @@ export function buildTaiShipmentRequest(entry: LoadEntry): Record<string, unknow
 
   const accessorialCodes = entry.accessorials.map((row) => ({
     code: row.code || "CUSTOM",
-    name: `${row.name} - ${row.scope[0].toUpperCase()}${row.scope.slice(1)}`,
+    name: formatTaiAccessorialName(row),
   }));
 
   const tariffs = entry.carrier.name

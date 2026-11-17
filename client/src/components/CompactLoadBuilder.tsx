@@ -1,9 +1,16 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import {
   TAI_CREATE_PACKAGING_TYPES,
   TAI_CREATE_TRAILER_TYPES,
 } from "@shared/tai-booking-enums";
-import { QUICK_ACCESSORIALS, type AccessorialScope } from "@shared/accessorial-options";
+import {
+  QUICK_ACCESSORIALS,
+  TAI_ACCESSORIAL_COUNT,
+  searchTaiAccessorials,
+  type AccessorialScope,
+  type TaiAccessorialCatalogItem,
+} from "@shared/accessorial-options";
+import { validateStateZipMatch } from "@shared/us-zip-ranges";
 import {
   buildTaiShipmentRequest,
   loadEntryTotals,
@@ -51,6 +58,48 @@ const COMMON_TRAILERS = [
   "Power Only",
 ];
 
+const FREIGHT_CLASSES = [
+  "No Class",
+  "50",
+  "55",
+  "60",
+  "65",
+  "70",
+  "77.5",
+  "85",
+  "92.5",
+  "100",
+  "110",
+  "125",
+  "150",
+  "175",
+  "200",
+  "250",
+  "300",
+  "400",
+  "500",
+];
+
+interface FacilitySearchCandidate {
+  id: string;
+  companyName: string;
+  streetAddress: string;
+  city: string;
+  state: string;
+  zipCode: string;
+  phone: string;
+  source: string;
+  mapsUrl: string;
+}
+
+interface StopMapsPanelState {
+  openStopIdx: number | null;
+  loading: boolean;
+  error: string | null;
+  query: string;
+  candidates: FacilitySearchCandidate[];
+}
+
 export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   compact = false,
   entry,
@@ -63,6 +112,17 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   onExtractSampleTender,
 }) => {
   const [expandedStopIdx, setExpandedStopIdx] = useState<number | null>(null);
+  const [mapsPanel, setMapsPanel] = useState<StopMapsPanelState>({
+    openStopIdx: null,
+    loading: false,
+    error: null,
+    query: "",
+    candidates: [],
+  });
+  const mapsSearchSeqRef = useRef(0);
+  const [showItemDims, setShowItemDims] = useState<boolean>(false);
+  const [showAccessorialPicker, setShowAccessorialPicker] = useState<boolean>(false);
+  const [accQuery, setAccQuery] = useState<string>("");
   const [showExtras, setShowExtras] = useState<boolean>(false);
   const [showMoreMenu, setShowMoreMenu] = useState<boolean>(false);
   const [showJsonPreview, setShowJsonPreview] = useState<boolean>(false);
@@ -73,6 +133,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   const issues = useMemo(() => validateTaiLoadEntry(entry), [entry]);
   const totals = useMemo(() => loadEntryTotals(entry), [entry]);
   const taiRequestPreview = useMemo(() => buildTaiShipmentRequest(entry), [entry]);
+  const filteredTaiAccessorials = useMemo(() => searchTaiAccessorials(accQuery, 80), [accQuery]);
 
   const updateStop = (idx: number, patch: Partial<LoadEntryStop>) => {
     const nextStops = entry.stops.map((s, i) => (i === idx ? { ...s, ...patch } : s));
@@ -81,14 +142,24 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
 
   const handleZipChange = (idx: number, zipVal: string) => {
     const hit = lookupZipCityState(zipVal);
-    const savedHit = facilities.find((f) => f.zipCode === zipVal.trim());
-    if (savedHit && !entry.stops[idx].companyName) {
+    const trimmed = zipVal.trim();
+    const zip5Match = trimmed.match(/^(\d{5})/);
+    const savedHit = zip5Match
+      ? facilities.find((f) => String(f.zipCode || "").trim().slice(0, 5) === zip5Match[1])
+      : undefined;
+    const currentStop = entry.stops[idx];
+    const currentState = String(currentStop.state || "").trim().toUpperCase();
+    if (
+      savedHit &&
+      !String(currentStop.companyName || "").trim() &&
+      (!currentState || String(savedHit.state || "").trim().toUpperCase() === currentState)
+    ) {
       updateStop(idx, {
         zipCode: zipVal,
         companyName: savedHit.companyName,
         streetAddress: savedHit.streetAddress,
-        city: savedHit.city,
-        state: savedHit.state,
+        city: hit?.city ?? savedHit.city,
+        state: hit?.state ?? savedHit.state,
         contactName: savedHit.contactName,
         phone: savedHit.phone,
         savedFacilityMatched: true,
@@ -99,6 +170,85 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       zipCode: zipVal,
       ...(hit ? { city: hit.city, state: hit.state } : {}),
     });
+  };
+
+  const runFacilitySearch = async (idx: number, customQuery?: string) => {
+    const st = entry.stops[idx];
+    if (!st) return;
+    const seq = ++mapsSearchSeqRef.current;
+    const defaultQuery = [st.companyName, st.city, st.state].filter(Boolean).join(" ").trim();
+    const activeQuery = customQuery !== undefined ? customQuery.trim() : defaultQuery;
+
+    setMapsPanel((prev) => ({
+      openStopIdx: idx,
+      loading: true,
+      error: null,
+      query: customQuery !== undefined ? customQuery : defaultQuery,
+      candidates: prev.openStopIdx === idx ? prev.candidates : [],
+    }));
+
+    const params = new URLSearchParams();
+    if (customQuery !== undefined) {
+      if (activeQuery) {
+        params.set("q", activeQuery);
+        params.set("query", activeQuery);
+      }
+    } else {
+      if (st.companyName.trim()) params.set("companyName", st.companyName.trim());
+      if (st.streetAddress.trim()) params.set("streetAddress", st.streetAddress.trim());
+      if (st.city.trim()) params.set("city", st.city.trim());
+      if (st.state.trim()) params.set("state", st.state.trim());
+      if (st.zipCode.trim()) params.set("zipCode", st.zipCode.trim());
+    }
+
+    try {
+      const res = await fetch(`/api/facilities/search?${params.toString()}`, {
+        credentials: "include",
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        message?: string;
+        candidates?: FacilitySearchCandidate[];
+      };
+      if (seq !== mapsSearchSeqRef.current) return;
+      if (!res.ok || data.ok === false) {
+        setMapsPanel((prev) => ({
+          ...prev,
+          loading: false,
+          error: data.message || "Facility & Google Maps lookup failed.",
+          candidates: [],
+        }));
+        return;
+      }
+      setMapsPanel((prev) => ({
+        ...prev,
+        loading: false,
+        error: null,
+        candidates: Array.isArray(data.candidates) ? data.candidates : [],
+      }));
+    } catch {
+      if (seq !== mapsSearchSeqRef.current) return;
+      setMapsPanel((prev) => ({
+        ...prev,
+        loading: false,
+        error: "Network error searching Google Maps & TAI facilities.",
+        candidates: [],
+      }));
+    }
+  };
+
+  const applyMapsCandidate = (idx: number, cand: FacilitySearchCandidate) => {
+    updateStop(idx, {
+      companyName: cand.companyName,
+      streetAddress: cand.streetAddress,
+      city: cand.city,
+      state: cand.state,
+      zipCode: cand.zipCode,
+      phone: cand.phone || "",
+      savedFacilityMatched: true,
+    });
+    setMapsPanel((prev) => ({ ...prev, openStopIdx: null }));
+    onToast(`Applied ${cand.companyName} (${cand.city}, ${cand.state} ${cand.zipCode})`);
   };
 
   const applySavedFacility = (stopIdx: number, facId: string) => {
@@ -149,6 +299,9 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
     const next = entry.stops.filter((_, i) => i !== idx);
     next[0] = { ...next[0], stopType: "First Pickup" };
     next[next.length - 1] = { ...next[next.length - 1], stopType: "Last Drop" };
+    if (mapsPanel.openStopIdx === idx) {
+      setMapsPanel((prev) => ({ ...prev, openStopIdx: null }));
+    }
     onChange({ ...entry, stops: next });
   };
 
@@ -168,7 +321,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
           handlingQuantity: 1,
           piecesTotal: 1,
           weightTotal: 0,
-          hazardousMaterial: false,
+          hazardousMaterial: Boolean(entry.items[0]?.hazardousMaterial),
           freightClass: "No Class",
           referenceNumber: "",
         },
@@ -187,6 +340,36 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       ? entry.accessorials.filter((a) => !(a.scope === scope && a.name === name))
       : [...entry.accessorials, { scope, code: "CUSTOM", name, sell: 0, buy: 0 }];
     onChange({ ...entry, accessorials: nextAcc });
+  };
+
+  const isCatalogAccessorialSelected = (item: TaiAccessorialCatalogItem) =>
+    entry.accessorials.some(
+      (a) =>
+        (a.code && a.code !== "CUSTOM" && a.code === item.code) ||
+        (a.scope === item.scope && a.name === item.name),
+    );
+
+  const toggleCatalogAccessorial = (item: TaiAccessorialCatalogItem) => {
+    const exists = isCatalogAccessorialSelected(item);
+    const nextAcc = exists
+      ? entry.accessorials.filter(
+          (a) =>
+            !(
+              (a.code && a.code !== "CUSTOM" && a.code === item.code) ||
+              (a.scope === item.scope && a.name === item.name)
+            ),
+        )
+      : [...entry.accessorials, { scope: item.scope, code: item.code, name: item.name, sell: 0, buy: 0 }];
+    onChange({ ...entry, accessorials: nextAcc });
+  };
+
+  const updateAccessorialPrice = (idx: number, patch: { sell?: number; buy?: number }) => {
+    const nextAcc = entry.accessorials.map((a, i) => (i === idx ? { ...a, ...patch } : a));
+    onChange({ ...entry, accessorials: nextAcc });
+  };
+
+  const removeAccessorial = (idx: number) => {
+    onChange({ ...entry, accessorials: entry.accessorials.filter((_, i) => i !== idx) });
   };
 
   const requestTaiBookingConfirm = () => {
@@ -371,7 +554,20 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
             const isPick = st.stopType.toLowerCase().includes("pick");
             const badgeText = idx === 0 ? "PU1" : idx === entry.stops.length - 1 ? "DEL" : isPick ? `PU${idx + 1}` : `DP${idx + 1}`;
             const isExpanded = expandedStopIdx === idx;
+            const isMapsOpen = mapsPanel.openStopIdx === idx;
             const zipInvalid = !/^\d{5}(-\d{4})?$/.test(String(st.zipCode || "").trim());
+            const zipStateCheck = validateStateZipMatch(st.state, st.zipCode);
+            const streetSuspicious = st.streetAddress.trim().length > 0 && st.streetAddress.trim().length <= 3;
+            const hasStopWarning = !zipStateCheck.valid || streetSuspicious;
+            const warningMessages: string[] = [];
+            if (!zipStateCheck.valid) {
+              warningMessages.push(
+                zipStateCheck.message || `ZIP ${st.zipCode} does not match ${st.state.toUpperCase()}`,
+              );
+            }
+            if (streetSuspicious) {
+              warningMessages.push(`Street "${st.streetAddress.trim()}" looks incomplete`);
+            }
 
             return (
               <div
@@ -379,7 +575,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                 className="p-2 rounded-md space-y-1.5"
                 style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
               >
-                {/* Row 1: Badge + Company + Saved Quick-Select + ZIP* */}
+                {/* Row 1: Badge + Company + ZIP* + Maps + ... */}
                 <div className="flex items-center gap-1.5">
                   <span
                     className="px-1.5 py-0.5 rounded font-mono text-[10px] font-bold shrink-0"
@@ -394,16 +590,37 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                     value={st.companyName}
                     onChange={(e) => updateStop(idx, { companyName: e.target.value })}
                     placeholder="Facility / Company *"
-                    className={`pf-input flex-1 ${!st.companyName.trim() ? "pf-input-missing" : ""}`}
+                    className={`pf-input flex-1 min-w-0 ${!st.companyName.trim() ? "pf-input-missing" : ""}`}
                   />
                   <input
                     value={st.zipCode}
                     onChange={(e) => handleZipChange(idx, e.target.value)}
                     placeholder="ZIP *"
                     maxLength={10}
-                    className={`pf-input font-mono font-semibold !w-[68px] shrink-0 ${zipInvalid ? "pf-input-missing" : ""}`}
+                    className={`pf-input font-mono font-semibold !w-[64px] shrink-0 ${
+                      zipInvalid || !zipStateCheck.valid ? "pf-input-missing" : ""
+                    }`}
                     title="5-digit ZIP (auto-fills City & State)"
                   />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isMapsOpen) {
+                        setMapsPanel((prev) => ({ ...prev, openStopIdx: null }));
+                      } else {
+                        runFacilitySearch(idx);
+                      }
+                    }}
+                    className="px-1.5 py-1 rounded text-[11px] font-medium shrink-0 whitespace-nowrap"
+                    style={{
+                      background: isMapsOpen ? "var(--pf-info-dim)" : "var(--pf-surface)",
+                      color: isMapsOpen ? "var(--pf-info)" : "var(--pf-text)",
+                      border: `1px solid ${isMapsOpen ? "var(--pf-info)" : "var(--pf-border)"}`,
+                    }}
+                    title="Search Google Maps & TAI Verified Facilities"
+                  >
+                    📍 Maps
+                  </button>
                   <button
                     type="button"
                     onClick={() => setExpandedStopIdx(isExpanded ? null : idx)}
@@ -439,7 +656,9 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                     maxLength={2}
                     onChange={(e) => updateStop(idx, { state: e.target.value.toUpperCase() })}
                     placeholder="ST"
-                    className={`pf-input font-mono text-center col-span-2 ${!st.state.trim() ? "pf-input-missing" : ""}`}
+                    className={`pf-input font-mono text-center col-span-2 ${
+                      !st.state.trim() || !zipStateCheck.valid ? "pf-input-missing" : ""
+                    }`}
                   />
                   <input
                     type="date"
@@ -448,6 +667,191 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                     className="pf-input font-mono col-span-5"
                   />
                 </div>
+
+                {/* Cross-State ZIP Mismatch or Suspicious Street Warning Strip */}
+                {hasStopWarning && (
+                  <div
+                    className="px-2 py-1.5 rounded flex items-center justify-between gap-2 text-[11px]"
+                    style={{
+                      background: !zipStateCheck.valid ? "var(--pf-danger-dim)" : "var(--pf-warning-dim)",
+                      border: `1px solid ${!zipStateCheck.valid ? "var(--pf-danger)" : "var(--pf-warning)"}`,
+                      color: !zipStateCheck.valid ? "var(--pf-danger)" : "var(--pf-warning)",
+                    }}
+                  >
+                    <span className="font-medium leading-snug">
+                      ⚠ {warningMessages.join(" · ")}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => runFacilitySearch(idx)}
+                      className="shrink-0 px-2 py-0.5 rounded font-semibold whitespace-nowrap"
+                      style={{
+                        background: "var(--pf-surface)",
+                        color: "var(--pf-text)",
+                        border: `1px solid ${!zipStateCheck.valid ? "var(--pf-danger)" : "var(--pf-warning)"}`,
+                      }}
+                    >
+                      📍 Verify on Maps
+                    </button>
+                  </div>
+                )}
+
+                {/* Inline Google Maps & Facility Matches Card */}
+                {isMapsOpen && (
+                  <div
+                    className="p-2 rounded-md space-y-2 text-xs"
+                    style={{
+                      background: "var(--pf-surface)",
+                      border: "1px solid var(--pf-info)",
+                    }}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-[11px]" style={{ color: "var(--pf-text)" }}>
+                        📍 Google Maps &amp; Facility Matches ({mapsPanel.candidates.length})
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setMapsPanel((prev) => ({ ...prev, openStopIdx: null }))}
+                        className="p-0.5 rounded"
+                        style={{ color: "var(--pf-text-muted)" }}
+                        title="Close Maps matches"
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        value={mapsPanel.query}
+                        onChange={(e) => setMapsPanel((prev) => ({ ...prev, query: e.target.value }))}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            runFacilitySearch(idx, mapsPanel.query);
+                          }
+                        }}
+                        placeholder="Search facility name, street, city, state or ZIP…"
+                        className="pf-input flex-1 min-w-0 text-[11px]"
+                      />
+                      <button
+                        type="button"
+                        disabled={mapsPanel.loading}
+                        onClick={() => runFacilitySearch(idx, mapsPanel.query)}
+                        className="px-2.5 py-1 rounded text-[11px] font-semibold shrink-0"
+                        style={{
+                          background: "var(--pf-info-dim)",
+                          color: "var(--pf-info)",
+                          border: "1px solid rgba(107,143,191,0.4)",
+                        }}
+                      >
+                        {mapsPanel.loading ? "…" : "Search"}
+                      </button>
+                    </div>
+
+                    {mapsPanel.loading && (
+                      <div className="text-[11px] py-1" style={{ color: "var(--pf-text-muted)" }}>
+                        Searching TAI verified facilities &amp; Google Maps…
+                      </div>
+                    )}
+
+                    {mapsPanel.error && (
+                      <div className="text-[11px] py-1" style={{ color: "var(--pf-danger)" }}>
+                        {mapsPanel.error}
+                      </div>
+                    )}
+
+                    {!mapsPanel.loading && !mapsPanel.error && mapsPanel.candidates.length === 0 && (
+                      <div className="text-[11px] py-1" style={{ color: "var(--pf-text-muted)" }}>
+                        No facility matches found — try a different company, street, or city/state query.
+                      </div>
+                    )}
+
+                    {!mapsPanel.loading && mapsPanel.candidates.length > 0 && (
+                      <div className="space-y-1.5 max-h-56 overflow-y-auto pf-scroll">
+                        {mapsPanel.candidates.map((cand) => {
+                          const isTaiVerified = cand.source === "TAI Verified Facility";
+                          const fullAddress = [cand.streetAddress, cand.city, cand.state, cand.zipCode]
+                            .filter(Boolean)
+                            .join(", ");
+                          return (
+                            <div
+                              key={cand.id}
+                              className="p-2 rounded space-y-1"
+                              style={{
+                                background: "var(--pf-surface-raised)",
+                                border: "1px solid var(--pf-border)",
+                              }}
+                            >
+                              <div className="flex items-start justify-between gap-1.5">
+                                <div className="min-w-0">
+                                  <div className="font-semibold text-[11px] truncate" style={{ color: "var(--pf-text)" }}>
+                                    {cand.companyName}
+                                  </div>
+                                  <div className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>
+                                    {fullAddress}
+                                  </div>
+                                  {cand.phone && (
+                                    <div className="text-[10px] font-mono" style={{ color: "var(--pf-text-subtle)" }}>
+                                      📞 {cand.phone}
+                                    </div>
+                                  )}
+                                </div>
+                                <span
+                                  className="px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 whitespace-nowrap"
+                                  style={
+                                    isTaiVerified
+                                      ? {
+                                          background: "var(--pf-primary-dim)",
+                                          color: "var(--pf-primary)",
+                                          border: "1px solid rgba(62,191,130,0.35)",
+                                        }
+                                      : {
+                                          background: "var(--pf-info-dim)",
+                                          color: "var(--pf-info)",
+                                          border: "1px solid rgba(107,143,191,0.35)",
+                                        }
+                                  }
+                                >
+                                  {cand.source}
+                                </span>
+                              </div>
+
+                              <div className="flex items-center justify-end gap-1.5 pt-0.5">
+                                {cand.mapsUrl && (
+                                  <a
+                                    href={cand.mapsUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="px-2 py-0.5 rounded text-[10px] font-medium"
+                                    style={{
+                                      background: "var(--pf-surface)",
+                                      color: "var(--pf-info)",
+                                      border: "1px solid var(--pf-border)",
+                                    }}
+                                  >
+                                    ↗ Map
+                                  </a>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => applyMapsCandidate(idx, cand)}
+                                  className="px-2 py-0.5 rounded text-[10px] font-bold"
+                                  style={{
+                                    background: "var(--pf-primary-dim)",
+                                    color: "var(--pf-primary)",
+                                    border: "1px solid rgba(62,191,130,0.45)",
+                                  }}
+                                >
+                                  ✓ Apply All
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* Optional On-Demand Stop Drawer (Saved TAI Location, Street, Window, Contact) */}
                 {isExpanded && (
@@ -486,6 +890,20 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                         />
                       </div>
                     </div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <input
+                        value={st.contactName}
+                        onChange={(e) => updateStop(idx, { contactName: e.target.value })}
+                        placeholder="Contact name"
+                        className="pf-input"
+                      />
+                      <input
+                        value={st.phone}
+                        onChange={(e) => updateStop(idx, { phone: e.target.value })}
+                        placeholder="Facility phone"
+                        className="pf-input font-mono"
+                      />
+                    </div>
                   </div>
                 )}
               </div>
@@ -520,58 +938,180 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
 
         <div className="space-y-1.5">
           {entry.items.map((it, idx) => (
-            <div key={idx} className="flex items-center gap-1.5">
-              <input
-                type="number"
-                min={1}
-                value={it.piecesTotal || ""}
-                onChange={(e) => {
-                  const n = Number(e.target.value) || 0;
-                  updateItem(idx, { piecesTotal: n, handlingQuantity: n });
-                }}
-                placeholder="Pcs*"
-                title="Piece count (required by TAI)"
-                className={`pf-input font-mono !w-[54px] shrink-0 ${it.piecesTotal <= 0 ? "pf-input-missing" : ""}`}
-              />
-              <select
-                value={it.packagingType}
-                onChange={(e) => updateItem(idx, { packagingType: e.target.value })}
-                className="pf-input !w-[82px] shrink-0"
-                title="TAI Packaging Type"
-              >
-                {TAI_CREATE_PACKAGING_TYPES.slice(0, 14).map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ))}
-              </select>
-              <input
-                type="number"
-                min={1}
-                value={it.weightTotal || ""}
-                onChange={(e) => updateItem(idx, { weightTotal: Number(e.target.value) || 0 })}
-                placeholder="Lbs *"
-                title="Total Weight in lbs (required by TAI)"
-                className={`pf-input font-mono !w-[76px] shrink-0 ${it.weightTotal <= 0 ? "pf-input-missing" : ""}`}
-              />
-              <input
-                value={it.description}
-                onChange={(e) => updateItem(idx, { description: e.target.value })}
-                placeholder={`Description * (Line ${idx + 1})`}
-                className={`pf-input flex-1 ${!it.description.trim() ? "pf-input-missing" : ""}`}
-              />
-              {entry.items.length > 1 && (
-                <button
-                  type="button"
-                  onClick={() => removeItem(idx)}
-                  className="p-0.5 shrink-0"
-                  style={{ color: "var(--pf-danger)" }}
+            <div key={idx} className="space-y-1">
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="number"
+                  min={1}
+                  value={it.piecesTotal || ""}
+                  onChange={(e) => {
+                    const n = Number(e.target.value) || 0;
+                    updateItem(idx, { piecesTotal: n, handlingQuantity: n });
+                  }}
+                  placeholder="Pcs*"
+                  title="Piece count (required by TAI)"
+                  className={`pf-input font-mono !w-[54px] shrink-0 ${it.piecesTotal <= 0 ? "pf-input-missing" : ""}`}
+                />
+                <select
+                  value={it.packagingType}
+                  onChange={(e) => updateItem(idx, { packagingType: e.target.value })}
+                  className="pf-input !w-[82px] shrink-0"
+                  title="TAI Packaging Type"
                 >
-                  <X size={13} />
-                </button>
+                  {TAI_CREATE_PACKAGING_TYPES.slice(0, 14).map((p) => (
+                    <option key={p} value={p}>
+                      {p}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  min={1}
+                  value={it.weightTotal || ""}
+                  onChange={(e) => updateItem(idx, { weightTotal: Number(e.target.value) || 0 })}
+                  placeholder="Lbs *"
+                  title="Total Weight in lbs (required by TAI)"
+                  className={`pf-input font-mono !w-[76px] shrink-0 ${it.weightTotal <= 0 ? "pf-input-missing" : ""}`}
+                />
+                <input
+                  value={it.description}
+                  onChange={(e) => updateItem(idx, { description: e.target.value })}
+                  placeholder={`Description * (Line ${idx + 1})`}
+                  className={`pf-input flex-1 min-w-0 ${!it.description.trim() ? "pf-input-missing" : ""}`}
+                />
+                {entry.items.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => removeItem(idx)}
+                    className="p-0.5 shrink-0"
+                    style={{ color: "var(--pf-danger)" }}
+                  >
+                    <X size={13} />
+                  </button>
+                )}
+              </div>
+
+              {showItemDims && (
+                <div className="grid grid-cols-5 gap-1 pl-1">
+                  <div>
+                    <label className="block text-[10px] truncate" style={{ color: "var(--pf-text-subtle)" }}>
+                      Length (in)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={it.length || ""}
+                      onChange={(e) =>
+                        updateItem(idx, { length: e.target.value ? Number(e.target.value) : undefined })
+                      }
+                      placeholder="L"
+                      className="pf-input font-mono text-[11px]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] truncate" style={{ color: "var(--pf-text-subtle)" }}>
+                      Width (in)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={it.width || ""}
+                      onChange={(e) =>
+                        updateItem(idx, { width: e.target.value ? Number(e.target.value) : undefined })
+                      }
+                      placeholder="W"
+                      className="pf-input font-mono text-[11px]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] truncate" style={{ color: "var(--pf-text-subtle)" }}>
+                      Height (in)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={it.height || ""}
+                      onChange={(e) =>
+                        updateItem(idx, { height: e.target.value ? Number(e.target.value) : undefined })
+                      }
+                      placeholder="H"
+                      className="pf-input font-mono text-[11px]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] truncate" style={{ color: "var(--pf-text-subtle)" }}>
+                      Handling Qty
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={it.handlingQuantity || ""}
+                      onChange={(e) => updateItem(idx, { handlingQuantity: Number(e.target.value) || 0 })}
+                      placeholder="Qty"
+                      className="pf-input font-mono text-[11px]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] truncate" style={{ color: "var(--pf-text-subtle)" }}>
+                      Freight Class
+                    </label>
+                    <select
+                      value={it.freightClass || "No Class"}
+                      onChange={(e) => updateItem(idx, { freightClass: e.target.value })}
+                      className="pf-input text-[11px]"
+                    >
+                      {it.freightClass && !FREIGHT_CLASSES.includes(it.freightClass) && (
+                        <option value={it.freightClass}>{it.freightClass}</option>
+                      )}
+                      {FREIGHT_CLASSES.map((fc) => (
+                        <option key={fc} value={fc}>
+                          {fc}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
               )}
             </div>
           ))}
+        </div>
+
+        {/* Hazmat Checkbox + Optional Commodity Dimensions / Class Toggle */}
+        <div
+          className="pt-1.5 flex items-center justify-between gap-2 text-[11px]"
+          style={{ borderTop: "1px dashed var(--pf-border)" }}
+        >
+          <label
+            className="inline-flex items-center gap-1.5 cursor-pointer min-w-0"
+            style={{
+              color: entry.items[0]?.hazardousMaterial ? "var(--pf-warning)" : "var(--pf-text-muted)",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={Boolean(entry.items[0]?.hazardousMaterial)}
+              onChange={(e) => {
+                const checked = e.target.checked;
+                onChange({
+                  ...entry,
+                  items: entry.items.map((it) => ({ ...it, hazardousMaterial: checked })),
+                });
+              }}
+              className="rounded shrink-0"
+              style={{ accentColor: "var(--pf-warning)" }}
+            />
+            <span className={entry.items[0]?.hazardousMaterial ? "font-semibold" : ""}>
+              Hazmat — SDS &amp; 24hr contact (adds &quot;HAZMAT&quot; to TAI comments)
+            </span>
+          </label>
+          <button
+            type="button"
+            onClick={() => setShowItemDims(!showItemDims)}
+            className="shrink-0 font-medium whitespace-nowrap"
+            style={{ color: showItemDims ? "var(--pf-primary)" : "var(--pf-text-muted)" }}
+          >
+            {showItemDims ? "▾ Dims / Class" : "▸ Dims / Class"}
+          </button>
         </div>
       </div>
 
@@ -658,6 +1198,128 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
           </div>
         </div>
 
+        {/* Dedicated 563 Active TAI Accessorials Searchable Picker */}
+        <button
+          type="button"
+          onClick={() => setShowAccessorialPicker(!showAccessorialPicker)}
+          className="w-full pt-1.5 flex items-center justify-between gap-2 text-[11px] font-medium"
+          style={{
+            borderTop: "1px solid var(--pf-border)",
+            color: entry.accessorials.length > 0 ? "var(--pf-primary)" : "var(--pf-text-muted)",
+          }}
+        >
+          <span className="truncate text-left">
+            {showAccessorialPicker ? "▾" : "▸"} Accessorials ({TAI_ACCESSORIAL_COUNT} active TAI charges) — Selected:{" "}
+            {entry.accessorials.length === 0 ? "None" : entry.accessorials.length}
+          </span>
+          {totals.accessorialSell !== 0 || totals.accessorialBuy !== 0 ? (
+            <span className="font-mono text-[10px] shrink-0">
+              +${totals.accessorialSell.toLocaleString()} / -${totals.accessorialBuy.toLocaleString()}
+            </span>
+          ) : (
+            <span className="font-mono text-[10px] shrink-0">Search</span>
+          )}
+        </button>
+
+        {showAccessorialPicker && (
+          <div className="pt-2 space-y-2 text-xs" style={{ borderTop: "1px dashed var(--pf-border)" }}>
+            <input
+              value={accQuery}
+              onChange={(e) => setAccQuery(e.target.value)}
+              placeholder="Search all 563 TAI accessorials by name, ID, or context (e.g. Tarp, 223, Detention, Pier Pass)..."
+              className="pf-input"
+            />
+
+            <div
+              className="max-h-44 overflow-y-auto pf-scroll flex flex-wrap gap-1 p-1.5 rounded"
+              style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+            >
+              {filteredTaiAccessorials.length === 0 ? (
+                <div className="text-[11px] px-1 py-1" style={{ color: "var(--pf-text-muted)" }}>
+                  No TAI accessorial matched &quot;{accQuery}&quot;.
+                </div>
+              ) : (
+                filteredTaiAccessorials.map((item) => {
+                  const active = isCatalogAccessorialSelected(item);
+                  return (
+                    <button
+                      key={`${item.backOfficeId}-${item.scope}`}
+                      type="button"
+                      onClick={() => toggleCatalogAccessorial(item)}
+                      className="px-2 py-0.5 rounded-full text-[11px] text-left transition-colors"
+                      style={{
+                        background: active ? "var(--pf-primary-dim)" : "var(--pf-surface)",
+                        color: active ? "var(--pf-primary)" : "var(--pf-text-muted)",
+                        border: `1px solid ${active ? "var(--pf-primary)" : "var(--pf-border)"}`,
+                      }}
+                    >
+                      {active ? "✓ " : ""}
+                      {`${item.name} #${item.backOfficeId} [${item.scope.toUpperCase()}]`}
+                    </button>
+                  );
+                })
+              )}
+            </div>
+
+            {entry.accessorials.length > 0 && (
+              <div className="space-y-1">
+                {entry.accessorials.map((acc, accIdx) => (
+                  <div
+                    key={`${acc.scope}-${acc.code}-${acc.name}-${accIdx}`}
+                    className="flex items-center gap-1.5 p-1.5 rounded"
+                    style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[11px] font-medium truncate" style={{ color: "var(--pf-text)" }}>
+                        {acc.name}
+                        {acc.code && acc.code !== "CUSTOM" ? ` #${acc.code}` : ""}
+                      </div>
+                      <div className="text-[10px] font-mono uppercase" style={{ color: "var(--pf-text-subtle)" }}>
+                        [{acc.scope}]
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <span className="text-[10px]" style={{ color: "var(--pf-text-muted)" }}>
+                        Sell
+                      </span>
+                      <input
+                        type="number"
+                        value={acc.sell || ""}
+                        onChange={(e) => updateAccessorialPrice(accIdx, { sell: Number(e.target.value) || 0 })}
+                        placeholder="0"
+                        title="Accessorial Sell ($)"
+                        className="pf-input font-mono !w-[60px] text-right"
+                      />
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <span className="text-[10px]" style={{ color: "var(--pf-text-muted)" }}>
+                        Buy
+                      </span>
+                      <input
+                        type="number"
+                        value={acc.buy || ""}
+                        onChange={(e) => updateAccessorialPrice(accIdx, { buy: Number(e.target.value) || 0 })}
+                        placeholder="0"
+                        title="Accessorial Buy ($)"
+                        className="pf-input font-mono !w-[60px] text-right"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeAccessorial(accIdx)}
+                      className="px-1 rounded text-sm font-bold shrink-0"
+                      style={{ color: "var(--pf-danger)" }}
+                      title="Remove accessorial"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Collapsible Extras Toggle (keeps panel short by default!) */}
         <button
           type="button"
@@ -667,7 +1329,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
         >
           <span className="inline-flex items-center gap-1">
             {showExtras ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-            Accessorials ({entry.accessorials.length}), Fuel Split, Lane Runners &amp; Instructions
+            Fuel Split, Quick Chips, Lane Runners &amp; Instructions
           </span>
           <span className="font-mono text-[10px]">Optional</span>
         </button>

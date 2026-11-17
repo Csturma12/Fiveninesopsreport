@@ -22,6 +22,13 @@ import {
   synthesizeContainerExceptionNote,
 } from "../shared/container-extractor";
 import { extractLoadEntryFromEmail } from "../shared/email-extractor";
+import {
+  TAI_ACCESSORIAL_CATALOG,
+  TAI_ACCESSORIAL_COUNT,
+  searchTaiAccessorials,
+} from "../shared/accessorial-options";
+import { validateStateZipMatch } from "../shared/us-zip-ranges";
+import { searchFacilityAndMapsCandidates } from "../server/facility-search";
 
 function makeSampleEntry(): LoadEntry {
   return {
@@ -260,4 +267,96 @@ test("email extractor parses Larkin Zelienople PA 16063 -> Lithonia GA 30058 4ft
   assert.match(result.entry.specialInstructions, /4ft Tarps Required/i);
   assert.ok(result.alternateEquipment.includes("53 ft Conestoga / Curtain Side"));
   assert.equal(validateTaiLoadEntry(result.entry).length, 0);
+});
+
+test("TAI_ACCESSORIAL_CATALOG has 563 active charges excluding test IDs 348, 356, 496 and searches #223 and Pier Pass", () => {
+  assert.equal(TAI_ACCESSORIAL_CATALOG.length, 563);
+  assert.equal(TAI_ACCESSORIAL_COUNT, 563);
+
+  const catalogIds = new Set(TAI_ACCESSORIAL_CATALOG.map((item) => item.backOfficeId));
+  assert.equal(catalogIds.has(348), false);
+  assert.equal(catalogIds.has(356), false);
+  assert.equal(catalogIds.has(496), false);
+
+  const byId = searchTaiAccessorials("223");
+  assert.ok(byId.length >= 1);
+  assert.equal(byId[0].backOfficeId, 223);
+  assert.equal(byId[0].name, "Tarp Fee - Shipment");
+  assert.equal(byId[0].scope, "shipment");
+
+  const byPierPass = searchTaiAccessorials("Pier Pass");
+  const pierPass = byPierPass.find((item) => item.backOfficeId === 145);
+  assert.ok(pierPass);
+  assert.equal(pierPass.name, "Pier Pass - Shipment");
+  assert.equal(pierPass.scope, "shipment");
+});
+
+test("validateStateZipMatch and validateTaiLoadEntry catch East Canton OH vs Greensboro NC 27409 cross-state ZIP mismatch", () => {
+  const mismatch = validateStateZipMatch("OH", "27409");
+  assert.equal(mismatch.valid, false);
+  assert.equal(mismatch.expectedState, "NC");
+  assert.match(String(mismatch.message), /ZIP 27409 belongs to NC, not OH/i);
+
+  const validOh = validateStateZipMatch("OH", "44730");
+  assert.equal(validOh.valid, true);
+  assert.equal(validOh.expectedState, "OH");
+
+  const entry = makeSampleEntry();
+  entry.stops[0] = {
+    ...entry.stops[0],
+    companyName: "RESCO PRODUCTS INC",
+    streetAddress: "6878 Osnaburg Street Southeast",
+    city: "East Canton",
+    state: "OH",
+    zipCode: "27409",
+  };
+
+  const blocked = validateTaiLoadEntry(entry);
+  assert.ok(
+    blocked.some(
+      (issue) => issue.field === "stops.0.zipCode" && /27409 belongs to NC, not OH/i.test(issue.message),
+    ),
+  );
+
+  entry.stops[0].zipCode = "44730";
+  assert.equal(validateTaiLoadEntry(entry).length, 0);
+});
+
+test("searchFacilityAndMapsCandidates returns East Canton OH 44730 first and keeps Greensboro NC 27409 intact", async () => {
+  const result = await searchFacilityAndMapsCandidates(
+    { companyName: "RESCO PRODUCTS INC", city: "East Canton", state: "OH" },
+    store.facilities,
+  );
+  assert.equal(result.ok, true);
+  assert.ok(result.candidates.length >= 2);
+
+  const eastCantonIdx = result.candidates.findIndex(
+    (c) => c.city.toLowerCase() === "east canton" && c.state === "OH" && c.zipCode === "44730",
+  );
+  const greensboroIdx = result.candidates.findIndex(
+    (c) => c.city.toLowerCase() === "greensboro" && c.state === "NC" && c.zipCode === "27409",
+  );
+
+  assert.equal(eastCantonIdx, 0);
+  assert.ok(greensboroIdx > 0);
+  assert.equal(result.candidates[eastCantonIdx].streetAddress, "6878 Osnaburg Street Southeast");
+  assert.equal(result.candidates[eastCantonIdx].zipCode, "44730");
+  assert.equal(result.candidates[greensboroIdx].streetAddress, "4521 NORTHLINE DR");
+  assert.equal(result.candidates[greensboroIdx].zipCode, "27409");
+});
+
+test("buildTaiShipmentRequest prepends HAZMAT to pickup instructions when hazardousMaterial is true", () => {
+  const entry = makeSampleEntry();
+  entry.items[0].hazardousMaterial = true;
+  entry.stops[0].instructions = "Check in at North Gate";
+  entry.accessorials = [
+    { scope: "shipment", code: "223", name: "Tarp Fee - Shipment", sell: 150, buy: 100 },
+  ];
+
+  const req = buildTaiShipmentRequest(entry);
+  const stops = req.stops as Array<{ instructions?: string }>;
+  assert.match(String(stops[0]?.instructions), /^HAZMAT \| Check in at North Gate \| 8ft Tarps Required$/);
+
+  const accessorialCodes = req.accessorialCodes as Array<{ code: string; name: string }>;
+  assert.deepEqual(accessorialCodes, [{ code: "223", name: "Tarp Fee - Shipment" }]);
 });
