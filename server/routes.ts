@@ -14,6 +14,7 @@ import {
   handleTaiInvoiceWebhook,
   handleTaiShipmentWebhook,
   previewTaiBooking,
+  taiBookingStatus,
   verifyWebhookSecretIfConfigured,
 } from "./tai-service";
 import type { LoadEntry } from "../shared/load-entry";
@@ -84,17 +85,44 @@ export function registerApiRoutes(app: Express): void {
     res.json({ ok: true, ...result });
   });
 
-  app.post("/api/loads/preview", (req: Request, res: Response) => {
-    const entry = req.body?.entry as LoadEntry;
-    const result = previewTaiBooking(entry);
-    res.json(result);
+  const readLoadEntry = (body: unknown): LoadEntry | null => {
+    const entry = (body as { entry?: unknown } | undefined)?.entry;
+    if (!entry || typeof entry !== "object") return null;
+    const e = entry as Partial<LoadEntry>;
+    if (!Array.isArray(e.stops) || !Array.isArray(e.items) || !e.customer || !e.references || !e.equipment) return null;
+    return { ...e, accessorials: Array.isArray(e.accessorials) ? e.accessorials : [] } as LoadEntry;
+  };
+
+  app.get("/api/tai/booking/status", (_req: Request, res: Response) => {
+    res.json(taiBookingStatus());
   });
 
-  app.post("/api/loads/book", async (req: Request, res: Response) => {
-    const entry = req.body?.entry as LoadEntry;
-    const duplicateCount = Number(req.body?.duplicateCount) || 1;
-    const result = await bookTaiLoads(entry, duplicateCount);
+  // Step 1 of Generate Load in TAI: validate + build the exact CommitDomesticShipmentRequest
+  // on the server and hand back a previewToken bound to it. No TAI call is made here.
+  app.post("/api/loads/preview", (req: Request, res: Response) => {
+    const entry = readLoadEntry(req.body);
+    if (!entry) {
+      res.status(400).json({ ok: false, message: "A load entry is required." });
+      return;
+    }
+    const result = previewTaiBooking(entry);
     res.status(result.ok ? 200 : 422).json(result);
+  });
+
+  // Step 2: create in TAI. Refuses without a matching previewToken; answers with TAI's own
+  // body on refusal; never saves a load TAI did not confirm with a shipment id.
+  app.post("/api/loads/book", async (req: Request, res: Response) => {
+    const entry = readLoadEntry(req.body);
+    if (!entry) {
+      res.status(400).json({ ok: false, message: "A load entry is required." });
+      return;
+    }
+    const result = await bookTaiLoads(entry, {
+      duplicateCount: Number(req.body?.duplicateCount) || 1,
+      previewToken: req.body?.previewToken,
+      confirmDuplicate: req.body?.confirmDuplicate === true,
+    });
+    res.status(result.status).json(result);
   });
 
   app.post("/api/loads/:id/writeback-carrier", async (req: Request, res: Response) => {

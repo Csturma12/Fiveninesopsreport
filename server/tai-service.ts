@@ -4,6 +4,7 @@ import {
   loadEntryTotals,
   validateTaiLoadEntry,
   type LoadEntry,
+  type TaiValidationIssue,
 } from "../shared/load-entry";
 import {
   extractDateShort,
@@ -12,7 +13,9 @@ import {
   type TaiInvoiceWebhookPayload,
   type TaiShipmentWebhookPayload,
 } from "../shared/tai-webhook-schema";
+import { findDuplicateBooking } from "./duplicate-booking";
 import { broadcastOpsEvent } from "./events";
+import { loadEntryPreviewToken } from "./load-entry-preview";
 import { store } from "./store";
 import {
   isPendingReadBack,
@@ -24,6 +27,8 @@ import {
 
 const TAI_BASE = (process.env.TAI_BASE_URL || "https://primaryfreightllc.taicloud.net").replace(/\/+$/, "");
 export const TAI_SHIPMENTS_PATH = "/PublicApi/Shipping/v2/Shipments";
+const TAI_RESPONSE_KEEP = 2_000;
+const TAI_TIMEOUT_MS = 30_000;
 
 function getConfiguredTaiToken(): string {
   const dynamicKeyName = ["TAI", "API", "KEY"].join("_");
@@ -32,37 +37,231 @@ function getConfiguredTaiToken(): string {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function previewTaiBooking(entry: LoadEntry) {
-  const issues = validateTaiLoadEntry(entry);
-  const request = buildTaiShipmentRequest(entry);
+/** Where live TAI shipment creation stands on this server (never includes the key itself). */
+export function taiBookingStatus() {
+  const configured = Boolean(getConfiguredTaiToken());
+  const liveWritesSwitchedOn = !store.isSafeSandbox;
   return {
-    ok: issues.length === 0,
+    configured,
+    liveWritesSwitchedOn,
+    enabled: configured && liveWritesSwitchedOn,
     url: `${TAI_BASE}${TAI_SHIPMENTS_PATH}`,
-    issues,
-    request,
   };
 }
 
-export async function bookTaiLoads(entry: LoadEntry, duplicateCount = 1) {
+export const LIVE_TAI_WRITES_OFF_MESSAGE =
+  "Live TAI writes are switched off on this server (ALLOW_LIVE_TAI_WRITES is not \"true\" or no TAI API key is configured). Nothing was created in TAI.";
+
+export const TAI_PREVIEW_STALE_MESSAGE =
+  "Shipment details changed since the TAI preview (or no preview was run). Preview the current shipment before generating it.";
+
+export const TAI_RECONCILE_MESSAGE =
+  "TAI accepted the request but its answer carried no Shipment ID. Nothing was saved locally — this load may already exist in TAI, so reconcile it there before retrying instead of booking a second one.";
+
+export interface TaiHttpDetail {
+  httpStatus: number | null;
+  /** First 2 KB of TAI's answer, verbatim. */
+  responseBody: string;
+  responseJson: unknown;
+  /** The exact CommitDomesticShipmentRequest body that was sent. */
+  request: Record<string, unknown>;
+  url: string;
+  durationMs: number;
+}
+
+export interface TaiBookResult {
+  ok: boolean;
+  /** HTTP status the route should answer with. */
+  status: number;
+  issues: TaiValidationIssue[];
+  request: Record<string, unknown>;
+  /** Shipment ids TAI confirmed (and that were saved locally), in order. */
+  createdIds: string[];
+  message: string;
+  requiresPreview?: boolean;
+  requiresDuplicateConfirmation?: boolean;
+  duplicateOf?: string;
+  matchedOn?: string;
+  requiresReconciliation?: boolean;
+  liveWritesEnabled?: boolean;
+  tai?: TaiHttpDetail;
+}
+
+export interface BookTaiLoadsOptions {
+  duplicateCount?: number;
+  previewToken?: unknown;
+  confirmDuplicate?: boolean;
+}
+
+export interface BookTaiLoadsDependencies {
+  fetchImpl?: typeof fetch;
+}
+
+export function previewTaiBooking(entry: LoadEntry) {
   const issues = validateTaiLoadEntry(entry);
-  const requestTemplate = buildTaiShipmentRequest(entry);
-  if (issues.length > 0) {
-    return {
-      ok: false,
-      issues,
-      request: requestTemplate,
-      createdIds: [] as string[],
-      message: issues[0].message,
-    };
+  const request = buildTaiShipmentRequest(entry);
+  const url = `${TAI_BASE}${TAI_SHIPMENTS_PATH}`;
+  const ok = issues.length === 0;
+  return {
+    ...taiBookingStatus(),
+    ok,
+    url,
+    issues,
+    request,
+    message: ok ? "" : issues[0].message,
+    previewToken: ok ? loadEntryPreviewToken(entry, { url, request }) : undefined,
+  };
+}
+
+/**
+ * "TAI answered 400: <TAI's own reason>" from the usual .NET error shapes
+ * (`errors` field map, `message`, `title`, an array of strings, or text).
+ */
+export function taiRefusalMessage(status: number, json: unknown, text: string): string {
+  const reasons: string[] = [];
+  const add = (value: unknown) => {
+    if (typeof value === "string" && value.trim()) reasons.push(value.trim());
+  };
+  const visit = (value: unknown, depth: number) => {
+    if (depth > 3 || value == null) return;
+    if (typeof value === "string") return add(value);
+    if (Array.isArray(value)) return value.forEach((item) => visit(item, depth + 1));
+    if (typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    if (record.errors && typeof record.errors === "object" && !Array.isArray(record.errors)) {
+      for (const [field, messages] of Object.entries(record.errors as Record<string, unknown>)) {
+        for (const message of Array.isArray(messages) ? messages : [messages]) {
+          if (typeof message === "string" && message.trim()) reasons.push(field ? `${field}: ${message.trim()}` : message.trim());
+        }
+      }
+    } else if (record.errors) visit(record.errors, depth + 1);
+    for (const key of ["message", "Message", "error", "errorMessage", "detail", "title"]) add(record[key]);
+    for (const key of ["validationErrors", "ValidationErrors", "messages", "Messages"]) visit(record[key], depth + 1);
+  };
+  visit(json, 0);
+  if (!reasons.length && !json) add(text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 300));
+  const unique = [...new Set(reasons)].slice(0, 6).join("; ").slice(0, 600);
+  return unique ? `TAI answered ${status}: ${unique}` : `TAI answered ${status} with no reason in its response`;
+}
+
+type TaiCreateOutcome =
+  | { kind: "created"; shipmentId: string; tai: TaiHttpDetail }
+  | { kind: "no-id"; tai: TaiHttpDetail }
+  | { kind: "refused"; message: string; tai: TaiHttpDetail }
+  | { kind: "unreachable"; message: string; tai: TaiHttpDetail };
+
+/** One POST /PublicApi/Shipping/v2/Shipments. Never throws; every outcome is reported with TAI's own answer. */
+async function createTaiShipment(
+  body: Record<string, unknown>,
+  fetchImpl: typeof fetch,
+): Promise<TaiCreateOutcome> {
+  const url = `${TAI_BASE}${TAI_SHIPMENTS_PATH}`;
+  const started = Date.now();
+  const detail = (httpStatus: number | null, responseBody: string, responseJson: unknown): TaiHttpDetail => ({
+    httpStatus,
+    responseBody: responseBody.slice(0, TAI_RESPONSE_KEEP),
+    responseJson,
+    request: body,
+    url,
+    durationMs: Date.now() - started,
+  });
+
+  let resp: Response;
+  try {
+    resp = await fetchImpl(url, {
+      method: "POST",
+      headers: {
+        "x-api-key": getConfiguredTaiToken(),
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TAI_TIMEOUT_MS),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { kind: "unreachable", message: `TAI unreachable: ${reason}`, tai: detail(null, "", null) };
   }
 
-  const count = Math.max(1, Math.min(10, Math.floor(Number(duplicateCount) || 1)));
+  let text = "";
+  try {
+    text = await resp.text();
+  } catch {
+    text = "";
+  }
+  let parsed: unknown = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    parsed = null;
+  }
+
+  if (!resp.ok) {
+    return { kind: "refused", message: taiRefusalMessage(resp.status, parsed, text), tai: detail(resp.status, text, parsed) };
+  }
+  const shipmentId = extractTaiShipmentId(parsed, text);
+  if (!shipmentId) return { kind: "no-id", tai: detail(resp.status, text, parsed) };
+  return { kind: "created", shipmentId, tai: detail(resp.status, text, parsed) };
+}
+
+/**
+ * Generate Load in TAI. TAI is the source of record: a load is only recorded
+ * here (and in Supabase `shipments`) after TAI answered 2xx WITH a shipment id.
+ *
+ * Refuses, in order, when: the entry fails TAI validation (422); the caller's
+ * previewToken is missing or stale (409 requiresPreview); a TAI load already
+ * exists for the same customer + reference and `confirmDuplicate` was not sent
+ * (409 requiresDuplicateConfirmation); live TAI writes are switched off (503);
+ * TAI refuses or is unreachable (502, with TAI's body); TAI accepts without an
+ * id (409 requiresReconciliation). No code path invents a TAI-looking id.
+ */
+export async function bookTaiLoads(
+  entry: LoadEntry,
+  options: BookTaiLoadsOptions = {},
+  dependencies: BookTaiLoadsDependencies = {},
+): Promise<TaiBookResult> {
+  const fetchImpl = dependencies.fetchImpl ?? fetch;
+  const preview = previewTaiBooking(entry);
+  const requestTemplate = preview.request;
+  const base = { issues: [] as TaiValidationIssue[], request: requestTemplate, createdIds: [] as string[] };
+
+  if (preview.issues.length > 0) {
+    return { ...base, ok: false, status: 422, issues: preview.issues, message: preview.issues[0].message };
+  }
+
+  if (typeof options.previewToken !== "string" || options.previewToken !== preview.previewToken) {
+    return { ...base, ok: false, status: 409, requiresPreview: true, message: TAI_PREVIEW_STALE_MESSAGE };
+  }
+
+  if (options.confirmDuplicate !== true) {
+    const duplicate = findDuplicateBooking(store.shipments, entry);
+    if (duplicate) {
+      return {
+        ...base,
+        ok: false,
+        status: 409,
+        requiresDuplicateConfirmation: true,
+        duplicateOf: duplicate.shipmentId,
+        matchedOn: duplicate.matchedOn,
+        message: `Load #${duplicate.shipmentId} is already booked in TAI for ${entry.customer.name.trim()} with the same ${duplicate.matchedOn} (${duplicate.value}). Open that load to change it, or confirm to generate a second one.`,
+      };
+    }
+  }
+
+  const liveStatus = taiBookingStatus();
+  if (!liveStatus.enabled) {
+    return { ...base, ok: false, status: 503, liveWritesEnabled: false, message: LIVE_TAI_WRITES_OFF_MESSAGE };
+  }
+
+  const count = Math.max(1, Math.min(10, Math.floor(Number(options.duplicateCount) || 1)));
   const totals = loadEntryTotals(entry);
   const firstStop = entry.stops[0];
   const lastStop = entry.stops[entry.stops.length - 1];
   const createdIds: string[] = [];
-  const liveAllowed = !store.isSafeSandbox && Boolean(getConfiguredTaiToken());
   const sb = store.getSupabase();
+
+  const partialNote = () =>
+    createdIds.length > 0 ? ` TAI did confirm ${createdIds.length} load(s) before this: #${createdIds.join(", #")}.` : "";
 
   for (let i = 0; i < count; i++) {
     const poVal =
@@ -75,41 +274,37 @@ export async function bookTaiLoads(entry: LoadEntry, duplicateCount = 1) {
       references: { ...entry.references, customerPO: poVal },
     };
     const body = buildTaiShipmentRequest(perLoadEntry);
-    let assignedId = "";
+    const outcome = await createTaiShipment(body, fetchImpl);
 
-    if (liveAllowed) {
-      const resp = await fetch(`${TAI_BASE}${TAI_SHIPMENTS_PATH}`, {
-        method: "POST",
-        headers: {
-          "x-api-key": getConfiguredTaiToken(),
-          Accept: "application/json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(30_000),
-      });
-      const text = await resp.text();
-      let parsed: unknown = null;
-      try {
-        parsed = text ? JSON.parse(text) : null;
-      } catch {
-        parsed = null;
-      }
-      if (!resp.ok) {
-        return {
-          ok: false,
-          issues: [{ field: "tai", message: `TAI refused (${resp.status}): ${text.slice(0, 300)}` }],
-          request: body,
-          createdIds,
-          message: `TAI refused the load (${resp.status}): ${text.slice(0, 240)}`,
-        };
-      }
-      assignedId = extractTaiShipmentId(parsed, text);
+    if (outcome.kind === "refused" || outcome.kind === "unreachable") {
+      if (createdIds.length > 0) broadcastOpsEvent("shipment_booked", { createdIds });
+      return {
+        ...base,
+        ok: false,
+        status: 502,
+        createdIds,
+        issues: [{ field: "tai", message: outcome.message }],
+        request: body,
+        tai: outcome.tai,
+        message: `${outcome.message}${partialNote()}`,
+      };
     }
 
-    if (!assignedId) {
-      assignedId = String(132742500 + Math.floor(Math.random() * 700) + i);
+    if (outcome.kind === "no-id") {
+      if (createdIds.length > 0) broadcastOpsEvent("shipment_booked", { createdIds });
+      return {
+        ...base,
+        ok: false,
+        status: 409,
+        createdIds,
+        requiresReconciliation: true,
+        request: body,
+        tai: outcome.tai,
+        message: `${TAI_RECONCILE_MESSAGE}${partialNote()}`,
+      };
     }
+
+    const assignedId = outcome.shipmentId;
     createdIds.push(assignedId);
 
     const newShipment: OpsShipment = {
@@ -140,13 +335,11 @@ export async function bookTaiLoads(entry: LoadEntry, duplicateCount = 1) {
       podCount: 0,
       emailPodAvailable: false,
       rateconStatus: entry.carrier.name ? "Drafted" : "Not Sent",
-      writebackState: liveAllowed
-        ? `Booked live in TAI (#${assignedId}) · CommitDomesticShipmentRequest`
-        : `Validated & booked in Sandbox (#${assignedId}) · Flip ALLOW_LIVE_TAI_WRITES=true for live`,
+      writebackState: `Generated live in TAI (#${assignedId}) · CommitDomesticShipmentRequest ${outcome.tai.httpStatus}`,
       location: `${entry.stops.length} stops · ${totals.totalPieces} pcs · ${totals.totalWeight.toLocaleString()} lbs`,
     };
 
-    if (liveAllowed && sb) {
+    if (sb) {
       await sb.from("shipments").upsert(
         {
           shipment_id: assignedId,
@@ -182,11 +375,12 @@ export async function bookTaiLoads(entry: LoadEntry, duplicateCount = 1) {
 
   broadcastOpsEvent("shipment_booked", { createdIds });
   return {
+    ...base,
     ok: true,
-    issues: [],
-    request: requestTemplate,
+    status: 200,
     createdIds,
-    message: `Created ${createdIds.length} load(s): #${createdIds.join(", #")}`,
+    liveWritesEnabled: true,
+    message: `Generated ${createdIds.length} load(s) in TAI: #${createdIds.join(", #")}`,
   };
 }
 
