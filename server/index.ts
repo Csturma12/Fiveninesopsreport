@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { registerAuth } from "./auth";
 import { registerApiRoutes } from "./routes";
+import { registerPfdGateway } from "./pfd-gateway";
 import { store } from "./store";
 import { startTaiWritebackPollerIfEnabled } from "./tai-writeback-poller";
 
@@ -32,6 +33,8 @@ async function startServer() {
 
   registerAuth(app);
   registerApiRoutes(app);
+  // /api/pfd/* → Primary Freight Dashboard staff APIs (see server/pfd-gateway.ts)
+  registerPfdGateway(app);
 
   // Hydrate Supabase & Realtime in background on startup, and start poller if enabled
   store.initSupabaseSyncAndRealtime().catch(() => {});

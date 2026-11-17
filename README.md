@@ -38,6 +38,24 @@ You can run `fivenines-ops` live alongside `primary-freight-dashboard` against t
 
 ---
 
+## Primary Freight Dashboard endpoints (`/api/pfd/*`)
+
+Every staff API on `primary-freight-dashboard` (~320 endpoints: shipments, quotes, carriers, customers, lanes, containers, GPA / Port Houston, DAT, freight rates, billing, projects, dispatch board, assistant, Gmail/Outlook toolkits, …) is available here at `/api/pfd/<path>`, forwarded to the dashboard's `/api/<path>`. Example: `GET /api/pfd/shipments/active` → dashboard `GET /api/shipments/active`.
+
+The dashboard serves them from its own SQLite volume, so data is always live and new dashboard endpoints work here without a port. `GET /api/pfd/_endpoints` lists the forwarded prefixes and `GET /api/pfd/_status` checks config and upstream health. Session sign-in (`/api/auth`), the customer portal (`/api/portal`) and machine webhooks (`/api/webhooks`) are not forwarded.
+
+Fly secrets (one shared token, set on both apps; this restarts both):
+```bash
+TOKEN=$(openssl rand -hex 32)
+flyctl secrets set -a fivenines-ops \
+  PFD_BASE_URL="http://primary-freight-dashboard.internal:5000" \
+  PFD_GATEWAY_TOKEN="$TOKEN"
+flyctl secrets set -a primary-freight-dashboard OPS_GATEWAY_TOKEN="$TOKEN"
+```
+The dashboard side needs the matching `OPS_GATEWAY_TOKEN` support (`server/ops-gateway-auth.ts` in primary-freight-dashboard).
+
+---
+
 ## Local Development
 ```bash
 npm install
