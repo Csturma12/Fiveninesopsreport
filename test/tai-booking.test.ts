@@ -484,6 +484,8 @@ test("HTTP routes: preview hands back the token; book maps refusals to 400/409/5
       { ...sampleEntry(), customer: "Larkin" },
       { ...sampleEntry(), pricing: null },
       { ...sampleEntry(), stops: ["Beaver Falls", "Lithonia"] },
+      { ...sampleEntry(), accessorials: ["Tarp Fee"] },
+      { ...sampleEntry(), accessorials: "Tarp Fee" },
     ]) {
       assert.equal((await post("/api/loads/preview", { entry: broken })).status, 400);
       assert.equal((await post("/api/loads/book", { entry: broken, previewToken: "x" })).status, 400);

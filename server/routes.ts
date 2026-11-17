@@ -97,7 +97,12 @@ export function registerApiRoutes(app: Express): void {
     for (const key of ["customer", "references", "equipment", "pricing", "carrier"]) {
       if (!isRecord(entry[key])) return null;
     }
-    const accessorials = Array.isArray(entry.accessorials) ? entry.accessorials.filter(isRecord) : [];
+    // Accessorials are optional, but when present every row must be an object: a
+    // malformed row is rejected rather than silently dropped from the TAI request.
+    if (entry.accessorials !== undefined && (!Array.isArray(entry.accessorials) || !entry.accessorials.every(isRecord))) {
+      return null;
+    }
+    const accessorials = Array.isArray(entry.accessorials) ? entry.accessorials : [];
     return { ...(entry as unknown as LoadEntry), accessorials: accessorials as unknown as LoadEntry["accessorials"] };
   };
 
