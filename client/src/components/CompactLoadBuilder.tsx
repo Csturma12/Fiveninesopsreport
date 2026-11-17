@@ -129,6 +129,18 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
   const [duplicateCount, setDuplicateCount] = useState<number>(1);
   const [submitting, setSubmitting] = useState<boolean>(false);
+  const [bookingError, setBookingError] = useState<string | null>(null);
+  // TAI may already hold this load (accepted without an id, or the create answer was lost):
+  // no ordinary retry is offered until the operator has checked TAI.
+  const [reconcileNotice, setReconcileNotice] = useState<{
+    message: string;
+    /** Customer as it was when the uncertain request was sent (the form may be edited afterwards). */
+    customer: string;
+    createdIds: string[];
+    /** Exact references of the order whose TAI outcome is unknown. */
+    pending: { customerPO: string; bolNumber: string }[];
+  } | null>(null);
+  const [duplicatePrompt, setDuplicatePrompt] = useState<{ message: string; duplicateOf?: string } | null>(null);
 
   const issues = useMemo(() => validateTaiLoadEntry(entry), [entry]);
   const totals = useMemo(() => loadEntryTotals(entry), [entry]);
@@ -373,28 +385,135 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   };
 
   const requestTaiBookingConfirm = () => {
+    if (submitting) return;
     if (issues.length > 0) {
       onToast(`Complete required TAI field: ${issues[0].message}`);
       return;
     }
+    // reconcileNotice is deliberately NOT cleared here: an unknown TAI outcome stays
+    // on this form until the operator confirms they checked TAI (resolveReconcile).
+    setBookingError(null);
+    setDuplicatePrompt(null);
     setShowConfirmModal(true);
   };
 
-  const executeTaiBooking = async () => {
-    setSubmitting(true);
+  const closeConfirmModal = () => {
+    if (submitting) return;
+    setShowConfirmModal(false);
+    setBookingError(null);
+    setDuplicatePrompt(null);
+  };
+
+  const resolveReconcile = () => {
+    if (submitting) return;
+    setReconcileNotice(null);
+  };
+
+  const readJson = async (res: Response): Promise<Record<string, unknown>> => {
     try {
-      const res = await fetch("/api/loads/book", {
+      const parsed: unknown = await res.json();
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  };
+
+  const firstMessage = (data: Record<string, unknown>, fallback: string): string => {
+    if (typeof data.message === "string" && data.message.trim()) return data.message;
+    const issue = Array.isArray(data.issues) ? (data.issues[0] as { message?: unknown } | undefined) : undefined;
+    return typeof issue?.message === "string" && issue.message.trim() ? issue.message : fallback;
+  };
+
+  /**
+   * Generate Load in TAI, after the operator confirmed the modal: run the server
+   * preview (validation + exact TAI request + previewToken), then create with that
+   * token. Any failure stops here with TAI's / the validator's message and nothing
+   * is treated as booked. The whole form is locked while this runs.
+   */
+  const executeTaiBooking = async (confirmDuplicate = false) => {
+    if (submitting || reconcileNotice) return;
+    setSubmitting(true);
+    setBookingError(null);
+    let previewToken = "";
+    try {
+      const previewRes = await fetch("/api/loads/preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ entry, duplicateCount }),
       });
-      const data = await res.json();
-      if (!data.ok) {
-        onToast(data.message || "TAI validation blocked booking");
-      } else {
-        setShowConfirmModal(false);
-        onBooked(data.createdIds, data.message);
+      const preview = await readJson(previewRes);
+      if (!previewRes.ok || preview.ok !== true || typeof preview.previewToken !== "string" || !preview.previewToken) {
+        setBookingError(firstMessage(preview, "TAI preview failed — nothing was generated in TAI."));
+        return;
       }
+      previewToken = preview.previewToken;
+    } catch (err) {
+      // Preview never touches TAI, so a lost preview is safe to retry.
+      setBookingError(
+        `Could not reach the ops server (${err instanceof Error ? err.message : String(err)}). Nothing was generated in TAI.`,
+      );
+      return;
+    } finally {
+      if (!previewToken) setSubmitting(false);
+    }
+
+    try {
+      const bookRes = await fetch("/api/loads/book", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          entry,
+          duplicateCount,
+          previewToken,
+          ...(confirmDuplicate ? { confirmDuplicate: true } : {}),
+        }),
+      });
+      const data = await readJson(bookRes);
+      if (data.requiresReconciliation === true) {
+        const pendingRef = data.pendingReference as { customerPO?: unknown; bolNumber?: unknown } | undefined;
+        setDuplicatePrompt(null);
+        setReconcileNotice({
+          message: firstMessage(data, "TAI accepted the request but returned no Shipment ID."),
+          customer: entry.customer.name,
+          createdIds: Array.isArray(data.createdIds) ? data.createdIds.map(String) : [],
+          pending: [
+            {
+              customerPO: typeof pendingRef?.customerPO === "string" ? pendingRef.customerPO : entry.references.customerPO,
+              bolNumber: typeof pendingRef?.bolNumber === "string" ? pendingRef.bolNumber : entry.references.bolNumber,
+            },
+          ],
+        });
+        return;
+      }
+      if (data.requiresDuplicateConfirmation === true) {
+        setDuplicatePrompt({
+          message: firstMessage(data, "A load with the same customer and reference already exists in TAI."),
+          duplicateOf: typeof data.duplicateOf === "string" ? data.duplicateOf : undefined,
+        });
+        return;
+      }
+      if (!bookRes.ok || data.ok !== true || !Array.isArray(data.createdIds) || data.createdIds.length === 0) {
+        setDuplicatePrompt(null);
+        setBookingError(firstMessage(data, "TAI did not confirm the load — nothing was generated."));
+        return;
+      }
+      setShowConfirmModal(false);
+      setDuplicatePrompt(null);
+      onBooked(data.createdIds.map(String), typeof data.message === "string" ? data.message : "Generated in TAI");
+    } catch (err) {
+      // The create request left this browser; its answer was lost. TAI may hold any
+      // of the orders that were requested (PO, or PO-1 … PO-N for a batch).
+      setDuplicatePrompt(null);
+      const basePo = entry.references.customerPO;
+      setReconcileNotice({
+        message: `The Generate request was sent but its answer never arrived (${err instanceof Error ? err.message : String(err)}).`,
+        customer: entry.customer.name,
+        createdIds: [],
+        pending:
+          duplicateCount > 1 && basePo
+            ? Array.from({ length: duplicateCount }, (_, i) => ({ customerPO: `${basePo}-${i + 1}`, bolNumber: entry.references.bolNumber }))
+            : [{ customerPO: basePo, bolNumber: entry.references.bolNumber }],
+      });
     } finally {
       setSubmitting(false);
     }
@@ -404,6 +523,12 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
 
   return (
     <div className={compact ? "space-y-2.5" : "space-y-3.5"}>
+      {/* Locked (no edits, no second click) while Generate Load in TAI is running */}
+      <fieldset
+        disabled={submitting}
+        data-testid="fieldset-clb-form"
+        className={`min-w-0 border-0 p-0 m-0 ${compact ? "space-y-2.5" : "space-y-3.5"}`}
+      >
       {/* 1. ULTRA-COMPACT TOP STATUS + EXTRACT BAR */}
       <div
         className="px-3 py-2 rounded-lg flex items-center justify-between gap-2 text-xs"
@@ -1480,11 +1605,16 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
             type="button"
             disabled={submitting}
             onClick={requestTaiBookingConfirm}
+            data-testid="button-clb-generate"
             className="flex-1 max-w-[260px] py-2 px-3 rounded-lg text-xs font-bold inline-flex items-center justify-center gap-1.5 transition-opacity"
             style={{ background: "var(--pf-action)", color: "#ffffff" }}
           >
             <Rocket size={13} />
-            {submitting ? "Booking…" : `Book in TAI${duplicateCount > 1 ? ` (×${duplicateCount})` : ""}`}
+            {submitting
+              ? "Generating…"
+              : reconcileNotice
+              ? "Check TAI · Outcome Unknown"
+              : `Generate Load in TAI${duplicateCount > 1 ? ` (×${duplicateCount})` : ""}`}
           </button>
 
           <button
@@ -1560,12 +1690,14 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
           {JSON.stringify(taiRequestPreview, null, 2)}
         </pre>
       )}
+      </fieldset>
 
       {showConfirmModal && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-3"
           style={{ background: "rgba(9, 12, 18, 0.78)" }}
-          onClick={() => !submitting && setShowConfirmModal(false)}
+          onClick={closeConfirmModal}
+          data-testid="dialog-clb-confirm"
         >
           <div
             className="w-full max-w-md rounded-xl p-4 space-y-3 shadow-2xl text-xs"
@@ -1583,9 +1715,10 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               <button
                 type="button"
                 disabled={submitting}
-                onClick={() => setShowConfirmModal(false)}
+                onClick={closeConfirmModal}
                 className="p-1 rounded"
                 style={{ color: "var(--pf-text-muted)" }}
+                title="Cancel — nothing is sent to TAI"
               >
                 <X size={14} />
               </button>
@@ -1594,10 +1727,29 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
             <div className="space-y-1.5 leading-relaxed">
               <div>
                 <strong style={{ color: "var(--pf-text-muted)" }}>Customer:</strong>{" "}
-                <span className="font-semibold">{entry.customer.name || "Unlinked Spot Customer"}</span>{" "}
+                <span className="font-semibold" data-testid="text-clb-confirm-customer">
+                  {entry.customer.name || "Unlinked Spot Customer"}
+                </span>{" "}
                 <span className="font-mono text-[11px]" style={{ color: "var(--pf-primary)" }}>
                   ({entry.customer.taiOrganizationId ? `TAI Org #${entry.customer.taiOrganizationId}` : "Unlinked OK"})
                 </span>
+              </div>
+
+              <div>
+                <strong style={{ color: "var(--pf-text-muted)" }}>Lane:</strong>{" "}
+                <span className="font-semibold" data-testid="text-clb-confirm-lane">
+                  {`${entry.stops[0]?.city || "?"}, ${entry.stops[0]?.state || "?"} ${entry.stops[0]?.zipCode || ""}`.trim()}
+                  {" → "}
+                  {`${entry.stops[entry.stops.length - 1]?.city || "?"}, ${entry.stops[entry.stops.length - 1]?.state || "?"} ${
+                    entry.stops[entry.stops.length - 1]?.zipCode || ""
+                  }`.trim()}
+                </span>
+                {entry.stops.length > 2 && (
+                  <span className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>
+                    {" "}
+                    · {entry.stops.length} stops
+                  </span>
+                )}
               </div>
 
               {entry.stops.map((st, idx) => {
@@ -1635,6 +1787,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                       <button
                         key={eqOption}
                         type="button"
+                        disabled={submitting}
                         onClick={() =>
                           onChange({
                             ...entry,
@@ -1669,7 +1822,11 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
 
               <div>
                 <strong style={{ color: "var(--pf-text-muted)" }}>Customer Rate:</strong>{" "}
-                <span className="font-mono font-bold" style={{ color: totals.totalSell > 0 ? "var(--pf-primary)" : "var(--pf-text-muted)" }}>
+                <span
+                  className="font-mono font-bold"
+                  data-testid="text-clb-confirm-rate"
+                  style={{ color: totals.totalSell > 0 ? "var(--pf-primary)" : "var(--pf-text-muted)" }}
+                >
                   {totals.totalSell > 0
                     ? `$${totals.totalSell.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                     : "Pending / TBD"}
@@ -1677,26 +1834,123 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               </div>
             </div>
 
+            {reconcileNotice && (
+              <div
+                role="alert"
+                data-testid="panel-clb-reconcile"
+                className="px-2.5 py-2 rounded-lg text-[11px] leading-snug space-y-1"
+                style={{
+                  background: "var(--pf-warning-dim)",
+                  border: "1px solid var(--pf-warning)",
+                  color: "var(--pf-warning)",
+                }}
+              >
+                <div className="font-bold">⚠ Outcome unknown — TAI may already hold this load</div>
+                <div>{reconcileNotice.message}</div>
+                {reconcileNotice.createdIds.length > 0 && (
+                  <div data-testid="text-clb-reconcile-saved">
+                    TAI confirmed and this dashboard saved:{" "}
+                    <span className="font-mono">#{reconcileNotice.createdIds.join(", #")}</span>. Do not generate those again.
+                  </div>
+                )}
+                <div data-testid="text-clb-reconcile-pending">
+                  {reconcileNotice.createdIds.length > 0 ? "The remaining order was not saved here." : "Nothing was saved here."} Check TAI for{" "}
+                  <span className="font-mono">
+                    {reconcileNotice.customer || "the unlinked spot customer"}
+                    {reconcileNotice.pending.map((p, i) => (
+                      <span key={i}>
+                        {p.customerPO ? ` · PO ${p.customerPO}` : ""}
+                        {p.bolNumber && (i === 0 || p.bolNumber !== reconcileNotice.pending[0].bolNumber) ? ` · BOL ${p.bolNumber}` : ""}
+                      </span>
+                    ))}
+                  </span>{" "}
+                  before generating again, or you will create a second shipment.
+                </div>
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    disabled={submitting}
+                    onClick={resolveReconcile}
+                    data-testid="button-clb-reconcile-resolved"
+                    className="px-2.5 py-1 rounded font-semibold"
+                    style={{ background: "var(--pf-surface)", color: "var(--pf-text)", border: "1px solid var(--pf-warning)" }}
+                  >
+                    I checked TAI — the load is not there, allow Generate
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {bookingError && !reconcileNotice && (
+              <div
+                role="alert"
+                data-testid="text-clb-booking-error"
+                className="px-2.5 py-2 rounded-lg text-[11px] leading-snug font-medium"
+                style={{
+                  background: "var(--pf-danger-dim)",
+                  border: "1px solid var(--pf-danger)",
+                  color: "var(--pf-danger)",
+                }}
+              >
+                ⚠ Not generated in TAI — {bookingError}
+              </div>
+            )}
+
+            {duplicatePrompt && !bookingError && !reconcileNotice && (
+              <div
+                role="alert"
+                data-testid="panel-clb-duplicate"
+                className="px-2.5 py-2 rounded-lg text-[11px] leading-snug space-y-1"
+                style={{
+                  background: "var(--pf-warning-dim)",
+                  border: "1px solid var(--pf-warning)",
+                  color: "var(--pf-warning)",
+                }}
+              >
+                <div className="font-bold">
+                  ⚠ Possible duplicate{duplicatePrompt.duplicateOf ? ` of Load #${duplicatePrompt.duplicateOf}` : ""}
+                </div>
+                <div>{duplicatePrompt.message}</div>
+                <div>Nothing has been sent to TAI yet. Generate a second load anyway?</div>
+              </div>
+            )}
+
             <div className="flex items-center justify-end gap-2 pt-2" style={{ borderTop: "1px solid var(--pf-border)" }}>
               <button
                 type="button"
                 disabled={submitting}
-                onClick={() => setShowConfirmModal(false)}
+                onClick={closeConfirmModal}
+                data-testid="button-clb-confirm-cancel"
                 className="px-3 py-1.5 rounded-lg font-medium"
                 style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
               >
-                Cancel
+                {reconcileNotice ? "Close · Check TAI" : "Cancel"}
               </button>
-              <button
-                type="button"
-                disabled={submitting}
-                onClick={executeTaiBooking}
-                className="px-4 py-1.5 rounded-lg font-bold inline-flex items-center gap-1.5"
-                style={{ background: "var(--pf-action)", color: "#ffffff" }}
-              >
-                <Rocket size={12} />
-                {submitting ? "Sending to TAI…" : "OK · Generate in TAI"}
-              </button>
+              {reconcileNotice ? null : duplicatePrompt && !bookingError ? (
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => executeTaiBooking(true)}
+                  data-testid="button-clb-confirm-duplicate"
+                  className="px-4 py-1.5 rounded-lg font-bold inline-flex items-center gap-1.5"
+                  style={{ background: "var(--pf-warning)", color: "#111111" }}
+                >
+                  <Rocket size={12} />
+                  {submitting ? "Sending to TAI…" : "Yes · Generate a 2nd Load"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => executeTaiBooking(false)}
+                  data-testid="button-clb-confirm-ok"
+                  className="px-4 py-1.5 rounded-lg font-bold inline-flex items-center gap-1.5"
+                  style={{ background: "var(--pf-action)", color: "#ffffff" }}
+                >
+                  <Rocket size={12} />
+                  {submitting ? "Sending to TAI…" : bookingError ? "Retry · Generate in TAI" : "OK · Generate in TAI"}
+                </button>
+              )}
             </div>
           </div>
         </div>

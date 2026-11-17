@@ -14,6 +14,7 @@ import {
   handleTaiInvoiceWebhook,
   handleTaiShipmentWebhook,
   previewTaiBooking,
+  taiBookingStatus,
   verifyWebhookSecretIfConfigured,
 } from "./tai-service";
 import type { LoadEntry } from "../shared/load-entry";
@@ -84,17 +85,57 @@ export function registerApiRoutes(app: Express): void {
     res.json({ ok: true, ...result });
   });
 
-  app.post("/api/loads/preview", (req: Request, res: Response) => {
-    const entry = req.body?.entry as LoadEntry;
-    const result = previewTaiBooking(entry);
-    res.json(result);
+  // Shape guard at the route boundary: every nested block the preview/book path
+  // dereferences must be a real object, so malformed input fails here with a 400
+  // instead of throwing after TAI has already created the load.
+  const isRecord = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === "object" && !Array.isArray(v);
+  const readLoadEntry = (body: unknown): LoadEntry | null => {
+    const entry = (body as { entry?: unknown } | undefined)?.entry;
+    if (!isRecord(entry)) return null;
+    if (!Array.isArray(entry.stops) || !entry.stops.every(isRecord)) return null;
+    if (!Array.isArray(entry.items) || !entry.items.every(isRecord)) return null;
+    for (const key of ["customer", "references", "equipment", "pricing", "carrier"]) {
+      if (!isRecord(entry[key])) return null;
+    }
+    // Accessorials are optional, but when present every row must be an object: a
+    // malformed row is rejected rather than silently dropped from the TAI request.
+    if (entry.accessorials !== undefined && (!Array.isArray(entry.accessorials) || !entry.accessorials.every(isRecord))) {
+      return null;
+    }
+    const accessorials = Array.isArray(entry.accessorials) ? entry.accessorials : [];
+    return { ...(entry as unknown as LoadEntry), accessorials: accessorials as unknown as LoadEntry["accessorials"] };
+  };
+
+  app.get("/api/tai/booking/status", (_req: Request, res: Response) => {
+    res.json(taiBookingStatus());
   });
 
-  app.post("/api/loads/book", async (req: Request, res: Response) => {
-    const entry = req.body?.entry as LoadEntry;
-    const duplicateCount = Number(req.body?.duplicateCount) || 1;
-    const result = await bookTaiLoads(entry, duplicateCount);
+  // Step 1 of Generate Load in TAI: validate + build the exact CommitDomesticShipmentRequest
+  // on the server and hand back a previewToken bound to it. No TAI call is made here.
+  app.post("/api/loads/preview", (req: Request, res: Response) => {
+    const entry = readLoadEntry(req.body);
+    if (!entry) {
+      res.status(400).json({ ok: false, message: "A load entry is required." });
+      return;
+    }
+    const result = previewTaiBooking(entry, req.body?.duplicateCount);
     res.status(result.ok ? 200 : 422).json(result);
+  });
+
+  // Step 2: create in TAI. Refuses without a matching previewToken; answers with TAI's own
+  // body on refusal; never saves a load TAI did not confirm with a shipment id.
+  app.post("/api/loads/book", async (req: Request, res: Response) => {
+    const entry = readLoadEntry(req.body);
+    if (!entry) {
+      res.status(400).json({ ok: false, message: "A load entry is required." });
+      return;
+    }
+    const result = await bookTaiLoads(entry, {
+      duplicateCount: req.body?.duplicateCount,
+      previewToken: req.body?.previewToken,
+      confirmDuplicate: req.body?.confirmDuplicate === true,
+    });
+    res.status(result.status).json(result);
   });
 
   app.post("/api/loads/:id/writeback-carrier", async (req: Request, res: Response) => {
