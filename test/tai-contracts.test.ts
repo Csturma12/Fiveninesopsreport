@@ -17,6 +17,7 @@ import {
   verifyTaiWebhookAuth,
 } from "../server/tai-service";
 import { registerApiRoutes } from "../server/routes";
+import { registerAuth } from "../server/auth";
 import { isPendingReadBack } from "../server/tai-writeback-poller";
 import { store } from "../server/store";
 import {
@@ -199,6 +200,9 @@ const WEBHOOK_ENV_KEYS = [
   "TAI_WEBHOOK_SECRET",
   "TAI_WEBHOOK_ALLOW_QUERY_SECRET",
   "TAI_WEBHOOK_SIMULATE_ENABLED",
+  "GOOGLE_CLIENT_ID",
+  "GOOGLE_CLIENT_SECRET",
+  "AUTH_DISABLED",
 ] as const;
 
 function withWebhookEnv<T>(overrides: Partial<Record<(typeof WEBHOOK_ENV_KEYS)[number], string | undefined>>, fn: () => T): T {
@@ -352,6 +356,61 @@ test("HTTP: /api/webhooks/tai/* enforce the secret and /simulate is blocked in p
       const sim = await post("/api/webhooks/tai/simulate", {}, { kind: "invoice" });
       assert.equal(sim.status, 200);
     });
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("HTTP + staff auth: unsigned /simulate is 401 under OAuth enforcement even with TAI_WEBHOOK_SIMULATE_ENABLED=true", async () => {
+  // Mirrors server/index.ts: registerAuth runs before registerApiRoutes, so /simulate must hit the
+  // staff gate. If /simulate were ever added to PUBLIC_PATHS, the unsigned request below would get 200.
+  const app = express();
+  app.use(express.json());
+  registerAuth(app);
+  registerApiRoutes(app);
+  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+    const s = app.listen(0, "127.0.0.1", () => resolve(s));
+  });
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const post = (path: string, headers: Record<string, string>, body: unknown) =>
+    fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body),
+    });
+
+  try {
+    await withWebhookEnv(
+      {
+        NODE_ENV: "production",
+        TAI_WEBHOOK_SECRET: TEST_SECRET,
+        TAI_WEBHOOK_SIMULATE_ENABLED: "true",
+        GOOGLE_CLIENT_ID: "test-client-id.apps.googleusercontent.com",
+        GOOGLE_CLIENT_SECRET: "test-client-secret",
+      },
+      async () => {
+        for (const kind of ["gps", "invoice"]) {
+          const sim = await post("/api/webhooks/tai/simulate", {}, { kind });
+          assert.equal(sim.status, 401, `unsigned /simulate (${kind}) must require staff sign-in`);
+          const json = (await sim.json()) as { authenticated?: boolean };
+          assert.equal(json.authenticated, false);
+        }
+
+        // The TAI webhook secret is not a staff credential: it must not unlock /simulate.
+        const simWithWebhookSecret = await post(
+          "/api/webhooks/tai/simulate",
+          { "x-tai-webhook-secret": TEST_SECRET },
+          { kind: "gps" },
+        );
+        assert.equal(simWithWebhookSecret.status, 401);
+
+        // The real webhook routes stay reachable without a staff session (secret-gated instead).
+        const shipmentBody = { shipmentId: "132738007", status: "Delivered", locationString: "Lithonia, GA 30058" };
+        assert.equal((await post("/api/webhooks/tai/shipment", {}, shipmentBody)).status, 401);
+        const signed = await post("/api/webhooks/tai/shipment", { "x-tai-webhook-secret": TEST_SECRET }, shipmentBody);
+        assert.equal(signed.status, 200);
+      },
+    );
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
