@@ -77,6 +77,15 @@ export function validatePodUpload(
   if (id === null) {
     return { ok: false, result: failure("invalid", "A numeric TAI shipment ID is required to upload a POD.") };
   }
+  if (input.bytes === undefined && input.fileName === undefined) {
+    return {
+      ok: false,
+      result: failure(
+        "invalid",
+        "No POD file received. Send the PDF/JPEG bytes with ?fileName= or a JSON body { fileName, mimeType, base64 }.",
+      ),
+    };
+  }
   const fileName = typeof input.fileName === "string" ? input.fileName.trim() : "";
   if (!fileName || fileName.length > 255 || /[\\/\x00-\x1f\x7f<>:"|?*]/.test(fileName)) {
     return {

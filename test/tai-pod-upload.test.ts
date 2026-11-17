@@ -223,6 +223,7 @@ test("POST /api/loads/:id/pod never sets a verified status on missing id, sandbo
   // Legacy bodyless POST (what the old fake route accepted) is now a loud 400.
   const bodyless = await realFetch(`${url}/api/loads/132647845/pod`, { method: "POST" });
   assert.equal(bodyless.status, 400);
+  assert.match(((await bodyless.json()) as { message: string }).message, /No POD file received/);
 
   // Mocked TAI rejection through the route layer.
   const rejectedApp = express();
