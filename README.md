@@ -42,9 +42,9 @@ You can run `fivenines-ops` live alongside `primary-freight-dashboard` against t
 
 Every staff API on `primary-freight-dashboard` (~320 endpoints: shipments, quotes, carriers, customers, lanes, containers, GPA / Port Houston, DAT, freight rates, billing, projects, dispatch board, assistant, Gmail/Outlook toolkits, …) is available here at `/api/pfd/<path>`, forwarded to the dashboard's `/api/<path>`. Example: `GET /api/pfd/shipments/active` → dashboard `GET /api/shipments/active`.
 
-The dashboard serves them from its own SQLite volume, so data is always live and new dashboard endpoints work here without a port. `GET /api/pfd/_endpoints` lists the forwarded prefixes and `GET /api/pfd/_status` checks config and upstream health. Session sign-in (`/api/auth`), the customer portal (`/api/portal`) and machine webhooks (`/api/webhooks`) are not forwarded.
+The dashboard serves them from its own SQLite volume, so data is always live. New endpoints under an existing prefix work here without changes; a new top-level prefix must be added to `shared/pfd-endpoints.ts`. `GET /api/pfd/_endpoints` lists the forwarded prefixes and `GET /api/pfd/_status` checks config and upstream health. Session sign-in (`/api/auth`), the customer portal (`/api/portal`) and machine webhooks (`/api/webhooks`) are not forwarded.
 
-Fly secrets (one shared token, set on both apps; this restarts both):
+Callers must be signed in to `fivenines-ops` as staff; the shared token alone authorizes nothing from a browser. Keep it server-side, as a Fly secret only. Set it on both apps (this restarts both):
 ```bash
 TOKEN=$(openssl rand -hex 32)
 flyctl secrets set -a fivenines-ops \

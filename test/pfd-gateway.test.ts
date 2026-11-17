@@ -42,6 +42,7 @@ async function withHarness(
           if (req.url === "/healthz") return res.end("ok");
           res.setHeader("content-type", "application/json");
           res.setHeader("set-cookie", "pfih.sid=leak");
+          res.setHeader("cache-control", "public, max-age=600");
           res.end(JSON.stringify({ upstream: true, url: req.url }));
         });
       }),
@@ -74,6 +75,12 @@ test("config requires base URL and a long token, and https off the private netwo
   assert.equal(short.ok, false);
   const plain = readPfdGatewayConfig({ PFD_BASE_URL: "http://example.com", PFD_GATEWAY_TOKEN: TOKEN });
   assert.equal(plain.ok, false);
+  for (const bad of ["Infinity", "NaN", "-5", "abc"]) {
+    const cfg = readPfdGatewayConfig({ PFD_BASE_URL: "https://x.fly.dev", PFD_GATEWAY_TOKEN: TOKEN, PFD_GATEWAY_TIMEOUT_MS: bad });
+    assert.ok(cfg.ok && cfg.config.timeoutMs === 60_000, bad);
+  }
+  const huge = readPfdGatewayConfig({ PFD_BASE_URL: "https://x.fly.dev", PFD_GATEWAY_TOKEN: TOKEN, PFD_GATEWAY_TIMEOUT_MS: "1e12" });
+  assert.ok(huge.ok && huge.config.timeoutMs === 2_147_483_647);
   const internal = readPfdGatewayConfig({ PFD_BASE_URL: "http://primary-freight-dashboard.internal:5000/", PFD_GATEWAY_TOKEN: TOKEN });
   assert.ok(internal.ok && internal.config.baseUrl === "http://primary-freight-dashboard.internal:5000");
 });
@@ -109,6 +116,7 @@ test("forwards GET with query, token and acting user, but never browser credenti
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), { upstream: true, url: "/api/shipments/active?limit=5&q=a%20b" });
     assert.equal(res.headers.get("set-cookie"), null);
+    assert.equal(res.headers.get("cache-control"), "no-store");
     const [call] = seen;
     assert.equal(call.headers[PFD_TOKEN_HEADER], TOKEN);
     assert.equal(call.headers[PFD_ACTING_USER_HEADER], "chriss@primarycompanies.com");

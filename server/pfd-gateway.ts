@@ -25,11 +25,10 @@ export const MIN_GATEWAY_TOKEN_LENGTH = 32;
 
 /** Request headers copied to the dashboard. Everything else is dropped. */
 const FORWARDED_REQUEST_HEADERS = ["accept", "accept-language", "content-type", "if-none-match", "last-event-id"];
-/** Response headers copied back to the browser. */
+/** Response headers copied back to the browser. Cache-Control is not copied: staff data stays no-store. */
 const FORWARDED_RESPONSE_HEADERS = [
   "content-type",
   "content-disposition",
-  "cache-control",
   "etag",
   "last-modified",
   "x-shipments-version",
@@ -72,7 +71,11 @@ export function readPfdGatewayConfig(env: NodeJS.ProcessEnv = process.env): PfdG
     problems.push(`PFD_GATEWAY_TOKEN must be at least ${MIN_GATEWAY_TOKEN_LENGTH} characters`);
   }
   if (missing.length || problems.length) return { ok: false, missing, problems };
-  const timeoutMs = Number(env.PFD_GATEWAY_TIMEOUT_MS) > 0 ? Number(env.PFD_GATEWAY_TIMEOUT_MS) : 60_000;
+  const configuredTimeoutMs = Number(env.PFD_GATEWAY_TIMEOUT_MS);
+  const timeoutMs =
+    Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+      ? Math.min(configuredTimeoutMs, 2_147_483_647)
+      : 60_000;
   return { ok: true, config: { baseUrl, token, timeoutMs } };
 }
 
@@ -125,6 +128,7 @@ export function registerPfdGateway(app: Express, options: RegisterPfdGatewayOpti
       const upstream = await doFetch(`${result.config.baseUrl}/healthz`, {
         signal: AbortSignal.timeout(Math.min(result.config.timeoutMs, 10_000)),
       });
+      await upstream.body?.cancel().catch(() => {});
       res.json({ ok: upstream.ok, configured: true, upstreamStatus: upstream.status, prefixes: PFD_API_PREFIXES.length });
     } catch (error) {
       res.status(502).json({ ok: false, configured: true, message: `Dashboard unreachable: ${(error as Error).message}` });
