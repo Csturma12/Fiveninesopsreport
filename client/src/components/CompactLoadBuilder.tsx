@@ -134,6 +134,8 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   // no ordinary retry is offered until the operator has checked TAI.
   const [reconcileNotice, setReconcileNotice] = useState<{
     message: string;
+    /** Customer as it was when the uncertain request was sent (the form may be edited afterwards). */
+    customer: string;
     createdIds: string[];
     /** Exact references of the order whose TAI outcome is unknown. */
     pending: { customerPO: string; bolNumber: string }[];
@@ -472,6 +474,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
         setDuplicatePrompt(null);
         setReconcileNotice({
           message: firstMessage(data, "TAI accepted the request but returned no Shipment ID."),
+          customer: entry.customer.name,
           createdIds: Array.isArray(data.createdIds) ? data.createdIds.map(String) : [],
           pending: [
             {
@@ -504,6 +507,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       const basePo = entry.references.customerPO;
       setReconcileNotice({
         message: `The Generate request was sent but its answer never arrived (${err instanceof Error ? err.message : String(err)}).`,
+        customer: entry.customer.name,
         createdIds: [],
         pending:
           duplicateCount > 1 && basePo
@@ -1852,7 +1856,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                 <div data-testid="text-clb-reconcile-pending">
                   {reconcileNotice.createdIds.length > 0 ? "The remaining order was not saved here." : "Nothing was saved here."} Check TAI for{" "}
                   <span className="font-mono">
-                    {entry.customer.name || "this customer"}
+                    {reconcileNotice.customer || "the unlinked spot customer"}
                     {reconcileNotice.pending.map((p, i) => (
                       <span key={i}>
                         {p.customerPO ? ` · PO ${p.customerPO}` : ""}

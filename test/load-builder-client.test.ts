@@ -143,10 +143,12 @@ function harness(initial: LoadEntry, compact = false) {
   const booked: Array<{ ids: string[]; msg: string }> = [];
   const toasts: string[] = [];
   let latestEntry = initial;
+  let setEntryFromTest: React.Dispatch<React.SetStateAction<LoadEntry>> = () => {};
 
   const Host: React.FC = () => {
     const [entry, setEntry] = React.useState(initial);
     latestEntry = entry;
+    setEntryFromTest = setEntry;
     return React.createElement(CompactLoadBuilder, {
       compact,
       entry,
@@ -166,6 +168,9 @@ function harness(initial: LoadEntry, compact = false) {
     toasts,
     get entry() {
       return latestEntry;
+    },
+    setEntry(update: React.SetStateAction<LoadEntry>) {
+      setEntryFromTest(update);
     },
     async render() {
       await act(async () => root.render(React.createElement(Host)));
@@ -329,10 +334,15 @@ test("an uncertain outcome (TAI accepted without an id, or the create answer was
     await h.click("button-clb-confirm-cancel");
     assert.equal(h.has("dialog-clb-confirm"), false);
 
-    // Closing does not clear the guard: reopening shows the same notice and still no OK.
+    // Closing does not clear the guard: reopening shows the same notice and still no OK,
+    // and the notice names the customer the uncertain request was sent for even if the
+    // form was edited in between.
     assert.match(h.find("button-clb-generate").textContent ?? "", /Check TAI · Outcome Unknown/);
+    await act(async () => h.setEntry((prev) => ({ ...prev, customer: { ...prev.customer, name: "Someone Else Inc" } })));
     await h.click("button-clb-generate");
-    h.find("panel-clb-reconcile");
+    const reopened = h.find("panel-clb-reconcile").textContent ?? "";
+    assert.match(reopened, /Larkin Refractory · PO 42705/);
+    assert.doesNotMatch(reopened, /Someone Else Inc/);
     assert.equal(h.has("button-clb-confirm-ok"), false, "still no retry after close + reopen");
     assert.equal(fetchCalls.length, 2, "reopening sends nothing");
 
