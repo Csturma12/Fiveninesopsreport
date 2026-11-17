@@ -392,6 +392,49 @@ test("duplicate guard checks the suffixed per-order references a Qty > 1 batch w
   assert.equal(single.ok, true);
 });
 
+test("concurrent bookings for the same customer are serialized: the second sees the first's TAI id and asks for confirmation", async () => {
+  enableFakeLiveWrites();
+  const entry = sampleEntry();
+  entry.customer.name = "Race Customer";
+  entry.references.customerPO = "PO-RACE";
+  entry.references.bolNumber = "";
+  const token = previewTaiBooking(entry).previewToken!;
+
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let posts = 0;
+  const slowTai = (async () => {
+    posts += 1;
+    await gate;
+    return new Response('{"shipmentId":132799030}', { status: 200 });
+  }) as typeof fetch;
+
+  const first = bookTaiLoads(entry, { previewToken: token }, { fetchImpl: slowTai });
+  const second = bookTaiLoads(entry, { previewToken: token }, { fetchImpl: slowTai });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(posts, 1, "the second booking waits on the first instead of racing past the duplicate check");
+
+  release();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.ok, true);
+  assert.deepEqual(a.createdIds, ["132799030"]);
+  assert.equal(b.ok, false);
+  assert.equal(b.status, 409);
+  assert.equal(b.requiresDuplicateConfirmation, true);
+  assert.equal(b.duplicateOf, "132799030");
+  assert.equal(posts, 1, "TAI received exactly one shipment");
+
+  // A different customer is not blocked by the lock.
+  const other = sampleEntry();
+  other.customer.name = "Other Customer";
+  other.references.customerPO = "PO-OTHER";
+  const otherToken = previewTaiBooking(other).previewToken!;
+  const result = await bookTaiLoads(other, { previewToken: otherToken }, { fetchImpl: fakeTai(200, '{"id":132799031}').fetchImpl });
+  assert.equal(result.ok, true);
+});
+
 test("taiRefusalMessage surfaces TAI's own reason from the usual .NET shapes", () => {
   assert.equal(taiRefusalMessage(400, { errors: { "stops[0].zipCode": ["required"] } }, ""), "TAI answered 400: stops[0].zipCode: required");
   assert.equal(taiRefusalMessage(401, null, "<html><body>Unauthorized</body></html>"), "TAI answered 401: Unauthorized");

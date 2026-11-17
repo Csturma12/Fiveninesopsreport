@@ -220,6 +220,32 @@ export async function bookTaiLoads(
   options: BookTaiLoadsOptions = {},
   dependencies: BookTaiLoadsDependencies = {},
 ): Promise<TaiBookResult> {
+  // Two bookings for the same customer must not both pass the duplicate check
+  // before either has recorded its TAI id, so the whole check -> POST -> record
+  // sequence runs under a per-customer lock. The store is in-process (one Fly
+  // machine), so an in-process lock is the coordination point.
+  const key = `customer:${String(entry?.customer?.name ?? "").trim().replace(/\s+/g, " ").toLowerCase()}`;
+  return withBookingLock(key, () => bookTaiLoadsUnlocked(entry, options, dependencies));
+}
+
+const bookingLocks = new Map<string, Promise<unknown>>();
+
+async function withBookingLock<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const previous = bookingLocks.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(run);
+  bookingLocks.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (bookingLocks.get(key) === current) bookingLocks.delete(key);
+  }
+}
+
+async function bookTaiLoadsUnlocked(
+  entry: LoadEntry,
+  options: BookTaiLoadsOptions,
+  dependencies: BookTaiLoadsDependencies,
+): Promise<TaiBookResult> {
   const fetchImpl = dependencies.fetchImpl ?? fetch;
   const preview = previewTaiBooking(entry);
   const requestTemplate = preview.request;
