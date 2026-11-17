@@ -48,3 +48,10 @@ npm run dev
 - **Dashboard + Docked 410px Gmail Panel**: `http://127.0.0.1:5090`
 - **Standalone Gmail Side-Panel Route**: `http://127.0.0.1:5090/gmail-panel`
 - **Chrome MV3 Extension**: Update `gmail-extension/sidepanel.html` + `manifest.json` host to `https://fivenines-ops.fly.dev` when deployed, and load unpacked in `chrome://extensions`.
+
+### Generate Load in TAI (Compact Builder & `/gmail-panel`)
+One click, always behind the **Generate this load in TAI?** confirm (customer, lane, customer rate):
+1. `POST /api/loads/preview` validates the entry, builds the exact `CommitDomesticShipmentRequest` and returns a `previewToken` bound to it (no TAI call).
+2. `POST /api/loads/book` with that `previewToken` creates the shipment in TAI. It refuses when the token is missing/stale (`409 requiresPreview`), asks before booking the same customer + PO/BOL twice (`409 requiresDuplicateConfirmation` → resend with `confirmDuplicate: true`), refuses when live writes are off (`503`), returns TAI's own body on refusal (`502`), and answers `409 requiresReconciliation` when TAI accepts without a shipment id.
+
+TAI is the source of record: nothing is saved locally or to Supabase unless TAI confirmed a shipment id, and there is no sandbox-minted id. Locally (no `ALLOW_LIVE_TAI_WRITES="true"` + TAI key) the button validates, previews and then refuses loudly with "Live TAI writes are switched off". The TAI key never leaves the server; the Gmail extension only iframes `/gmail-panel`.
