@@ -174,7 +174,7 @@ export function registerAuth(app: Express): void {
       client_id: clientId,
       redirect_uri: redirectUri,
       response_type: "code",
-      scope: "openid email profile https://www.googleapis.com/auth/gmail.readonly",
+      scope: "openid email profile",
       include_granted_scopes: "true",
       prompt: "select_account",
       state: returnTo,
