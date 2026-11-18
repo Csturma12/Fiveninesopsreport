@@ -50,16 +50,16 @@ function buildFormattedQuote(q: QuoteDraftState) {
     .join("\n");
 
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const html = `<div style="font-family:system-ui,-apple-system,sans-serif;font-size:13px;color:#111827;max-width:620px;border:1px solid #cbd5e1;border-radius:8px;overflow:hidden">
-    <div style="height:4px;background:linear-gradient(90deg,#1D2C5E,#682C87,#D52A3B,#F0641E,#F5B841)"></div>
+  const html = `<div style="font-family:system-ui,-apple-system,sans-serif;font-size:13px;color:#12345a;max-width:620px;border:1px solid #dce5ee;border-radius:8px;overflow:hidden">
+    <div style="height:4px;background:linear-gradient(90deg,#12345a 0%,#1768b2 48%,#21b975 82%,#66d9a2 100%)"></div>
     <div style="padding:14px 16px">
-      <div style="font-weight:700;font-size:15px;color:#1D2C5E">Freight Rate Quote · ${esc(q.customerName || "Customer")}</div>
-      <div style="margin-top:4px;color:#475569"><strong>Lane:</strong> ${esc(q.origin)} &rarr; ${esc(q.destination)}${q.estMiles > 0 ? ` (${q.estMiles.toLocaleString()} mi)` : ""} &nbsp;|&nbsp; <strong>Equipment:</strong> ${esc(q.equipmentType)}</div>
+      <div style="font-weight:700;font-size:15px;color:#12345a">Freight Rate Quote · ${esc(q.customerName || "Customer")}</div>
+      <div style="margin-top:4px;color:#54687e"><strong>Lane:</strong> ${esc(q.origin)} &rarr; ${esc(q.destination)}${q.estMiles > 0 ? ` (${q.estMiles.toLocaleString()} mi)` : ""} &nbsp;|&nbsp; <strong>Equipment:</strong> ${esc(q.equipmentType)}</div>
       <table style="width:100%;border-collapse:collapse;margin-top:10px;font-size:12px">
-        <tr><td style="padding:6px;border-bottom:1px solid #e2e8f0">Linehaul</td><td style="padding:6px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:600">$${(Number(q.linehaulRate) || 0).toLocaleString()}</td></tr>
-        ${q.fuelSurcharge > 0 ? `<tr><td style="padding:6px;border-bottom:1px solid #e2e8f0">Fuel Surcharge</td><td style="padding:6px;border-bottom:1px solid #e2e8f0;text-align:right">$${Number(q.fuelSurcharge).toLocaleString()}</td></tr>` : ""}
-        ${q.accessorials.filter((a) => a.name.trim()).map((a) => `<tr><td style="padding:6px;border-bottom:1px solid #e2e8f0">${esc(a.name)}</td><td style="padding:6px;border-bottom:1px solid #e2e8f0;text-align:right">$${(Number(a.amount) || 0).toLocaleString()}</td></tr>`).join("")}
-        <tr style="background:#f8fafc"><td style="padding:8px 6px;font-weight:700">Total All-In Rate</td><td style="padding:8px 6px;text-align:right;font-weight:700;color:#16a34a;font-size:14px">$${allInTotal.toLocaleString()}</td></tr>
+        <tr><td style="padding:6px;border-bottom:1px solid #dce5ee">Linehaul</td><td style="padding:6px;border-bottom:1px solid #dce5ee;text-align:right;font-weight:600">$${(Number(q.linehaulRate) || 0).toLocaleString()}</td></tr>
+        ${q.fuelSurcharge > 0 ? `<tr><td style="padding:6px;border-bottom:1px solid #dce5ee">Fuel Surcharge</td><td style="padding:6px;border-bottom:1px solid #dce5ee;text-align:right">$${Number(q.fuelSurcharge).toLocaleString()}</td></tr>` : ""}
+        ${q.accessorials.filter((a) => a.name.trim()).map((a) => `<tr><td style="padding:6px;border-bottom:1px solid #dce5ee">${esc(a.name)}</td><td style="padding:6px;border-bottom:1px solid #dce5ee;text-align:right">$${(Number(a.amount) || 0).toLocaleString()}</td></tr>`).join("")}
+        <tr style="background:#f7f9fc"><td style="padding:8px 6px;font-weight:700">Total All-In Rate</td><td style="padding:8px 6px;text-align:right;font-weight:700;color:#21b975;font-size:14px">$${allInTotal.toLocaleString()}</td></tr>
       </table>
       ${q.equipmentNotes ? `<div style="margin-top:10px;font-size:12px;color:#334155"><strong>Notes &amp; Terms:</strong> ${esc(q.equipmentNotes)}</div>` : ""}
       ${q.validUntil ? `<div style="margin-top:4px;font-size:11px;color:#64748b">Valid through ${esc(q.validUntil)} · ${esc(q.transitNote)}</div>` : ""}

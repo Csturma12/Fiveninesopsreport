@@ -1,6 +1,8 @@
 import React, { useMemo, useState } from "react";
-import type { CrmLeadItem, CrmLeadSource, CrmLeadStage } from "@shared/tai-webhook-schema";
+import type { CrmLeadItem, CrmLeadSource, CrmLeadStage, CustomerOption, OpsShipment } from "@shared/tai-webhook-schema";
+import { buildExistingCustomerSet, isKnownExistingCustomer } from "./panel/panelTypes";
 import {
+  AlertTriangle,
   Download,
   Edit3,
   ExternalLink,
@@ -14,6 +16,8 @@ import {
 
 interface SalesOpsCrmViewProps {
   leads: CrmLeadItem[];
+  customers?: CustomerOption[];
+  shipments?: OpsShipment[];
   crmWebhookUrl: string;
   onAddLead: (payload: Partial<CrmLeadItem>) => Promise<void>;
   onBulkImportLeads: (leads: Array<Partial<CrmLeadItem>>) => Promise<void>;
@@ -100,6 +104,8 @@ function parseSimpleCsv(raw: string): Array<Partial<CrmLeadItem>> {
 
 export const SalesOpsCrmView: React.FC<SalesOpsCrmViewProps> = ({
   leads,
+  customers = [],
+  shipments = [],
   crmWebhookUrl,
   onAddLead,
   onBulkImportLeads,
@@ -128,6 +134,22 @@ export const SalesOpsCrmView: React.FC<SalesOpsCrmViewProps> = ({
     estimatedLanes: "",
   });
 
+  const existingCustomerKeys = useMemo(
+    () => buildExistingCustomerSet(customers, shipments),
+    [customers, shipments],
+  );
+
+  // Strictly net-new prospects ONLY — strip any existing active TAI / shipment customer
+  const netNewLeads = useMemo(
+    () => leads.filter((l) => !isKnownExistingCustomer(l.company, existingCustomerKeys)),
+    [leads, existingCustomerKeys],
+  );
+
+  const typedCompanyIsExisting = useMemo(
+    () => isKnownExistingCustomer(newLead.company, existingCustomerKeys),
+    [newLead.company, existingCustomerKeys],
+  );
+
   const externalCrmUrl = useMemo(() => {
     try {
       return new URL(crmWebhookUrl).origin;
@@ -137,26 +159,26 @@ export const SalesOpsCrmView: React.FC<SalesOpsCrmViewProps> = ({
   }, [crmWebhookUrl]);
 
   const counts = useMemo(() => {
-    const out: Record<string, number> = { All: leads.length };
+    const out: Record<string, number> = { All: netNewLeads.length };
     for (const st of STAGES) out[st] = 0;
-    for (const l of leads) out[l.status] = (out[l.status] || 0) + 1;
+    for (const l of netNewLeads) out[l.status] = (out[l.status] || 0) + 1;
     return out;
-  }, [leads]);
+  }, [netNewLeads]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return leads.filter((l) => {
+    return netNewLeads.filter((l) => {
       if (stageFilter !== "All" && l.status !== stageFilter) return false;
       if (!q) return true;
       return `${l.company} ${l.contact} ${l.email} ${l.location} ${l.evidence} ${l.estimatedLanes || ""}`
         .toLowerCase()
         .includes(q);
     });
-  }, [leads, stageFilter, search]);
+  }, [netNewLeads, stageFilter, search]);
 
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newLead.company.trim()) return;
+    if (!newLead.company.trim() || typedCompanyIsExisting) return;
     await onAddLead(newLead);
     setNewLead({
       company: "",
@@ -236,8 +258,21 @@ export const SalesOpsCrmView: React.FC<SalesOpsCrmViewProps> = ({
           style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-action)" }}
         >
           <div className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--pf-text-muted)" }}>
-            Add SalesOps Lead
+            Add Net-New SalesOps Prospect (Existing TAI Customers Automatically Excluded)
           </div>
+          {typedCompanyIsExisting && (
+            <div
+              role="alert"
+              className="p-2.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 w-full"
+              style={{
+                background: "var(--pf-warning-dim)",
+                color: "var(--pf-warning)",
+                border: "1px solid var(--pf-warning)",
+              }}
+            >
+              <AlertTriangle size={14} /> &ldquo;{newLead.company.trim()}&rdquo; is already an active TAI customer — SalesOps CRM only accepts net-new prospects.
+            </div>
+          )}
           <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
             <input
               required
@@ -313,7 +348,8 @@ export const SalesOpsCrmView: React.FC<SalesOpsCrmViewProps> = ({
             </button>
             <button
               type="submit"
-              className="px-4 py-1.5 rounded-lg text-xs font-bold"
+              disabled={typedCompanyIsExisting}
+              className="px-4 py-1.5 rounded-lg text-xs font-bold disabled:opacity-45"
               style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
             >
               Save Lead to CRM
@@ -350,7 +386,9 @@ export const SalesOpsCrmView: React.FC<SalesOpsCrmViewProps> = ({
             <button
               type="button"
               onClick={async () => {
-                const parsed = parseSimpleCsv(csvText);
+                const parsed = parseSimpleCsv(csvText).filter(
+                  (r) => !isKnownExistingCustomer(r.company, existingCustomerKeys),
+                );
                 if (parsed.length === 0) return;
                 await onBulkImportLeads(parsed);
                 setCsvText("");

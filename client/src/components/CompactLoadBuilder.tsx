@@ -1714,7 +1714,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
             </div>
             <div
               className="text-base font-bold mt-0.5"
-              style={{ color: totals.totalMargin >= 0 ? "#38c976" : "var(--pf-danger)" }}
+              style={{ color: totals.totalMargin >= 0 ? "var(--pf-primary)" : "var(--pf-danger)" }}
             >
               {totals.totalMargin >= 0 ? "" : "-"}${Math.abs(Math.round(totals.totalMargin)).toLocaleString()}
             </div>
@@ -1750,7 +1750,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
             className="flex-1 max-w-[280px] py-2 px-3 rounded-xl text-xs font-bold inline-flex items-center justify-center gap-1.5 transition-opacity"
             style={
               compact
-                ? { background: "#38c976", color: "#07130c" }
+                ? { background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }
                 : { background: "var(--pf-action)", color: "#ffffff" }
             }
           >
@@ -1834,7 +1834,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       {showJsonPreview && (
         <pre
           className="p-3 rounded-lg text-[11px] font-mono overflow-x-auto max-h-56 pf-scroll"
-          style={{ background: "#0b0e12", color: "#8ce6b8", border: "1px solid var(--pf-border)" }}
+          style={{ background: "var(--pf-bg)", color: "var(--pf-primary-bright, #66d9a2)", border: "1px solid var(--pf-border)" }}
         >
           {JSON.stringify(taiRequestPreview, null, 2)}
         </pre>
@@ -1897,7 +1897,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span style={{ color: "var(--pf-text-muted)" }}>Preview Lock Token:</span>
-                <span style={{ color: previewCtx?.previewToken ? "#38c976" : "var(--pf-text-subtle)" }}>
+                <span style={{ color: previewCtx?.previewToken ? "var(--pf-primary)" : "var(--pf-text-subtle)" }}>
                   {previewLoading
                     ? "Computing SHA-256…"
                     : previewCtx?.previewToken
@@ -2029,7 +2029,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                   <strong style={{ color: "var(--pf-text-muted)" }}>Buy:</strong>{" "}
                   <strong>${totals.totalBuy.toLocaleString()}</strong>
                 </span>
-                <span style={{ color: totals.totalMargin >= 0 ? "#38c976" : "var(--pf-danger)" }}>
+                <span style={{ color: totals.totalMargin >= 0 ? "var(--pf-primary)" : "var(--pf-danger)" }}>
                   <strong>Margin: ${totals.totalMargin.toLocaleString()}</strong>
                 </span>
               </div>
@@ -2066,7 +2066,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                   disabled={submitting || previewLoading}
                   onClick={() => void executeTaiBooking(false)}
                   className="px-4 py-1.5 rounded-xl font-bold inline-flex items-center gap-1.5"
-                  style={{ background: "#38c976", color: "#07130c" }}
+                  style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
                 >
                   <Rocket size={12} />
                   {submitting ? "Sending to TAI…" : "OK · Generate in TAI"}

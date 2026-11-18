@@ -22,6 +22,7 @@ import {
   type CapturedGmailThread,
 } from "./panel/extensionBridge";
 import { HomeLauncherView } from "./panel/HomeLauncherView";
+import { InboxStreamView } from "./panel/InboxStreamView";
 import { LoadBuilderPanelView } from "./panel/LoadBuilderPanelView";
 import { fetchPanelSession, panelFetchJson, type PanelApiContext } from "./panel/panelApi";
 import {
@@ -31,6 +32,7 @@ import {
   parsePanelViewParam,
   syncPanelUrlView,
   type ApTaskRecord,
+  type LiveOpsShipment,
   type PanelKnowledgeRule,
   type PanelSavedDraft,
   type PanelSessionInfo,
@@ -62,7 +64,7 @@ export interface GmailToolkitPanelProps {
   onToast: (msg: string, kind?: "ok" | "error") => void;
   onExtractTender: () => void;
   chatHistory: Array<{ role: "user" | "assistant"; text: string }>;
-  onAskAi: (q: string) => Promise<void>;
+  onAskAi: (q: string, activeEmail?: { subject?: string; from?: string; body?: string } | null) => Promise<void>;
   onDeleteEmail?: (id: string) => Promise<void>;
   onSaveToCrm?: (email: CrucialEmailItem) => Promise<void>;
   /** Opens the host's file picker; the POD is streamed through the server to TAI (key stays server-side). */
@@ -118,7 +120,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
   onRefresh,
   onOpenDashboardLoad,
 }) => {
-  const [view, setView] = useState<PanelViewId>(() => parsePanelViewParam() || "home");
+  const [view, setView] = useState<PanelViewId>(() => parsePanelViewParam() || (fullScreen ? "home" : "inbox"));
   const [universalQuery, setUniversalQuery] = useState<string>("");
   const [expandedLoadId, setExpandedLoadId] = useState<string | null>(shipments[0]?.id ?? null);
   const [bolTargetId, setBolTargetId] = useState<string | null>(null);
@@ -313,10 +315,19 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
     navigateView("build-load");
   }, [apiCtx, navigateView, notify, onBuilderChange]);
 
-  // Compute live Attention count across all 4 alert sections + AP load checks
+  // Compute live Attention count across all 4 alert sections + AP load checks (excluding Cancelled & covered loads)
   const attentionCount = useMemo(() => {
-    const uncovered = shipments.filter((s) => s.stage === "Needs truck" || !s.carrier.trim()).length;
-    const mismatches = shipments.filter((s) => Boolean(s.mismatchNote) || !s.po.trim()).length;
+    const uncovered = shipments.filter((raw) => {
+      const s = raw as LiveOpsShipment;
+      const isCancelled = s.stage === "Cancelled" || /cancel/i.test(String(s.rawStatus || ""));
+      if (isCancelled || s.stage === "Delivered") return false;
+      return !s.carrier.trim();
+    }).length;
+    const mismatches = shipments.filter((raw) => {
+      const s = raw as LiveOpsShipment;
+      if (s.stage === "Cancelled") return false;
+      return Boolean(s.mismatchNote) || !s.po.trim();
+    }).length;
     const missingPods = shipments.filter((s) => s.stage === "Delivered" && s.podCount === 0).length;
     const containerAlerts = shipments.filter((s) => Boolean(s.operationalNote)).length;
     const unappliedEmails = crucialEmails.filter((e) => !e.applied).length;
@@ -335,6 +346,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
       className="tk-panel h-full w-full flex flex-col overflow-hidden"
     >
       <PanelTopBar
+        fullScreen={fullScreen}
         view={view}
         onNavigate={navigateView}
         shipments={shipments}
@@ -349,6 +361,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
         session={session}
         fallbackUser={bootstrapUser}
         attentionCount={attentionCount}
+        inboxCount={crucialEmails.length}
         openApCount={openApCount}
         liveThreadSubject={liveThread?.subject || ""}
         onQuickCaptureThread={() => void handleQuickCaptureToBuilder()}
@@ -397,11 +410,28 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
             <HomeLauncherView
               onNavigate={navigateView}
               attentionCount={attentionCount}
+              inboxCount={crucialEmails.length}
               shipments={shipments}
               customers={customers}
               facilities={facilities}
               kpis={kpis}
               taiPortalUrl={taiPortalUrl}
+            />
+          )}
+
+          {view === "inbox" && (
+            <InboxStreamView
+              crucialEmails={crucialEmails}
+              shipments={shipments}
+              onBuilderChange={onBuilderChange}
+              onThreadSelected={setLiveThread}
+              onInspectLoad={handleInspectLoad}
+              onNavigate={navigateView}
+              onRefreshBootstrap={async () => {
+                await onRefresh?.();
+              }}
+              apiCtx={apiCtx}
+              onToast={notify}
             />
           )}
 
@@ -484,6 +514,8 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
           {view === "sales" && (
             <SalesPanelView
               leads={crmLeads}
+              customers={customers}
+              shipments={shipments}
               builderEntry={builderEntry}
               onBuilderChange={onBuilderChange}
               apiCtx={apiCtx}
@@ -575,6 +607,9 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
             <AiAssistantView
               chatHistory={chatHistory}
               onAskAi={onAskAi}
+              liveThread={liveThread}
+              crucialEmails={crucialEmails}
+              onThreadCaptured={setLiveThread}
               onToast={notify}
             />
           )}

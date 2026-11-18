@@ -69,6 +69,220 @@ export interface InsertGmailReplyResult {
   message: string;
 }
 
+export interface ExtensionInboxRow {
+  id?: string;
+  threadId?: string;
+  messageId?: string;
+  from: string;
+  subject: string;
+  snippet?: string;
+  bodyText?: string;
+  receivedAt?: string;
+  unread?: boolean;
+  permalink?: string;
+}
+
+export interface CaptureInboxResult {
+  ok: boolean;
+  items: ExtensionInboxRow[];
+  outsideIframe?: boolean;
+  error?: string;
+}
+
+export interface OpenGmailThreadInput {
+  permalink?: string;
+  threadId?: string;
+  messageId?: string;
+  subject?: string;
+  loadId?: string;
+  query?: string;
+}
+
+const HEX_GMAIL_ID_RE = /^[0-9a-f]{15,18}$/i;
+
+function extractHexGmailId(raw?: string): string | null {
+  if (!raw) return null;
+  const cleaned = raw.trim().replace(/^#?(?:thread-f:|msg-f:|inbox\/|all\/)/i, "");
+  if (HEX_GMAIL_ID_RE.test(cleaned)) return cleaned;
+  const embedded = raw.match(/#(?:inbox|all|label\/[^/]+)\/([0-9a-f]{15,18})\b/i);
+  return embedded ? embedded[1] : null;
+}
+
+/**
+ * Builds a guaranteed-valid https://mail.google.com/mail/u/0/... URL (never "#" or blank).
+ */
+export function buildValidGmailUrl(input: OpenGmailThreadInput): { url: string; query: string } {
+  const hexId =
+    extractHexGmailId(input.threadId) ||
+    extractHexGmailId(input.messageId) ||
+    extractHexGmailId(input.permalink);
+
+  const fallbackQuery =
+    (input.query && input.query.trim()) ||
+    (input.subject && input.subject.trim()) ||
+    (input.loadId && input.loadId !== "NEW" ? input.loadId.trim() : "") ||
+    "Primary Freight";
+
+  if (input.permalink) {
+    const trimmed = input.permalink.trim();
+    if (
+      trimmed.startsWith("https://mail.google.com/") &&
+      !/#(?:inbox|all|search)\/?$/i.test(trimmed) &&
+      trimmed !== "https://mail.google.com/" &&
+      trimmed !== "https://mail.google.com/mail/u/0/" &&
+      trimmed !== "https://mail.google.com/mail/u/0/#"
+    ) {
+      return { url: trimmed, query: fallbackQuery };
+    }
+  }
+
+  if (hexId) {
+    return {
+      url: `https://mail.google.com/mail/u/0/#inbox/${hexId}`,
+      query: fallbackQuery,
+    };
+  }
+
+  return {
+    url: `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(fallbackQuery)}`,
+    query: fallbackQuery,
+  };
+}
+
+/**
+ * Opens an email thread or search directly in Gmail. Inside the MV3 Side Panel iframe, asks
+ * the extension to navigate the active mail.google.com tab via openGmailThread; outside the
+ * iframe (or on timeout), opens the guaranteed-valid Gmail URL in a new browser tab.
+ */
+export async function openEmailInGmail(input: OpenGmailThreadInput, timeoutMs = 1400): Promise<void> {
+  const { url, query } = buildValidGmailUrl(input);
+
+  if (!isInsideExtensionIframe()) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+
+  const requestId = makeRequestId("pf-open");
+  const handledByExtension = await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener("message", onMessage);
+      window.clearTimeout(timer);
+      resolve(ok);
+    };
+
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== window.parent) return;
+      const data = event.data;
+      if (!data || typeof data !== "object") return;
+      if (
+        data.type === "PF_EXT_BRIDGE_RES" &&
+        data.action === "openGmailThread" &&
+        (!data.requestId || data.requestId === requestId)
+      ) {
+        finish(Boolean(data.ok));
+      }
+    };
+
+    const timer = window.setTimeout(() => finish(false), timeoutMs);
+    window.addEventListener("message", onMessage);
+    window.parent.postMessage(
+      {
+        type: "PF_EXT_BRIDGE",
+        action: "openGmailThread",
+        requestId,
+        payload: {
+          url,
+          permalink: url,
+          threadId: input.threadId,
+          query,
+        },
+      },
+      "*",
+    );
+  });
+
+  if (!handledByExtension) {
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
+
+/**
+ * Triggers live Gmail visible inbox capture (tr.zA rows + open thread) through PF_EXT_BRIDGE
+ * captureInbox, which auto-ingests into /api/inbox/ingest and returns captured items.
+ */
+export function captureGmailInbox(timeoutMs = 5000): Promise<CaptureInboxResult> {
+  if (!isInsideExtensionIframe()) {
+    return Promise.resolve({
+      ok: false,
+      items: [],
+      outsideIframe: true,
+      error: "Running outside the Gmail extension side panel — showing server-synced Gmail stream.",
+    });
+  }
+
+  const requestId = makeRequestId("pf-inbox");
+  return new Promise<CaptureInboxResult>((resolve) => {
+    let settled = false;
+    const finish = (res: CaptureInboxResult) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener("message", onMessage);
+      window.clearTimeout(timer);
+      resolve(res);
+    };
+
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== window.parent) return;
+      const data = event.data;
+      if (!data || typeof data !== "object") return;
+      if (
+        data.type === "PF_EXT_BRIDGE_RES" &&
+        data.action === "captureInbox" &&
+        (!data.requestId || data.requestId === requestId)
+      ) {
+        const rawItems: unknown[] = Array.isArray(data.payload)
+          ? (data.payload as unknown[])
+          : Array.isArray((data.payload as { items?: unknown } | undefined)?.items)
+          ? ((data.payload as { items: unknown[] }).items)
+          : [];
+        const items: ExtensionInboxRow[] = rawItems
+          .filter((r: unknown): r is Record<string, unknown> => Boolean(r && typeof r === "object"))
+          .map((r: Record<string, unknown>) => ({
+            id: r.id ? String(r.id) : undefined,
+            threadId: r.threadId ? String(r.threadId) : undefined,
+            messageId: r.messageId ? String(r.messageId) : undefined,
+            from: String(r.from || r.sender || ""),
+            subject: String(r.subject || ""),
+            snippet: r.snippet ? String(r.snippet) : undefined,
+            bodyText: r.bodyText ? String(r.bodyText) : undefined,
+            receivedAt: r.receivedAt ? String(r.receivedAt) : undefined,
+            unread: Boolean(r.unread),
+            permalink: r.permalink ? String(r.permalink) : undefined,
+          }));
+        finish({
+          ok: Boolean(data.ok),
+          items,
+          error: data.error ? String(data.error) : undefined,
+        });
+      }
+    };
+
+    const timer = window.setTimeout(() => {
+      finish({
+        ok: false,
+        items: [],
+        error: "Timed out syncing Gmail inbox tab — ensure mail.google.com is open.",
+      });
+    }, timeoutMs);
+
+    window.addEventListener("message", onMessage);
+    window.parent.postMessage({ type: "PF_EXT_BRIDGE", action: "captureInbox", requestId }, "*");
+  });
+}
+
 export function isInsideExtensionIframe(): boolean {
   try {
     return typeof window !== "undefined" && window.parent !== window;

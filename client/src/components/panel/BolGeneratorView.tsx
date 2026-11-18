@@ -99,8 +99,8 @@ function renderBolPrintableHtml(f: BolFields): string {
     .join("");
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>BOL ${esc(f.bolNumber)}</title>
-  <style>body{font-family:system-ui,-apple-system,sans-serif;padding:28px;color:#0f172a;font-size:12px}
-  .bar{height:4px;background:linear-gradient(90deg,#1D2C5E,#682C87,#D52A3B,#F0641E,#F5B841);margin-bottom:14px}
+  <style>body{font-family:system-ui,-apple-system,sans-serif;padding:28px;color:#12345a;font-size:12px}
+  .bar{height:4px;background:linear-gradient(90deg,#12345a 0%,#1768b2 48%,#21b975 82%,#66d9a2 100%);margin-bottom:14px}
   h1{margin:0;font-size:19px;letter-spacing:.02em}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
   .box{border:1px solid #94a3b8;padding:10px;border-radius:6px}
   table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border:1px solid #94a3b8;padding:8px;text-align:left}

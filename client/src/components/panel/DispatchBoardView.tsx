@@ -1,5 +1,5 @@
 import React, { useRef, useState } from "react";
-import type { CarrierOption, DispatchStage, OpsShipment } from "@shared/tai-webhook-schema";
+import type { CarrierOption, OpsShipment } from "@shared/tai-webhook-schema";
 import { POD_FILE_ACCEPT, podMimeTypeForFile } from "../../lib/pod-file";
 import {
   CheckCircle2,
@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { insertGmailReply } from "./extensionBridge";
 import { panelFetchJson, type PanelApiContext } from "./panelApi";
-import { openPrintableHtmlWindow } from "./panelTypes";
+import { openPrintableHtmlWindow, type LiveOpsShipment } from "./panelTypes";
 
 interface DispatchBoardViewProps {
   shipments: OpsShipment[];
@@ -29,34 +29,43 @@ interface DispatchBoardViewProps {
   isLiveSync?: boolean;
 }
 
-type StageBucket = "All" | "Needs truck" | "Assigned" | "In transit" | "Delivered";
+type StageBucket = "All" | "Needs truck" | "Assigned" | "In transit" | "Delivered" | "Cancelled";
 
-const STAGE_BUCKETS: StageBucket[] = ["All", "Needs truck", "Assigned", "In transit", "Delivered"];
+const STAGE_BUCKETS: StageBucket[] = [
+  "All",
+  "Needs truck",
+  "Assigned",
+  "In transit",
+  "Delivered",
+  "Cancelled",
+];
 
-function mapBucketToStage(bucket: StageBucket): DispatchStage | null {
-  if (bucket === "All") return null;
-  return bucket;
+function isLoadCancelled(s: LiveOpsShipment): boolean {
+  return s.stage === "Cancelled" || /cancel/i.test(String(s.rawStatus || ""));
 }
 
 function shortCityState(loc: string): string {
   return loc.replace(/\s+\d{5}(-\d{4})?$/, "").replace(/,/g, "").trim();
 }
 
-function stagePillPalette(stage: DispatchStage, rawStatus: string): { label: string; bg: string; fg: string } {
-  const raw = rawStatus.toLowerCase();
-  if (raw.includes("picked")) {
-    return { label: "Picked up", bg: "#142d22", fg: "#38c976" };
+function stagePillPalette(stage: LiveOpsShipment["stage"], rawStatus: string, hasCarrier: boolean): { label: string; bg: string; fg: string } {
+  const raw = String(rawStatus || "").toLowerCase();
+  if (stage === "Cancelled" || raw.includes("cancel")) {
+    return { label: "Cancelled", bg: "#33181c", fg: "#f87171" };
   }
-  if (stage === "Needs truck") {
+  if (raw.includes("picked")) {
+    return { label: "Picked up", bg: "#142d22", fg: "#21b975" };
+  }
+  if (stage === "Needs truck" && !hasCarrier) {
     return { label: "Needs truck", bg: "#2c2216", fg: "#d89b3c" };
   }
-  if (stage === "Assigned") {
+  if (stage === "Assigned" || (stage === "Needs truck" && hasCarrier)) {
     return { label: "Assigned", bg: "#18263a", fg: "#6ca0dc" };
   }
   if (stage === "In transit") {
     return { label: "In transit", bg: "#18263a", fg: "#6ca0dc" };
   }
-  return { label: "Delivered", bg: "#142d22", fg: "#38c976" };
+  return { label: "Delivered", bg: "#142d22", fg: "#21b975" };
 }
 
 function buildFallbackRateCon(s: OpsShipment): { summaryText: string; printableHtml: string } {
@@ -86,7 +95,7 @@ function buildFallbackRateCon(s: OpsShipment): { summaryText: string; printableH
   <style>body{font-family:system-ui,-apple-system,sans-serif;padding:28px;color:#111827;font-size:13px}
   h1{margin:0 0 4px;font-size:20px}table{width:100%;border-collapse:collapse;margin-top:14px}
   th,td{border:1px solid #cbd5e1;padding:8px;text-align:left}th{background:#f1f5f9;font-size:11px;text-transform:uppercase}
-  .bar{height:4px;background:linear-gradient(90deg,#1D2C5E,#682C87,#D52A3B,#F0641E,#F5B841);margin-bottom:16px}
+  .bar{height:4px;background:linear-gradient(90deg,#12345a 0%,#1768b2 48%,#21b975 82%,#66d9a2 100%);margin-bottom:16px}
   .box{background:#f8fafc;border:1px solid #cbd5e1;padding:12px;border-radius:8px;margin-top:12px}</style></head>
   <body><div class="bar"></div><h1>Carrier Rate Confirmation · Load #${s.id}</h1>
   <div>Five Nines / Primary Freight · PO: <strong>${s.po || "TBD"}</strong> · BOL: <strong>${s.bol || "TBD"}</strong></div>
@@ -127,12 +136,68 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
 
   const [carrierSel, setCarrierSel] = useState<Record<string, string>>({});
   const [buySel, setBuySel] = useState<Record<string, number>>({});
+  const [sellSel, setSellSel] = useState<Record<string, number>>({});
 
   const localPodInputRef = useRef<HTMLInputElement | null>(null);
   const localPodTargetRef = useRef<string | null>(null);
 
-  const stageTarget = mapBucketToStage(bucket);
-  const visible = shipments.filter((s) => !stageTarget || s.stage === stageTarget);
+  const visible = (shipments as LiveOpsShipment[]).filter((s) => {
+    const cancelled = isLoadCancelled(s);
+    const hasCarrier = Boolean(s.carrier && s.carrier.trim());
+    if (bucket === "Cancelled") return cancelled;
+    if (cancelled) return false;
+    if (bucket === "All") return true;
+    if (bucket === "Needs truck") return s.stage === "Needs truck" && !hasCarrier;
+    if (bucket === "Assigned") return s.stage === "Assigned" || (s.stage === "Needs truck" && hasCarrier);
+    return s.stage === bucket;
+  });
+
+  const cycleRateconStatus = async (s: LiveOpsShipment) => {
+    const cur = String(s.rateconStatus || "Not Sent").toLowerCase();
+    const next = cur === "not sent" || cur === "drafted" ? "Sent" : cur === "sent" ? "Signed" : "Not Sent";
+    const { ok, data } = await panelFetchJson<{ ok?: boolean; message?: string }>(
+      `/api/loads/${encodeURIComponent(s.id)}/ratecon-status`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ rateconStatus: next }),
+      },
+      apiCtx,
+    );
+    onToast(data.message || `RateCon → ${next} on #${s.id}`, ok && data.ok !== false ? "ok" : "error");
+    await onRefresh();
+  };
+
+  const submitFullShipmentEdit = async (s: LiveOpsShipment) => {
+    setBusyLoadId(s.id);
+    try {
+      const carrier = carrierSel[s.id] ?? s.carrier;
+      const buy = buySel[s.id] ?? s.buy;
+      const sell = sellSel[s.id] ?? s.sell;
+      const po = refPo[s.id] ?? s.po;
+      const bol = refBol[s.id] ?? s.bol;
+      const pro = refPro[s.id] ?? s.pro;
+      const { ok, data } = await panelFetchJson<{ ok?: boolean; message?: string }>(
+        `/api/loads/${encodeURIComponent(s.id)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({
+            carrier,
+            buy,
+            sell,
+            po,
+            bol,
+            pro,
+            pushToTai: true,
+          }),
+        },
+        apiCtx,
+      );
+      onToast(data.message || `Saved Load #${s.id} & synced live to TAI`, ok && data.ok !== false ? "ok" : "error");
+      await onRefresh();
+    } finally {
+      setBusyLoadId(null);
+    }
+  };
 
   const submitCheckCall = async (s: OpsShipment) => {
     setBusyLoadId(s.id);
@@ -334,7 +399,7 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
                 active
                   ? {
                       background: "rgba(56, 201, 118, 0.14)",
-                      color: "#38c976",
+                      color: "#21b975",
                       border: "1px solid rgba(56, 201, 118, 0.55)",
                     }
                   : {
@@ -363,7 +428,7 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
           visible.map((s) => {
             const isExp = expandedId === s.id;
             const busy = busyLoadId === s.id;
-            const pill = stagePillPalette(s.stage, s.rawStatus);
+            const pill = stagePillPalette(s.stage, s.rawStatus, Boolean(s.carrier && s.carrier.trim()));
 
             return (
               <div
@@ -371,7 +436,7 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
                 className="rounded-2xl overflow-hidden transition-colors"
                 style={{
                   background: "#131820",
-                  border: `1px solid ${isExp ? "#38c976" : "#222936"}`,
+                  border: `1px solid ${isExp ? "#21b975" : "#222936"}`,
                 }}
               >
                 <button
@@ -391,13 +456,26 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
 
                     <div className="flex items-center gap-2">
                       <span
+                        className="px-2 py-0.5 rounded-md text-[10px] font-semibold"
+                        style={{
+                          background:
+                            s.rateconStatus === "Sent" || s.rateconStatus === "Signed"
+                              ? "rgba(56,201,118,0.14)"
+                              : "rgba(190,45,75,0.16)",
+                          color:
+                            s.rateconStatus === "Sent" || s.rateconStatus === "Signed" ? "#21b975" : "#f48fb1",
+                        }}
+                      >
+                        RC: {s.rateconStatus || "Not Sent"}
+                      </span>
+                      <span
                         className="px-2.5 py-0.5 rounded-md text-[11px] font-semibold"
                         style={{ background: pill.bg, color: pill.fg }}
                       >
                         {pill.label}
                       </span>
                       <span
-                        className="text-xs font-semibold truncate max-w-[165px]"
+                        className="text-xs font-semibold truncate max-w-[140px]"
                         style={{ color: s.carrier ? "#f3f5f8" : "#d89b3c" }}
                       >
                         {s.carrier || "Needs carrier"}
@@ -424,13 +502,23 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
                           type="button"
                           onClick={() => openDashboardForLoad(s.id)}
                           className="inline-flex items-center gap-1 text-[11px] font-semibold underline shrink-0"
-                          style={{ color: "#38c976" }}
+                          style={{ color: "#21b975" }}
                         >
                           <ExternalLink size={11} /> Open in Dashboard
                         </button>
                       </div>
-                      <div className="font-mono text-[10px]" style={{ color: "#8b95a5" }}>
-                        Sell ${s.sell.toLocaleString()} · Buy ${s.buy.toLocaleString()} · {s.writebackState}
+                      <div className="flex items-center justify-between gap-2 pt-0.5">
+                        <span className="font-mono text-[10px]" style={{ color: "#8b95a5" }}>
+                          Sell ${s.sell.toLocaleString()} · Buy ${s.buy.toLocaleString()} · {s.writebackState}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => void cycleRateconStatus(s)}
+                          className="px-2 py-0.5 rounded text-[10px] font-semibold shrink-0"
+                          style={{ background: "#181f2a", border: "1px solid #262f3d", color: "#21b975" }}
+                        >
+                          RateCon: {s.rateconStatus || "Not Sent"} ↻
+                        </button>
                       </div>
                     </div>
 
@@ -440,7 +528,7 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
                         type="button"
                         onClick={() => void handleInsertRateConReply(s)}
                         className="py-2 px-2.5 rounded-xl text-[11px] font-bold inline-flex items-center justify-center gap-1.5"
-                        style={{ background: "#38c976", color: "#07130c" }}
+                        style={{ background: "#21b975", color: "#07130c" }}
                       >
                         <Reply size={12} /> RateCon → Gmail
                       </button>
@@ -460,7 +548,7 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
                         className="py-2 px-2.5 rounded-xl text-[11px] font-semibold inline-flex items-center justify-center gap-1.5"
                         style={{
                           background: s.podCount > 0 ? "rgba(56,201,118,0.14)" : "#161c26",
-                          color: s.podCount > 0 ? "#38c976" : "#f3f5f8",
+                          color: s.podCount > 0 ? "#21b975" : "#f3f5f8",
                           border: "1px solid #262f3d",
                         }}
                       >
@@ -524,47 +612,57 @@ export const DispatchBoardView: React.FC<DispatchBoardViewProps> = ({
                         disabled={busy}
                         onClick={() => void submitCheckCall(s)}
                         className="w-full py-1.5 rounded-xl text-[11px] font-bold"
-                        style={{ background: "#38c976", color: "#07130c" }}
+                        style={{ background: "#21b975", color: "#07130c" }}
                       >
                         {busy ? "Saving…" : "Log Check Call"}
                       </button>
                     </div>
 
-                    {/* Carrier & Buy Write-Back */}
+                    {/* Carrier, Sell & Buy Live Edit (PATCH /api/loads/:id) */}
                     <div
                       className="p-2.5 rounded-xl space-y-2"
                       style={{ background: "#131820", border: "1px solid #222936" }}
                     >
                       <div className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#8b95a5" }}>
-                        Carrier &amp; Buy Write-Back
+                        Edit Carrier, Sell &amp; Buy (Live TAI Sync)
                       </div>
+                      <select
+                        value={carrierSel[s.id] ?? (s.carrier || "")}
+                        onChange={(e) => setCarrierSel({ ...carrierSel, [s.id]: e.target.value })}
+                        className="pf-input text-[11px]"
+                      >
+                        <option value="">— Unassigned —</option>
+                        {carriers.slice(0, 200).map((c) => (
+                          <option key={`${c.name}-${c.taiMasterId || c.mc}`} value={c.name}>
+                            {c.name} {c.mc ? `(MC ${c.mc})` : ""}
+                          </option>
+                        ))}
+                      </select>
                       <div className="grid grid-cols-12 gap-1.5 items-center">
-                        <select
-                          value={carrierSel[s.id] ?? (s.carrier || carriers[0]?.name || "")}
-                          onChange={(e) => setCarrierSel({ ...carrierSel, [s.id]: e.target.value })}
-                          className="pf-input col-span-7 text-[11px]"
-                        >
-                          {carriers.map((c) => (
-                            <option key={c.name} value={c.name}>
-                              {c.name} (MC {c.mc})
-                            </option>
-                          ))}
-                        </select>
                         <input
                           type="number"
-                          value={buySel[s.id] ?? (s.buy || Math.max(850, s.sell - 400))}
+                          value={sellSel[s.id] ?? s.sell}
+                          onChange={(e) => setSellSel({ ...sellSel, [s.id]: Number(e.target.value) || 0 })}
+                          placeholder="Sell $"
+                          title="Customer Sell ($)"
+                          className="pf-input col-span-4 font-mono font-bold text-[11px]"
+                        />
+                        <input
+                          type="number"
+                          value={buySel[s.id] ?? s.buy}
                           onChange={(e) => setBuySel({ ...buySel, [s.id]: Number(e.target.value) || 0 })}
                           placeholder="Buy $"
-                          className="pf-input col-span-3 font-mono font-bold text-[11px]"
+                          title="Carrier Buy ($)"
+                          className="pf-input col-span-4 font-mono font-bold text-[11px]"
                         />
                         <button
                           type="button"
                           disabled={busy}
-                          onClick={() => void submitCarrierWriteback(s)}
-                          className="col-span-2 py-1.5 rounded-lg text-[10px] font-bold"
-                          style={{ background: "#18263a", color: "#6ca0dc" }}
+                          onClick={() => void submitFullShipmentEdit(s)}
+                          className="col-span-4 py-1.5 rounded-lg text-[10.5px] font-bold"
+                          style={{ background: "#21b975", color: "#07130c" }}
                         >
-                          Sync
+                          Save &amp; Sync
                         </button>
                       </div>
                     </div>

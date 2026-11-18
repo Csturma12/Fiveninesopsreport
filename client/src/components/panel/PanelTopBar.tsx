@@ -1,6 +1,6 @@
 import React, { useMemo, useRef, useState } from "react";
 import type { OpsShipment } from "@shared/tai-webhook-schema";
-import { ChevronLeft, LayoutGrid, RefreshCw, Search, X } from "lucide-react";
+import { Bot, ChevronLeft, Inbox, LayoutGrid, PlusCircle, RefreshCw, Search, X } from "lucide-react";
 import {
   MAX_PANEL_ZOOM,
   MIN_PANEL_ZOOM,
@@ -9,6 +9,7 @@ import {
 } from "./panelTypes";
 
 interface PanelTopBarProps {
+  fullScreen?: boolean;
   view: PanelViewId;
   onNavigate: (view: PanelViewId) => void;
   shipments: OpsShipment[];
@@ -23,12 +24,14 @@ interface PanelTopBarProps {
   session: PanelSessionInfo | null;
   fallbackUser?: { email: string; name: string } | null;
   attentionCount: number;
+  inboxCount?: number;
   openApCount: number;
   liveThreadSubject: string;
   onQuickCaptureThread: () => void;
 }
 
 export const PanelTopBar: React.FC<PanelTopBarProps> = ({
+  fullScreen = false,
   view,
   onNavigate,
   shipments,
@@ -43,6 +46,7 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
   session,
   fallbackUser,
   attentionCount,
+  inboxCount = 0,
   liveThreadSubject,
   onQuickCaptureThread,
 }) => {
@@ -96,7 +100,7 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
   return (
     <header
       className="shrink-0 select-none relative z-30"
-      style={{ background: "#0b0e13", color: "#f3f5f8", borderBottom: "1px solid #1b222d" }}
+      style={{ background: "#0b0e11", color: "#f8fafc", borderBottom: "1px solid #222933" }}
     >
       {/* Calm Single-Row Top Bar matching reference mockups */}
       <div className="px-3 py-2.5 flex items-center gap-2.5 relative">
@@ -117,7 +121,7 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
               onClick={() => onNavigate("attention")}
               className="px-1.5 py-0.5 rounded-full font-mono text-[10px] font-bold"
               style={{
-                background: attentionCount > 0 ? "#dc4446" : "#1b222d",
+                background: attentionCount > 0 ? "#d42f34" : "#191f28",
                 color: "#ffffff",
               }}
               title="Open Attention items"
@@ -130,7 +134,7 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
             type="button"
             onClick={() => setMenuOpen((v) => !v)}
             className="w-8 h-8 rounded-xl flex items-center justify-center shrink-0 transition-colors hover:bg-white/10"
-            style={{ background: "#141922", border: "1px solid #222936", color: "#9aa4b2" }}
+            style={{ background: "#13171d", border: "1px solid #222933", color: "#94a3b8" }}
             title="Five Nines / Primary Freight Panel Controls"
           >
             <LayoutGrid size={14} />
@@ -142,8 +146,8 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
           <div
             className="flex items-center gap-2 px-3 py-2 rounded-xl transition-colors"
             style={{
-              background: "#151a23",
-              border: `1px solid ${searchFocused ? "#38c976" : "#222936"}`,
+              background: "#13171d",
+              border: `1px solid ${searchFocused ? "#21b975" : "#222933"}`,
             }}
           >
             <Search size={14} style={{ color: "#6e7787" }} className="shrink-0" />
@@ -209,7 +213,7 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
                         setSearchFocused(false);
                       }}
                       className="underline font-semibold"
-                      style={{ color: "#38c976" }}
+                      style={{ color: "#66d9a2" }}
                     >
                       All Loads →
                     </button>
@@ -224,16 +228,16 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
                         setSearchFocused(false);
                       }}
                       className="w-full text-left px-3 py-2 text-xs hover:bg-white/5 flex items-center justify-between gap-2"
-                      style={{ borderTop: "1px solid #222936" }}
+                      style={{ borderTop: "1px solid #222933" }}
                     >
                       <div className="min-w-0">
                         <div className="font-semibold truncate">
                           {s.customer} · {s.origin.split(",")[0]} → {s.dest.split(",")[0]}{" "}
-                          <span className="font-mono font-normal" style={{ color: "#8b95a5" }}>
+                          <span className="font-mono font-normal" style={{ color: "#94a3b8" }}>
                             ({s.id})
                           </span>
                         </div>
-                        <div className="text-[11px] truncate" style={{ color: "#8b95a5" }}>
+                        <div className="text-[11px] truncate" style={{ color: "#94a3b8" }}>
                           {s.po ? `PO ${s.po} · ` : ""}
                           {s.carrier || "Needs carrier"}
                           {s.containerNumber ? ` · ${s.containerNumber}` : ""}
@@ -241,7 +245,7 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
                       </div>
                       <span
                         className="px-2 py-0.5 rounded-full text-[10px] font-medium shrink-0"
-                        style={{ background: "rgba(56,201,118,0.14)", color: "#38c976" }}
+                        style={{ background: "rgba(33,185,117,0.16)", color: "#66d9a2" }}
                       >
                         {s.stage}
                       </span>
@@ -253,7 +257,7 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
           )}
         </div>
 
-        {/* Right: Signature Emerald Connection Dot (toggles compact Session, Zoom & Refresh popover) */}
+        {/* Right: Signature Five Nines Signal Emerald Connection Dot */}
         <button
           type="button"
           onClick={() => setMenuOpen((v) => !v)}
@@ -264,8 +268,8 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
           <span
             className="w-2.5 h-2.5 rounded-full block"
             style={{
-              background: "#38c976",
-              boxShadow: "0 0 8px rgba(56, 201, 118, 0.55)",
+              background: "#21b975",
+              boxShadow: "0 0 8px rgba(33, 185, 117, 0.6)",
             }}
           />
         </button>
@@ -275,22 +279,22 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
           className={`absolute right-3 top-full mt-1.5 w-64 rounded-2xl p-3 shadow-2xl space-y-2.5 z-50 transition-all ${
             menuOpen ? "opacity-100 pointer-events-auto translate-y-0" : "opacity-0 pointer-events-none -translate-y-1"
           }`}
-          style={{ background: "#131820", border: "1px solid #262f3d", color: "#f3f5f8" }}
+          style={{ background: "#13171d", border: "1px solid #222933", color: "#f8fafc" }}
           aria-hidden={!menuOpen}
         >
           <div className="flex items-center justify-between gap-2 text-xs">
             <div className="min-w-0">
-              <div className="font-semibold truncate" style={{ color: "#38c976" }}>
+              <div className="font-semibold truncate" style={{ color: "#66d9a2" }}>
                 ✓ {staffDisplayName}
               </div>
-              <div className="text-[10px] font-mono truncate" style={{ color: "#8b95a5" }}>
+              <div className="text-[10px] font-mono truncate" style={{ color: "#94a3b8" }}>
                 {staffEmail}
               </div>
             </div>
             <a
               href={oauthHref}
               className="px-2 py-1 rounded-lg text-[10px] font-semibold shrink-0"
-              style={{ background: "#1b222d", border: "1px solid #2a3444", color: "#f3f5f8" }}
+              style={{ background: "#1768b2", color: "#ffffff" }}
             >
               Reconnect OAuth
             </a>
@@ -360,13 +364,60 @@ export const PanelTopBar: React.FC<PanelTopBarProps> = ({
                 setMenuOpen(false);
               }}
               className="w-full text-left text-[11px] truncate pt-1 hover:underline"
-              style={{ color: "#38c976" }}
+              style={{ color: "#66d9a2" }}
             >
               📧 Open Thread: {liveThreadSubject}
             </button>
           )}
         </div>
       </div>
+
+      {/* Docked Dashboard Quick Switcher: instant 1-click access between Live Inbox, Home, Load Builder & AI */}
+      {!fullScreen && (
+        <div
+          className="px-3 pb-2 flex items-center gap-1.5"
+          style={{ borderTop: "1px solid rgba(255,255,255,0.04)" }}
+        >
+          {(
+            [
+              { id: "inbox" as PanelViewId, label: "Inbox", icon: Inbox, badge: inboxCount > 0 ? inboxCount : null },
+              { id: "home" as PanelViewId, label: "Toolkit Home", icon: LayoutGrid, badge: null },
+              { id: "build-load" as PanelViewId, label: "Builder", icon: PlusCircle, badge: null },
+              { id: "ai-assistant" as PanelViewId, label: "AI", icon: Bot, badge: null },
+            ] as const
+          ).map((tab) => {
+            const Icon = tab.icon;
+            const active = view === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => onNavigate(tab.id)}
+                className="flex-1 py-1 px-2 rounded-lg text-[11px] font-semibold inline-flex items-center justify-center gap-1 transition-colors"
+                style={{
+                  background: active ? "rgba(23,104,178,0.24)" : "#13171d",
+                  color: active ? "#ffffff" : "#94a3b8",
+                  border: `1px solid ${active ? "#1768b2" : "#222933"}`,
+                }}
+              >
+                <Icon size={11} />
+                <span className="truncate">{tab.label}</span>
+                {tab.badge !== null && (
+                  <span
+                    className="px-1 rounded-full font-mono text-[9px] font-bold"
+                    style={{
+                      background: active ? "#21b975" : "#191f28",
+                      color: active ? "#04130b" : "#f8fafc",
+                    }}
+                  >
+                    {tab.badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
     </header>
   );
 };
