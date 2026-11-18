@@ -165,7 +165,7 @@ function buildOrderConfirmationReply(entry: LoadEntry): { text: string; html: st
 
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Order Summary</title>
   <style>body{font-family:system-ui,-apple-system,sans-serif;padding:28px;font-size:13px;color:#0f172a}
-  .bar{height:4px;background:linear-gradient(90deg,#1D2C5E,#682C87,#D52A3B,#F0641E,#F5B841);margin-bottom:14px}
+  .bar{height:4px;background:linear-gradient(90deg,#12345a 0%,#1768b2 48%,#21b975 82%,#66d9a2 100%);margin-bottom:14px}
   .box{border:1px solid #cbd5e1;border-radius:8px;padding:12px;margin-top:10px}</style></head>
   <body><div class="bar"></div><h2>Order Confirmation · PO ${entry.references.customerPO || "TBD"}</h2>
   <div class="box"><strong>Customer:</strong> ${entry.customer.name || "Spot"} &nbsp;|&nbsp; <strong>Equipment:</strong> ${entry.equipment.trailerType} &nbsp;|&nbsp; <strong>Rate:</strong> $${totals.totalSell.toLocaleString()}</div>
@@ -493,7 +493,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
             type="button"
             onClick={() => setTriggerCreateSignal((n) => n + 1)}
             className="px-4 py-2 rounded-xl text-xs font-bold transition-opacity hover:opacity-95"
-            style={{ background: "#38c976", color: "#07130c" }}
+            style={{ background: "#21b975", color: "#07130c" }}
           >
             Create load
           </button>
@@ -524,7 +524,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
                 className="px-2.5 py-1 rounded-full font-medium transition-colors"
                 style={{
                   background: active ? "rgba(56,201,118,0.14)" : "#131820",
-                  color: active ? "#38c976" : "#8b95a5",
+                  color: active ? "#21b975" : "#8b95a5",
                   border: `1px solid ${active ? "rgba(56,201,118,0.45)" : "#222936"}`,
                 }}
               >
@@ -539,7 +539,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
             className="px-2.5 py-1 rounded-full font-medium inline-flex items-center gap-1"
             style={{
               background: drawer === "learned" ? "rgba(56,201,118,0.14)" : "#131820",
-              color: drawer === "learned" ? "#38c976" : "#8b95a5",
+              color: drawer === "learned" ? "#21b975" : "#8b95a5",
               border: "1px solid #222936",
             }}
           >
@@ -552,7 +552,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
             className="px-2.5 py-1 rounded-full font-medium inline-flex items-center gap-1"
             style={{
               background: drawer === "drafts" ? "rgba(56,201,118,0.14)" : "#131820",
-              color: drawer === "drafts" ? "#38c976" : "#8b95a5",
+              color: drawer === "drafts" ? "#21b975" : "#8b95a5",
               border: "1px solid #222936",
             }}
           >
@@ -565,7 +565,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
             className="px-2.5 py-1 rounded-full font-medium inline-flex items-center gap-1"
             style={{
               background: drawer === "preview" ? "rgba(56,201,118,0.14)" : "#131820",
-              color: drawer === "preview" ? "#38c976" : "#8b95a5",
+              color: drawer === "preview" ? "#21b975" : "#8b95a5",
               border: "1px solid #222936",
             }}
           >
@@ -589,7 +589,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
                   disabled={busy}
                   onClick={() => void handleCaptureOpenGmail()}
                   className="flex-1 py-1.5 px-2.5 rounded-xl text-[11px] font-bold inline-flex items-center justify-center gap-1"
-                  style={{ background: "#38c976", color: "#07130c" }}
+                  style={{ background: "#21b975", color: "#07130c" }}
                 >
                   <Sparkles size={11} /> {busy ? "Extracting Open Thread…" : "Capture Active Gmail Thread"}
                 </button>
@@ -608,7 +608,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
           )}
 
           {liveThread?.subject && (
-            <div className="text-[11px] truncate" style={{ color: "#38c976" }}>
+            <div className="text-[11px] truncate" style={{ color: "#21b975" }}>
               📧 Open Thread: {liveThread.subject} {liveThread.sender ? `(${liveThread.sender})` : ""}
             </div>
           )}
@@ -629,7 +629,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
                   disabled={busy || !pasteText.trim()}
                   onClick={() => void extractFromText({ subject: liveThread?.subject, bodyText: pasteText })}
                   className="flex-1 py-1.5 px-2.5 rounded-xl text-[11px] font-bold inline-flex items-center justify-center gap-1"
-                  style={{ background: "#38c976", color: "#07130c" }}
+                  style={{ background: "#21b975", color: "#07130c" }}
                 >
                   <ClipboardPaste size={11} /> {busy ? "Parsing…" : "Extract Pasted Text → Builder"}
                 </button>
@@ -677,7 +677,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
                   disabled={busy}
                   onClick={() => tenderInputRef.current?.click()}
                   className="flex-1 py-1.5 px-2.5 rounded-xl text-[11px] font-bold inline-flex items-center justify-center gap-1"
-                  style={{ background: "#38c976", color: "#07130c" }}
+                  style={{ background: "#21b975", color: "#07130c" }}
                 >
                   <FileUp size={11} /> {busy ? "Transcribing…" : "Choose Tender PDF / Image"}
                 </button>
@@ -717,9 +717,9 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
               {pendingTranscript && (
                 <div
                   className="p-2.5 rounded-xl space-y-1.5"
-                  style={{ background: "#0f141b", border: "1px solid #38c976" }}
+                  style={{ background: "#0f141b", border: "1px solid #21b975" }}
                 >
-                  <div className="text-[10px] font-bold" style={{ color: "#38c976" }}>
+                  <div className="text-[10px] font-bold" style={{ color: "#21b975" }}>
                     Review &amp; Confirm Extracted Tender Transcript ({transcriptFilename})
                   </div>
                   <textarea
@@ -737,7 +737,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
                       disabled={busy}
                       onClick={() => void handleConfirmTranscript()}
                       className="flex-1 py-1.5 px-2 rounded-xl text-[11px] font-bold inline-flex items-center justify-center gap-1"
-                      style={{ background: "#38c976", color: "#07130c" }}
+                      style={{ background: "#21b975", color: "#07130c" }}
                     >
                       <CheckCircle2 size={11} /> Confirm Transcript &amp; Populate Builder
                     </button>
@@ -771,7 +771,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
                   className="px-2 py-0.5 rounded-full text-[10px]"
                   style={{
                     background: entry.equipment.trailerType === eq ? "rgba(56,201,118,0.14)" : "#181f2a",
-                    color: entry.equipment.trailerType === eq ? "#38c976" : "#8b95a5",
+                    color: entry.equipment.trailerType === eq ? "#21b975" : "#8b95a5",
                     border: "1px solid #262f3d",
                   }}
                 >

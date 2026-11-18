@@ -1,8 +1,8 @@
 import React, { useState } from "react";
 import type { CrucialEmailItem, OpsShipment } from "@shared/tai-webhook-schema";
-import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
 import { AlertTriangle, CheckCircle2, DollarSign, ExternalLink, FileWarning, Package, Search, Truck, Upload } from "lucide-react";
-import { isApTaskResolved, type ApTaskRecord, type PanelViewId } from "./panelTypes";
+import { openEmailInGmail } from "./extensionBridge";
+import { isApTaskResolved, type ApTaskRecord, type LiveOpsShipment, type PanelViewId } from "./panelTypes";
 
 interface AttentionViewProps {
   shipments: OpsShipment[];
@@ -29,7 +29,14 @@ export const AttentionView: React.FC<AttentionViewProps> = ({
 }) => {
   const [filter, setFilter] = useState<SectionFilter>("all");
 
-  const uncoveredLoads = shipments.filter((s) => s.stage === "Needs truck" || !s.carrier.trim());
+  const uncoveredLoads = (shipments as LiveOpsShipment[]).filter(
+    (s) =>
+      s.stage !== "Cancelled" &&
+      !/cancel/i.test(String(s.rawStatus || "")) &&
+      s.stage !== "Delivered" &&
+      (s.stage === "Needs truck" || !s.carrier.trim()) &&
+      !s.carrier.trim(),
+  );
   const mismatchLoads = shipments.filter((s) => Boolean(s.mismatchNote) || (s.buy > 0 && s.sell < s.buy) || !s.po.trim());
   const mismatchEmails = crucialEmails.filter(
     (e) => !e.applied && (e.diffType === "rate_mismatch" || e.diffType === "missing_po"),
@@ -333,15 +340,19 @@ export const AttentionView: React.FC<AttentionViewProps> = ({
                   </div>
                   <div className="flex items-center gap-1">
                     {s.containerNumber && (
-                      <a
-                        href={buildGmailContainerSearchUrl(s.containerNumber, s.id)}
-                        target="_blank"
-                        rel="noreferrer"
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void openEmailInGmail({
+                            query: `"${s.containerNumber}" OR "${s.id}"`,
+                            loadId: s.id,
+                          })
+                        }
                         className="px-1.5 py-0.5 rounded text-[10px] inline-flex items-center gap-0.5"
                         style={{ background: "var(--pf-surface)", color: "var(--pf-info)", border: "1px solid var(--pf-border)" }}
                       >
                         <Search size={9} /> Gmail
-                      </a>
+                      </button>
                     )}
                     <button
                       type="button"
@@ -446,14 +457,13 @@ export const AttentionView: React.FC<AttentionViewProps> = ({
           {openApAndTenders.length === 0 && unbookedTenders.length === 0 && (
             <div className="text-[11px] flex items-center justify-between" style={{ color: "var(--pf-text-muted)" }}>
               <span>✓ No pending AP load checks or unbooked tenders.</span>
-              <a
-                href="https://mail.google.com/mail/u/0/#search/invoice+OR+tender"
-                target="_blank"
-                rel="noreferrer"
+              <button
+                type="button"
+                onClick={() => void openEmailInGmail({ query: "invoice OR tender" })}
                 className="inline-flex items-center gap-0.5 underline text-[10px]"
               >
                 <ExternalLink size={10} /> Gmail
-              </a>
+              </button>
             </div>
           )}
         </section>

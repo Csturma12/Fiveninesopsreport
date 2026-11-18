@@ -11,12 +11,14 @@ import type { LoadEntry } from "../shared/load-entry";
 import type { OpsShipment } from "../shared/tai-webhook-schema";
 import { stateForZip } from "../shared/us-zip-ranges";
 import { addSseClient, broadcastOpsEvent } from "./events";
+import { getStaffGmailAccessToken } from "./auth";
 import { searchFacilityAndMapsCandidates } from "./facility-search";
 import { isPfdGatewayConfigured } from "./pfd-gateway";
-import { store } from "./store";
+import { store, type IngestEmailInput } from "./store";
 import { registerPodUploadRoute } from "./tai-pod-routes";
 import { getTaiPushLogs } from "./tai-push-log";
 import {
+  answerGroundedOpsQuestion,
   bookTaiLoads,
   calculateFuelSurcharge,
   decomposeShipmentLinehaulVsAllIn,
@@ -30,9 +32,12 @@ import {
   pushShipmentCheckCall,
   pushShipmentReferences,
   saveFacilityRecord,
+  updateShipmentFull,
+  updateShipmentRateconStatus,
   verifyWebhookSecretIfConfigured,
   type BookTaiLoadsOptions,
   type DirectTaiHelperOptions,
+  type GroundedAiOptions,
 } from "./tai-service";
 
 export interface PanelDraftRecord {
@@ -658,6 +663,123 @@ export interface RegisterApiRoutesOptions {
   env?: NodeJS.ProcessEnv;
   bookingOptions?: Partial<BookTaiLoadsOptions>;
   helperOptions?: Partial<DirectTaiHelperOptions>;
+  aiOptions?: GroundedAiOptions;
+  gmailFetchImpl?: typeof fetch;
+}
+
+interface GmailApiPart {
+  mimeType?: string;
+  filename?: string;
+  body?: { data?: string; size?: number };
+  parts?: GmailApiPart[];
+}
+
+function decodeGmailBase64Url(data: string | undefined): string {
+  if (!data) return "";
+  try {
+    return Buffer.from(data, "base64url").toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function extractGmailBodyAndAttachments(payload: GmailApiPart | undefined): {
+  bodyText: string;
+  attachments: Array<{ filename: string; mimeType?: string }>;
+} {
+  let plain = "";
+  let html = "";
+  const attachments: Array<{ filename: string; mimeType?: string }> = [];
+
+  const walk = (part: GmailApiPart | undefined) => {
+    if (!part) return;
+    const mime = String(part.mimeType || "").toLowerCase();
+    if (part.filename && String(part.filename).trim()) {
+      attachments.push({ filename: String(part.filename).trim(), mimeType: part.mimeType });
+    }
+    if (mime === "text/plain" && part.body?.data && !plain) {
+      plain = decodeGmailBase64Url(part.body.data);
+    } else if (mime === "text/html" && part.body?.data && !html) {
+      html = decodeGmailBase64Url(part.body.data);
+    }
+    if (Array.isArray(part.parts)) {
+      for (const child of part.parts) walk(child);
+    }
+  };
+  walk(payload);
+
+  const bodyText =
+    plain.trim() ||
+    html
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  return { bodyText, attachments };
+}
+
+async function fetchLiveGmailMessages(
+  accessToken: string,
+  doFetch: typeof fetch = fetch,
+): Promise<IngestEmailInput[]> {
+  const listResp = await doFetch(
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=25&q=in%3Ainbox",
+    {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(12_000),
+    },
+  );
+  if (!listResp.ok) return [];
+  const listJson = (await listResp.json()) as { messages?: Array<{ id?: string; threadId?: string }> };
+  const refs = (listJson.messages || []).slice(0, 25);
+  if (refs.length === 0) return [];
+
+  const fetched = await Promise.all(
+    refs.map(async (ref): Promise<IngestEmailInput | null> => {
+      if (!ref.id) return null;
+      try {
+        const msgResp = await doFetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(ref.id)}?format=full`,
+          {
+            headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+            signal: AbortSignal.timeout(10_000),
+          },
+        );
+        if (!msgResp.ok) return null;
+        const msg = (await msgResp.json()) as {
+          id?: string;
+          threadId?: string;
+          snippet?: string;
+          labelIds?: string[];
+          payload?: GmailApiPart & { headers?: Array<{ name?: string; value?: string }> };
+        };
+        const headers = msg.payload?.headers || [];
+        const getHdr = (name: string) =>
+          headers.find((h) => String(h.name || "").toLowerCase() === name.toLowerCase())?.value || "";
+        const subject = getHdr("Subject");
+        const from = getHdr("From");
+        const dateHdr = getHdr("Date");
+        const { bodyText, attachments } = extractGmailBodyAndAttachments(msg.payload);
+        return {
+          messageId: msg.id,
+          threadId: msg.threadId || ref.threadId,
+          from,
+          subject,
+          snippet: msg.snippet || "",
+          bodyText: bodyText || msg.snippet || "",
+          receivedAt: dateHdr ? dateHdr.slice(0, 22) : "Recent",
+          unread: Array.isArray(msg.labelIds) ? msg.labelIds.includes("UNREAD") : false,
+          permalink: msg.threadId ? `https://mail.google.com/mail/u/0/#inbox/${msg.threadId}` : undefined,
+          attachments,
+        };
+      } catch {
+        return null;
+      }
+    }),
+  );
+
+  return fetched.filter((x): x is IngestEmailInput => x !== null);
 }
 
 export function registerApiRoutes(app: Express, options: RegisterApiRoutesOptions = {}): void {
@@ -699,7 +821,9 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
   });
 
   app.get("/api/bootstrap", async (req: Request, res: Response) => {
-    const data = await store.getBootstrap(req.staffUser || null);
+    const forceRefresh = req.query.refresh === "1" || req.query.refresh === "true";
+    const data = await store.getBootstrap(req.staffUser || null, { forceRefresh });
+    res.setHeader("Cache-Control", "no-store");
     res.json(data);
   });
 
@@ -839,12 +963,57 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
     res.status(result.ok ? successStatus : result.status).json(result);
   };
 
+  // Server-Paged All Loads Endpoint (12,572+ Supabase rows when live, deterministic fallback offline)
+  app.get("/api/loads", async (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    const pageResult = await store.queryShipmentsPage({
+      page: Number(req.query.page) || 1,
+      pageSize: Number(req.query.pageSize) || 100,
+      status: typeof req.query.status === "string" ? req.query.status : undefined,
+      view: typeof req.query.view === "string" ? req.query.view : undefined,
+      search:
+        typeof req.query.search === "string"
+          ? req.query.search
+          : typeof req.query.q === "string"
+          ? req.query.q
+          : undefined,
+      sortBy:
+        typeof req.query.sortBy === "string"
+          ? req.query.sortBy
+          : typeof req.query.sortKey === "string"
+          ? req.query.sortKey
+          : undefined,
+      sortDir: typeof req.query.sortDir === "string" ? req.query.sortDir : undefined,
+    });
+    res.json(pageResult);
+  });
+
   app.post("/api/loads", (req: Request, res: Response) => {
     void handleBookLoad(req, res, 201);
   });
 
   app.post("/api/loads/book", (req: Request, res: Response) => {
     void handleBookLoad(req, res, 200);
+  });
+
+  // Full Edit Shipment w/ Guarded Live TAI Write-Back (ShipmentCharges, CarrierCharges, References, Tracking)
+  const handleEditShipment = async (req: Request, res: Response) => {
+    const actor = req.staffUser?.email ? `fivenines-ops:${req.staffUser.email}` : "fivenines-ops";
+    const result = await updateShipmentFull(String(req.params.id), req.body || {}, {
+      ...options.helperOptions,
+      billingWriteEnabled: options.bookingOptions?.billingWriteEnabled,
+      actor,
+    });
+    res.status(result.status).json(result);
+  };
+  app.patch("/api/loads/:id", handleEditShipment);
+  app.put("/api/loads/:id", handleEditShipment);
+
+  // Click-to-cycle / explicit RateCon status update ("Not Sent" | "Drafted" | "Sent" | "Signed")
+  app.patch("/api/loads/:id/ratecon-status", async (req: Request, res: Response) => {
+    const actor = req.staffUser?.email || "ops-desk";
+    const result = await updateShipmentRateconStatus(String(req.params.id), req.body?.rateconStatus, actor);
+    res.status(result.status).json(result);
   });
 
   app.post("/api/loads/:id/writeback-carrier", async (req: Request, res: Response) => {
@@ -1028,6 +1197,80 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
     broadcastOpsEvent("shipment_updated", { deletedId: id });
     res.json({ ok: true, id, message: `Deleted load #${id}` });
   });
+
+  // Live Gmail Inbox Stream & Extension Auto-Ingest Endpoints
+  app.get("/api/inbox", (_req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    const items = store.getInboxItems();
+    res.json({
+      ok: true,
+      items,
+      count: items.length,
+      unreadCount: items.filter((i) => i.unread).length,
+    });
+  });
+
+  app.post("/api/inbox/ingest", (req: Request, res: Response) => {
+    const origin = req.headers.origin || "";
+    if (origin.startsWith("chrome-extension://") || origin.startsWith("https://mail.google.com")) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+    }
+    const rawBody = req.body;
+    const rawItems: IngestEmailInput[] = Array.isArray(rawBody)
+      ? rawBody
+      : Array.isArray(rawBody?.items)
+      ? rawBody.items
+      : rawBody && typeof rawBody === "object"
+      ? [rawBody as IngestEmailInput]
+      : [];
+
+    const out = store.ingestExtensionEmails(rawItems);
+    res.json({
+      ok: true,
+      ingested: out.ingested,
+      count: out.items.length,
+      items: out.items,
+    });
+  });
+
+  const handleInboxSync = async (req: Request, res: Response) => {
+    if (store.isSupabaseConfigured) {
+      await store.refreshFromSupabase();
+    }
+    const bearerHeader = String(req.headers.authorization || "");
+    const bearerToken = bearerHeader.toLowerCase().startsWith("bearer ") ? bearerHeader.slice(7).trim() : "";
+    const accessToken =
+      getStaffGmailAccessToken(req.staffUser?.email) ||
+      (bearerToken && bearerToken.split(".").length !== 3 ? bearerToken : null);
+
+    let syncedGmailMessages = 0;
+    if (accessToken) {
+      const gmailItems = await fetchLiveGmailMessages(accessToken, options.gmailFetchImpl ?? fetch);
+      if (gmailItems.length > 0) {
+        const ingested = store.ingestExtensionEmails(gmailItems);
+        syncedGmailMessages = ingested.ingested;
+      }
+    }
+
+    const items = store.getInboxItems();
+    broadcastOpsEvent("inbox_updated", { count: items.length, syncedGmailMessages });
+    res.json({
+      ok: true,
+      items,
+      count: items.length,
+      syncedGmailMessages,
+      oauthConnected: Boolean(accessToken),
+      supabaseConnected: store.supabaseConnected,
+      message: syncedGmailMessages > 0
+        ? `Synced ${syncedGmailMessages} Gmail thread(s) into Five Nines Inbox.`
+        : store.supabaseConnected
+        ? `Refreshed ${items.length} live inbox item(s) from Supabase.`
+        : `Loaded ${items.length} inbox item(s).`,
+    });
+  };
+  app.post("/api/inbox/sync", handleInboxSync);
+  app.post("/api/inbox/sync-gmail", handleInboxSync);
 
   app.delete("/api/inbox/:id", (req: Request, res: Response) => {
     const id = String(req.params.id || "").trim();
@@ -1483,6 +1726,8 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
     const rawList = Array.isArray(req.body?.leads) ? req.body.leads : [req.body];
     let added = 0;
     let duplicates = 0;
+    let blockedExisting = 0;
+    let lastBlockedMatch: string | undefined;
     let lastLead = null;
 
     for (const item of rawList) {
@@ -1501,6 +1746,11 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
         evidence: item.evidence,
         estimatedLanes: item.estimatedLanes,
       });
+      if (result.blockedExistingCustomer) {
+        blockedExisting++;
+        lastBlockedMatch = result.matchedCustomer || String(item.company);
+        continue;
+      }
       lastLead = result.lead;
       if (result.duplicate) {
         duplicates++;
@@ -1510,6 +1760,17 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
           pushLeadWebhook(result.lead).catch(() => {});
         }
       }
+    }
+
+    if (!lastLead && blockedExisting > 0) {
+      res.status(409).json({
+        ok: false,
+        blockedExistingCustomer: true,
+        matchedCustomer: lastBlockedMatch,
+        leads: store.crmLeads,
+        message: `"${lastBlockedMatch}" is already an existing TAI customer — SalesOps CRM only tracks net-new prospects.`,
+      });
+      return;
     }
 
     if (!lastLead) {
@@ -1524,9 +1785,10 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
       leads: store.crmLeads,
       added,
       duplicates,
+      skippedExistingCustomers: blockedExisting,
       message:
         rawList.length > 1
-          ? `Imported ${added} lead(s) (${duplicates} duplicate skipped).`
+          ? `Imported ${added} lead(s) (${duplicates} duplicate, ${blockedExisting} existing customer skipped).`
           : `Added ${lastLead.company} to SalesOps CRM.`,
     });
   });
@@ -1591,60 +1853,23 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
     }
   });
 
-  app.post("/api/inbox/:id/apply", (req: Request, res: Response) => {
+  app.post("/api/inbox/:id/apply", async (req: Request, res: Response) => {
     const item = store.crucialEmails.find((e) => e.id === req.params.id);
     if (!item) {
       res.status(404).json({ ok: false, message: "Action email not found" });
       return;
     }
     const s = item.loadId !== "NEW" ? store.shipments.find((x) => x.id === item.loadId) : undefined;
+    const bodyObj = (req.body && typeof req.body === "object" ? req.body : {}) as Record<string, unknown>;
+    const hasExplicitOverrides =
+      bodyObj.po !== undefined ||
+      bodyObj.customerPO !== undefined ||
+      bodyObj.sellRate !== undefined ||
+      bodyObj.buyRate !== undefined ||
+      bodyObj.note !== undefined ||
+      bodyObj.operationalNote !== undefined;
 
-    if (item.diffType === "missing_po") {
-      const poVal = item.extractedPo || "LR-88412";
-      if (s) {
-        s.po = poVal;
-        s.writebackState = `✓ Customer PO ${poVal} applied & synced to TAI Reference Numbers`;
-      }
-      item.applied = true;
-      res.json({ ok: true, action: "po_updated", shipment: s, message: `Wrote PO ${poVal} to Load #${item.loadId}` });
-      return;
-    }
-    if (item.diffType === "rate_mismatch") {
-      if (item.operationalNote && !item.extractedAmount) {
-        if (s) {
-          if (item.containerNumber && !s.containerNumber) s.containerNumber = item.containerNumber;
-          s.operationalNote = item.operationalNote;
-          s.writebackState = `✓ Exception note synced (${s.containerNumber || s.id})`;
-        }
-        item.applied = true;
-        broadcastOpsEvent("shipment_updated", { shipmentId: item.loadId });
-        res.json({
-          ok: true,
-          action: "note_synced",
-          shipment: s,
-          message: `Synced container/TONU note onto Load #${item.loadId}`,
-        });
-        return;
-      }
-      const amt = item.extractedAmount && item.extractedAmount > 0 ? item.extractedAmount : 6950;
-      if (s) {
-        if (s.buy > 0 && amt < s.buy && item.loadId === "132738007") {
-          s.sell = 6950;
-        } else if (amt >= s.sell) {
-          s.sell = amt;
-        } else {
-          s.buy = amt;
-        }
-        delete s.mismatchNote;
-        if (item.operationalNote && !s.operationalNote) s.operationalNote = item.operationalNote;
-        s.writebackState = `Rates synced from email ($${s.sell.toLocaleString()} sell / $${s.buy.toLocaleString()} buy)`;
-      }
-      item.applied = true;
-      store.kpis.tmsMismatches = Math.max(0, store.kpis.tmsMismatches - 1);
-      res.json({ ok: true, action: "sell_updated", shipment: s, message: `Updated rates on Load #${item.loadId} ($${amt.toLocaleString()})` });
-      return;
-    }
-    if (item.diffType === "missing_pod") {
+    if (item.diffType === "missing_pod" && !hasExplicitOverrides) {
       // The server has no access to the Gmail attachment bytes, so nothing can be sent to TAI from here.
       // Never mark the POD as uploaded/verified without TAI confirming it: direct the user to the real upload.
       res.status(501).json({
@@ -1655,35 +1880,144 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
       });
       return;
     }
-    res.json({ ok: true, action: "extract_tender", message: "Extracted tender into Compact Load Builder" });
-  });
 
-  app.post("/api/assistant/ask", (req: Request, res: Response) => {
-    const q = String(req.body?.question || "").trim();
-    const ql = q.toLowerCase();
-    let answer = "";
-
-    if (ql.includes("runner") || ql.includes("pa") || ql.includes("flatbed")) {
-      answer =
-        "Top historical PA → GA Flatbed runners in TAI: (1) EVANS DELIVERY COMPANY INC (MC 117950 · 12 pickups, avg $2,350 buy), (2) AESJS INCORPORATED (MC 884120 · avg $2,400 buy), (3) FOX CARRIERS (MC 994210). All carry active cargo insurance.";
-    } else if (ql.includes("webhook") || ql.includes("write") || ql.includes("poller") || ql.includes("tai")) {
-      answer = `TAI Live Sync: Supabase ${store.isSupabaseConfigured ? "Connected" : "Seeded"}, Realtime ${store.realtimeSubscribed ? "Subscribed" : "Standby"}. Inbound webhooks (/api/webhooks/tai/shipment & /api/webhooks/tai/invoice) active. Carrier/Buy writes enqueue to tai_carrier_assignments and wait up to 45s for verified TAI GET /Shipments/{id} read-back.`;
-    } else {
-      const matchedLoad = store.shipments.find(
-        (s) =>
-          ql.includes(s.id) ||
-          (s.containerNumber && sameContainerNumber(s.containerNumber, q)) ||
-          (s.containerNumber && ql.includes(s.containerNumber.toLowerCase())),
+    if (item.loadId === "NEW" || item.diffType === "new_tender") {
+      const extracted = extractLoadEntryFromEmail(
+        {
+          subject: item.subject,
+          sender: item.from,
+          bodyText: item.fullBody || item.body,
+        },
+        store.customers,
+        store.facilities,
       );
-      if (matchedLoad) {
-        const wt = matchedLoad.commodities.reduce((a, c) => a + c.weightTotal, 0);
-        answer = `Load #${matchedLoad.id}${matchedLoad.containerNumber ? ` [${matchedLoad.containerNumber}]` : ""} (${matchedLoad.customer}): ${matchedLoad.origin} → ${matchedLoad.dest} · ${wt.toLocaleString()} lbs · Stage: ${matchedLoad.stage} · Carrier: ${matchedLoad.carrier || "Unassigned"}${matchedLoad.operationalNote ? ` · NOTE: ${matchedLoad.operationalNote}` : ""} · Sync: ${matchedLoad.writebackState}`;
-      } else {
-        answer = `Live Ops Summary: ${store.kpis.uncoveredCommitted} uncovered committed loads, ${store.kpis.inTransitNow} in transit, ${store.kpis.emailPodReady} Gmail PODs ready for TAI upload, and 30d net margin at $${(store.kpis.rev30d - store.kpis.buy30d).toLocaleString()}.`;
-      }
+      item.applied = true;
+      broadcastOpsEvent("inbox_updated", { appliedId: item.id });
+      res.json({
+        ok: true,
+        action: "extract_tender",
+        entry: extracted.entry,
+        extractedFields: item.extractedFields,
+        email: item,
+        message: `Extracted tender from "${item.subject}" into Compact Load Builder`,
+      });
+      return;
     }
-    res.json({ ok: true, answer });
+
+    const poOverride = String(bodyObj.po ?? bodyObj.customerPO ?? item.extractedFields?.customerPO ?? item.extractedPo ?? "").trim();
+    const sellOverride = Number(bodyObj.sellRate ?? item.extractedFields?.sellRate ?? 0) || 0;
+    const buyOverride = Number(bodyObj.buyRate ?? item.extractedFields?.buyRate ?? 0) || 0;
+    const noteOverride = String(
+      bodyObj.operationalNote ?? bodyObj.note ?? item.operationalNote ?? item.extractedFields?.notes ?? "",
+    ).trim();
+
+    if (hasExplicitOverrides && item.loadId !== "NEW") {
+      const actor = req.staffUser?.email ? `fivenines-ops:${req.staffUser.email}` : "fivenines-ops";
+      const updated = await updateShipmentFull(
+        item.loadId,
+        {
+          ...(poOverride ? { po: poOverride } : {}),
+          ...(sellOverride > 0 ? { sell: sellOverride } : {}),
+          ...(buyOverride > 0 ? { buy: buyOverride } : {}),
+          ...(noteOverride ? { operationalNote: noteOverride } : {}),
+        },
+        {
+          ...options.helperOptions,
+          billingWriteEnabled: options.bookingOptions?.billingWriteEnabled,
+          actor,
+        },
+      );
+      item.applied = true;
+      broadcastOpsEvent("inbox_updated", { appliedId: item.id });
+      res.status(updated.ok ? 200 : updated.status).json({
+        ok: updated.ok,
+        action: "email_fields_applied",
+        shipment: updated.shipment,
+        taiWriteback: updated.taiWriteback,
+        email: item,
+        message: updated.message,
+      });
+      return;
+    }
+
+    if (item.diffType === "missing_po" || (poOverride && (!s || !s.po))) {
+      const poVal = poOverride || item.extractedPo || "";
+      if (s && poVal) {
+        await pushShipmentReferences(
+          s.id,
+          { po: poVal },
+          { ...options.helperOptions, actor: req.staffUser?.email || "ops-desk" },
+        );
+      }
+      item.applied = true;
+      broadcastOpsEvent("inbox_updated", { appliedId: item.id });
+      res.json({ ok: true, action: "po_updated", shipment: s, email: item, message: `Wrote PO ${poVal} to Load #${item.loadId}` });
+      return;
+    }
+
+    if (item.diffType === "rate_mismatch") {
+      if (item.operationalNote && !item.extractedAmount) {
+        if (s) {
+          if (item.containerNumber && !s.containerNumber) s.containerNumber = item.containerNumber;
+          s.operationalNote = item.operationalNote;
+          s.writebackState = `✓ Exception note synced (${s.containerNumber || s.id})`;
+        }
+        item.applied = true;
+        broadcastOpsEvent("shipment_updated", { shipmentId: item.loadId });
+        broadcastOpsEvent("inbox_updated", { appliedId: item.id });
+        res.json({
+          ok: true,
+          action: "note_synced",
+          shipment: s,
+          email: item,
+          message: `Synced container/TONU note onto Load #${item.loadId}`,
+        });
+        return;
+      }
+      const amt = item.extractedAmount && item.extractedAmount > 0 ? item.extractedAmount : sellOverride;
+      if (s && amt > 0) {
+        if (amt >= s.sell) s.sell = amt;
+        else s.buy = amt;
+        delete s.mismatchNote;
+        if (item.operationalNote && !s.operationalNote) s.operationalNote = item.operationalNote;
+        s.writebackState = `Rates synced from email ($${s.sell.toLocaleString()} sell / $${s.buy.toLocaleString()} buy)`;
+      }
+      item.applied = true;
+      store.kpis.tmsMismatches = Math.max(0, store.kpis.tmsMismatches - 1);
+      broadcastOpsEvent("shipment_updated", { shipmentId: item.loadId });
+      broadcastOpsEvent("inbox_updated", { appliedId: item.id });
+      res.json({
+        ok: true,
+        action: "sell_updated",
+        shipment: s,
+        email: item,
+        message: `Updated rates on Load #${item.loadId}${amt > 0 ? ` ($${amt.toLocaleString()})` : ""}`,
+      });
+      return;
+    }
+
+    item.applied = true;
+    broadcastOpsEvent("inbox_updated", { appliedId: item.id });
+    res.json({ ok: true, action: "applied", shipment: s, email: item, message: `Applied update for #${item.loadId}` });
   });
+
+  // Grounded Live AI Copilot / Assistant (zero hardcoded fake carriers or static counts)
+  const handleAiAsk = async (req: Request, res: Response) => {
+    const question = String(req.body?.question || req.body?.prompt || req.body?.q || "").trim();
+    const activeEmail =
+      req.body?.activeEmail && typeof req.body.activeEmail === "object"
+        ? (req.body.activeEmail as Record<string, unknown>)
+        : null;
+    const history = Array.isArray(req.body?.history)
+      ? (req.body.history as Array<{ role: string; text: string }>)
+      : undefined;
+
+    const out = await answerGroundedOpsQuestion({ question, activeEmail, history }, options.aiOptions);
+    res.status(out.status).json(out);
+  };
+  app.post("/api/ai/ask", handleAiAsk);
+  app.post("/api/assistant/ask", handleAiAsk);
+  app.post("/api/copilot", handleAiAsk);
 
   // Canonical TAI Inbound Webhooks (both /shipment and root alias supported)
   const shipmentWebhookHandler = (req: Request, res: Response) => {

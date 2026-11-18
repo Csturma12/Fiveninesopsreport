@@ -105,7 +105,7 @@ export const PodFilesView: React.FC<PodFilesViewProps> = ({
               className="px-3 py-1.5 rounded-full text-xs font-medium transition-colors"
               style={{
                 background: active ? "rgba(56,201,118,0.14)" : "var(--pf-surface)",
-                color: active ? "#38c976" : "var(--pf-text)",
+                color: active ? "#21b975" : "var(--pf-text)",
                 border: `1px solid ${active ? "rgba(56,201,118,0.45)" : "var(--pf-border)"}`,
               }}
             >
@@ -155,7 +155,7 @@ export const PodFilesView: React.FC<PodFilesViewProps> = ({
                   <span>{s.carrier || "Unassigned"}</span>
                   <span>·</span>
                   {s.podCount > 0 ? (
-                    <span className="inline-flex items-center gap-1 font-medium" style={{ color: "#38c976" }}>
+                    <span className="inline-flex items-center gap-1 font-medium" style={{ color: "#21b975" }}>
                       <CheckCircle2 size={11} /> {s.podCount} POD verified
                     </span>
                   ) : (
@@ -171,7 +171,7 @@ export const PodFilesView: React.FC<PodFilesViewProps> = ({
                   type="button"
                   onClick={() => triggerUpload(s.id)}
                   className="px-3 py-1.5 rounded-xl text-xs font-semibold inline-flex items-center gap-1.5"
-                  style={{ background: "#38c976", color: "#07130c" }}
+                  style={{ background: "#21b975", color: "#07130c" }}
                 >
                   <Upload size={12} /> Upload
                 </button>

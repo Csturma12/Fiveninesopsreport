@@ -1,8 +1,9 @@
 import type { LoadEntry } from "@shared/load-entry";
-import type { OpsShipment } from "@shared/tai-webhook-schema";
+import type { CrucialEmailItem, CustomerOption, OpsShipment } from "@shared/tai-webhook-schema";
 
 export type PanelViewId =
   | "home"
+  | "inbox"
   | "attention"
   | "dispatch"
   | "all-loads"
@@ -19,6 +20,7 @@ export type PanelViewId =
 
 export const PANEL_VIEW_IDS: readonly PanelViewId[] = [
   "home",
+  "inbox",
   "attention",
   "dispatch",
   "all-loads",
@@ -36,6 +38,7 @@ export const PANEL_VIEW_IDS: readonly PanelViewId[] = [
 
 export const PANEL_VIEW_LABELS: Record<PanelViewId, string> = {
   home: "Home",
+  inbox: "Inbox",
   attention: "Attention",
   dispatch: "Dispatch",
   "all-loads": "All Loads",
@@ -56,10 +59,84 @@ const VIEW_ALIASES: Record<string, PanelViewId> = {
   "load-builder": "build-load",
   bol: "tools-bol",
   quote: "quote-builder",
-  inbox: "attention",
   ai: "ai-assistant",
   ap: "ap-tasks",
 };
+
+/**
+ * Extended shipment & email shapes compatible with both baseline and Phase 2 live Supabase fields.
+ */
+export type LiveOpsShipment = Omit<OpsShipment, "stage" | "rateconStatus"> & {
+  stage: OpsShipment["stage"] | "Cancelled";
+  rateconStatus: OpsShipment["rateconStatus"] | "Signed";
+  taiRawStatus?: string;
+  shipDateIso?: string;
+  delivDateIso?: string;
+  currentLocation?: string;
+  driverPhone?: string;
+  trailerNumber?: string;
+  invoiceStatus?: string;
+  carrierPayStatus?: string;
+  podStatus?: string;
+};
+
+export type LiveCrucialEmail = Omit<CrucialEmailItem, "extractedFields"> & {
+  messageId?: string;
+  unread?: boolean;
+  source?: "extension" | "ap_inbox" | "intake_draft" | "seed" | string;
+  extractedFields?: {
+    customer?: string;
+    po?: string;
+    customerPO?: string;
+    rate?: number;
+    sellRate?: number;
+    buyRate?: number;
+    origin?: string;
+    dest?: string;
+    destination?: string;
+    equipment?: string;
+    readyDate?: string;
+    notes?: string;
+  };
+};
+
+const CORP_SUFFIX_RE =
+  /\b(incorporated|inc|llc|l\.l\.c\.|corp|corporation|co|company|ltd|limited|solutions|lp|llp|plc)\b/gi;
+
+export function normalizeCompanyNameKey(raw?: string | null): string {
+  if (!raw) return "";
+  return String(raw)
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(CORP_SUFFIX_RE, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+export function buildExistingCustomerSet(
+  customers: CustomerOption[] = [],
+  shipments: Array<{ customer?: string }> = [],
+): Set<string> {
+  const keys = new Set<string>();
+  for (const c of customers) {
+    const k = normalizeCompanyNameKey(c.name);
+    if (k.length >= 2) keys.add(k);
+  }
+  for (const s of shipments) {
+    const k = normalizeCompanyNameKey(s.customer);
+    if (k.length >= 2 && k !== "unlinked spot customer" && k !== "tai webhook customer") {
+      keys.add(k);
+    }
+  }
+  return keys;
+}
+
+export function isKnownExistingCustomer(companyName: string | undefined, existingKeys: Set<string>): boolean {
+  const key = normalizeCompanyNameKey(companyName);
+  if (!key || key.length < 2) return false;
+  return existingKeys.has(key);
+}
 
 export function parsePanelViewParam(searchStr?: string): PanelViewId | null {
   const rawSearch = searchStr !== undefined ? searchStr : typeof window !== "undefined" ? window.location.search : "";

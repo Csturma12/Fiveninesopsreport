@@ -186,7 +186,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
         <button
           type="button"
           onClick={() => onNavigate("tools-bol")}
-          className="p-2 rounded-xl text-left space-y-0.5 hover:border-[#F0641E]"
+          className="p-2 rounded-xl text-left space-y-0.5 hover:border-[#1768b2]"
           style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
         >
           <FileText size={13} style={{ color: "var(--pf-warning)" }} />
@@ -196,7 +196,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
         <button
           type="button"
           onClick={() => onNavigate("quote-builder")}
-          className="p-2 rounded-xl text-left space-y-0.5 hover:border-[#F0641E]"
+          className="p-2 rounded-xl text-left space-y-0.5 hover:border-[#1768b2]"
           style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
         >
           <FileSpreadsheet size={13} style={{ color: "var(--pf-primary)" }} />
@@ -206,7 +206,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
         <button
           type="button"
           onClick={handleDashboardClick}
-          className="p-2 rounded-xl text-left space-y-0.5 hover:border-[#F0641E]"
+          className="p-2 rounded-xl text-left space-y-0.5 hover:border-[#1768b2]"
           style={{
             background: showEmbeddedDash ? "var(--pf-info-dim)" : "var(--pf-surface)",
             border: `1px solid ${showEmbeddedDash ? "var(--pf-info)" : "var(--pf-border)"}`,

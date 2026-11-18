@@ -74,6 +74,14 @@ const DIRECT_BROWSER_ENDPOINT_RULES: readonly PatternRule[] = [
   },
 ];
 
+function captureSandboxSetTimeout(fn: () => void, ms?: number) {
+  const handle = setTimeout(fn, ms);
+  if ((ms ?? 0) >= 300) {
+    handle.unref?.();
+  }
+  return handle;
+}
+
 function collectFilesRecursively(dir: string): string[] {
   const results: string[] = [];
   const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -213,10 +221,21 @@ test("every file in gmail-extension/ and client/ contains zero keys, secret env 
 
   assert.deepEqual(allViolations, [], `Zero-key violations detected:\n${allViolations.join("\n")}`);
 
-  for (const jsName of ["background.js", "capture.js", "sidepanel.js"]) {
+  for (const jsName of ["capture.js", "sidepanel.js"]) {
     const jsSource = fs.readFileSync(path.join(EXT_DIR, jsName), "utf8");
     assert.ok(!/\bfetch\s*\(/.test(jsSource), `${jsName} must not make direct fetch() network requests`);
     assert.ok(!/\bXMLHttpRequest\b/.test(jsSource), `${jsName} must not use XMLHttpRequest`);
+  }
+
+  const bgSource = fs.readFileSync(path.join(EXT_DIR, "background.js"), "utf8");
+  assert.ok(!/\bXMLHttpRequest\b/.test(bgSource), "background.js must not use XMLHttpRequest");
+  assert.match(bgSource, /https:\/\/fivenines-ops\.fly\.dev\/api\/inbox\/ingest/);
+  const bgUrls = bgSource.match(/https?:\/\/[^\s"'`)]+/g) || [];
+  for (const url of bgUrls) {
+    assert.ok(
+      url.startsWith("https://fivenines-ops.fly.dev/") || url.startsWith("https://mail.google.com"),
+      `background.js contains disallowed external URL: ${url}`,
+    );
   }
 });
 
@@ -309,12 +328,12 @@ function createSidepanelHarness(options: SidepanelHarnessOptions = {}) {
     Object,
     Array,
     String,
+    Number,
+    Math,
     Boolean,
     Error,
     JSON,
     encodeURIComponent,
-    Number,
-    Math,
     window: {
       location: {
         search: options.search || "",
@@ -336,10 +355,12 @@ function createSidepanelHarness(options: SidepanelHarnessOptions = {}) {
         lastError: null as { message: string } | null,
         sendMessage(msg: Record<string, unknown>, cb?: (res: unknown) => void) {
           const result = options.onRuntimeMessage
-            ? options.onRuntimeMessage(msg)
+            ? options.onRuntimeMessage(JSON.parse(JSON.stringify(msg)) as Record<string, unknown>)
             : { ok: true, payload: {} };
-          if (cb) cb(result);
-          return Promise.resolve(result);
+          return Promise.resolve(result).then((resolved) => {
+            if (cb) cb(resolved);
+            return resolved;
+          });
         },
         onMessage: {
           addListener(fn: (msg: Record<string, unknown>) => void) {
@@ -382,7 +403,7 @@ function createSidepanelHarness(options: SidepanelHarnessOptions = {}) {
     for (const listener of windowMessageListeners) {
       listener({ origin, source: sourceWin, data });
     }
-    await new Promise((resolve) => setTimeout(resolve, 15));
+    await new Promise((resolve) => setTimeout(resolve, 20));
     return postedToIframe.slice(before);
   }
 
@@ -651,7 +672,7 @@ test("capture.js and background.js extract Gmail thread + attachments and click 
     innerText: "Load Tender #88412 - Houston TX to Tulsa OK",
     isConnected: true,
     getAttribute(name: string) {
-      if (name === "data-legacy-thread-id") return "1933f9a00112233";
+      if (name === "data-legacy-thread-id") return "1933f9a001122334";
       return null;
     },
   };
@@ -754,16 +775,18 @@ test("capture.js and background.js extract Gmail thread + attachments and click 
     Promise,
     Set,
     String,
-    Boolean,
-    setTimeout,
-    decodeURIComponent,
     Number,
     Math,
+    Boolean,
+    setTimeout: captureSandboxSetTimeout,
+    decodeURIComponent,
+    encodeURIComponent,
     window: {
       location: {
-        href: "https://mail.google.com/mail/u/0/#inbox/FMfcgzQXJkLmNoPq",
+        href: "https://mail.google.com/mail/u/0/#inbox/1933f9a001122334",
         origin: "https://mail.google.com",
-        hash: "#inbox/FMfcgzQXJkLmNoPq",
+        pathname: "/mail/u/0/",
+        hash: "#inbox/1933f9a001122334",
       },
       addEventListener() {},
     },
@@ -775,6 +798,7 @@ test("capture.js and background.js extract Gmail thread + attachments and click 
         }
         if (sel.includes('[role="button"]')) return [replyButton];
         if (sel === 'input[name="subjectbox"]') return [];
+        if (sel === "tr.zA") return [];
         return [];
       },
     },
@@ -786,7 +810,7 @@ test("capture.js and background.js extract Gmail thread + attachments and click 
           },
         },
         sendMessage() {
-          return Promise.resolve();
+          return Promise.resolve({ ok: true });
         },
       },
     },
@@ -801,6 +825,10 @@ test("capture.js and background.js extract Gmail thread + attachments and click 
 
   const backgroundContext = vm.createContext({
     Promise,
+    URL,
+    JSON,
+    encodeURIComponent,
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, ingested: 1 }) }),
     chrome: {
       sidePanel: {
         setPanelBehavior() {
@@ -809,7 +837,7 @@ test("capture.js and background.js extract Gmail thread + attachments and click 
       },
       tabs: {
         query() {
-          return Promise.resolve([{ id: 77, url: "https://mail.google.com/mail/u/0/#inbox/FMfcgzQXJkLmNoPq" }]);
+          return Promise.resolve([{ id: 77, url: "https://mail.google.com/mail/u/0/#inbox/1933f9a001122334" }]);
         },
         sendMessage(_tabId: number, tabMessage: Record<string, unknown>) {
           if (!scriptReadyInTab) {
@@ -818,6 +846,12 @@ test("capture.js and background.js extract Gmail thread + attachments and click 
           return new Promise((resolve) => {
             captureListener!(tabMessage, {}, (res) => resolve(res));
           });
+        },
+        update() {
+          return Promise.resolve({});
+        },
+        create() {
+          return Promise.resolve({ id: 88 });
         },
       },
       scripting: {
@@ -887,4 +921,384 @@ test("capture.js and background.js extract Gmail thread + attachments and click 
   assert.equal(composeBoxMounted, true);
   assert.match(composeEditor.innerHTML, /Confirmed \$2,050 all-in flatbed<br>Driver ETA 08:00/);
   assert.deepEqual(dispatchedEditorEvents, ["input", "change"]);
+});
+
+test("captureInbox extracts tr.zA Gmail thread rows and auto-ingests + bridges to /api/inbox/ingest", async () => {
+  const captureSource = fs.readFileSync(path.join(EXT_DIR, "capture.js"), "utf8");
+  const backgroundSource = fs.readFileSync(path.join(EXT_DIR, "background.js"), "utf8");
+
+  const row1 = {
+    isConnected: true,
+    hidden: false,
+    classList: {
+      contains(cls: string) {
+        return cls === "zE";
+      },
+    },
+    getAttribute(name: string) {
+      if (name === "data-legacy-thread-id") return "1933f9a001122334";
+      return null;
+    },
+    querySelector(sel: string) {
+      if (sel.includes("span[email]")) {
+        return {
+          innerText: "IMC Dispatch",
+          getAttribute(attr: string) {
+            if (attr === "email") return "dispatch@imclogistics.com";
+            if (attr === "name") return "IMC Dispatch";
+            return null;
+          },
+        };
+      }
+      if (sel.includes(".bog")) return { innerText: "Tender PO 99104 - Houston TX to Dallas TX" };
+      if (sel === ".y2") return { innerText: " - Need 53ft dry van ready 08:00 sharp" };
+      if (sel.includes(".xW")) {
+        return {
+          innerText: "10:05 AM",
+          getAttribute(attr: string) {
+            return attr === "title" ? "Wed, Nov 18, 2026, 10:05 AM" : null;
+          },
+        };
+      }
+      return null;
+    },
+  };
+
+  const row2 = {
+    isConnected: true,
+    hidden: false,
+    classList: {
+      contains() {
+        return false;
+      },
+    },
+    getAttribute(name: string) {
+      if (name === "data-thread-id") return "#thread-f:1816049918273645123";
+      return null;
+    },
+    querySelector(sel: string) {
+      if (sel.includes("span[email]")) {
+        return {
+          innerText: "AP Billing",
+          getAttribute(attr: string) {
+            if (attr === "email") return "ap@carrierco.com";
+            if (attr === "name") return "AP Billing";
+            return null;
+          },
+        };
+      }
+      if (sel.includes(".bog")) return { innerText: "POD Attached Load 132784381" };
+      if (sel === ".y2") return { innerText: " — Signed BOL and POD attached for payment" };
+      if (sel.includes(".xW")) {
+        return {
+          innerText: "9:12 AM",
+          getAttribute(attr: string) {
+            return attr === "title" ? "Wed, Nov 18, 2026, 9:12 AM" : null;
+          },
+        };
+      }
+      return null;
+    },
+  };
+
+  const ingestPosts: Array<{ url: string; credentials?: string; items: Array<Record<string, unknown>> }> = [];
+  let backgroundListener: ((msg: Record<string, unknown>, sender: unknown, sendResponse: (r: unknown) => void) => boolean) | null = null;
+  let captureListener: ((msg: Record<string, unknown>, sender: unknown, sendResponse: (r: unknown) => void) => boolean) | null = null;
+
+  const backgroundContext = vm.createContext({
+    Promise,
+    URL,
+    JSON,
+    encodeURIComponent,
+    fetch: async (url: string, init?: { method?: string; credentials?: string; body?: string }) => {
+      const parsedBody = JSON.parse(String(init?.body || "{}")) as { items?: Array<Record<string, unknown>> };
+      ingestPosts.push({
+        url,
+        credentials: init?.credentials,
+        items: parsedBody.items || [],
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, ingested: (parsedBody.items || []).length }),
+      };
+    },
+    chrome: {
+      sidePanel: {
+        setPanelBehavior() {
+          return Promise.resolve();
+        },
+      },
+      tabs: {
+        query() {
+          return Promise.resolve([{ id: 42, url: "https://mail.google.com/mail/u/0/#inbox" }]);
+        },
+        sendMessage(_tabId: number, tabMessage: Record<string, unknown>) {
+          return new Promise((resolve) => {
+            captureListener!(tabMessage, {}, (res) => resolve(res));
+          });
+        },
+        update() {
+          return Promise.resolve({});
+        },
+        create() {
+          return Promise.resolve({ id: 43 });
+        },
+      },
+      scripting: {
+        executeScript() {
+          return Promise.resolve();
+        },
+      },
+      runtime: {
+        onMessage: {
+          addListener(fn: typeof backgroundListener) {
+            backgroundListener = fn;
+          },
+        },
+      },
+    },
+  });
+
+  vm.runInContext(backgroundSource, backgroundContext);
+  assert.ok(backgroundListener);
+
+  const scheduledAutoCallbacks: Array<() => void> = [];
+  const captureContext = vm.createContext({
+    URL,
+    Date,
+    Promise,
+    Set,
+    String,
+    Number,
+    Math,
+    Boolean,
+    setTimeout: (fn: () => void) => {
+      scheduledAutoCallbacks.push(fn);
+      return 1;
+    },
+    decodeURIComponent,
+    encodeURIComponent,
+    window: {
+      location: {
+        href: "https://mail.google.com/mail/u/0/#inbox",
+        origin: "https://mail.google.com",
+        pathname: "/mail/u/0/",
+        hash: "#inbox",
+      },
+      addEventListener() {},
+    },
+    document: {
+      querySelector() {
+        return null;
+      },
+      querySelectorAll(sel: string) {
+        if (sel === "tr.zA") return [row1, row2];
+        return [];
+      },
+    },
+    chrome: {
+      runtime: {
+        onMessage: {
+          addListener(fn: typeof captureListener) {
+            captureListener = fn;
+          },
+        },
+        sendMessage(msg: Record<string, unknown>) {
+          return new Promise((resolve) => {
+            backgroundListener!(msg, {}, (res) => resolve(res));
+          });
+        },
+      },
+    },
+  });
+
+  vm.runInContext(captureSource, captureContext);
+  assert.ok(captureListener);
+
+  // Trigger initial auto-sync scheduled by capture.js on load
+  assert.equal(scheduledAutoCallbacks.length, 1);
+  scheduledAutoCallbacks[0]();
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  assert.equal(ingestPosts.length, 1, "capture.js initial load should auto-sync inbox to /api/inbox/ingest");
+  assert.equal(ingestPosts[0].url, "https://fivenines-ops.fly.dev/api/inbox/ingest");
+  assert.equal(ingestPosts[0].credentials, "include");
+  assert.equal(ingestPosts[0].items.length, 2);
+
+  // Also test on-demand PF_EXT_BRIDGE action: "captureInbox" end-to-end through sidepanel.js -> background.js -> capture.js
+  const sidepanelHarness = createSidepanelHarness({
+    onRuntimeMessage(msg) {
+      return new Promise((resolve) => {
+        backgroundListener!(msg, {}, (res) => resolve(res));
+      });
+    },
+  });
+
+  const [bridgeRes] = await sidepanelHarness.dispatchPanelPostMessage({
+    type: "PF_EXT_BRIDGE",
+    action: "captureInbox",
+    requestId: "req-inbox-1",
+  });
+
+  assert.ok(bridgeRes);
+  assert.equal(bridgeRes.payload.type, "PF_EXT_BRIDGE_RES");
+  assert.equal(bridgeRes.payload.action, "captureInbox");
+  assert.equal(bridgeRes.payload.requestId, "req-inbox-1");
+  assert.equal(bridgeRes.payload.ok, true);
+
+  const items = ((bridgeRes.payload.payload as Record<string, unknown>).items as Array<Record<string, unknown>>) || [];
+  assert.equal(items.length, 2);
+
+  assert.equal(items[0].threadId, "1933f9a001122334");
+  assert.equal(items[0].from, "IMC Dispatch <dispatch@imclogistics.com>");
+  assert.equal(items[0].subject, "Tender PO 99104 - Houston TX to Dallas TX");
+  assert.equal(items[0].snippet, "Need 53ft dry van ready 08:00 sharp");
+  assert.equal(items[0].receivedAt, "Wed, Nov 18, 2026, 10:05 AM");
+  assert.equal(items[0].unread, true);
+  assert.equal(items[0].permalink, "https://mail.google.com/mail/u/0/#inbox/1933f9a001122334");
+
+  assert.equal(items[1].threadId, "1816049918273645123");
+  assert.equal(items[1].unread, false);
+  assert.equal(items[1].snippet, "Signed BOL and POD attached for payment");
+  assert.equal(
+    items[1].permalink,
+    "https://mail.google.com/mail/u/0/#search/POD%20Attached%20Load%20132784381",
+  );
+  assert.equal(ingestPosts.length, 2, "captureInbox should also POST latest items to /api/inbox/ingest");
+});
+
+test("openGmailThread navigates existing or new Gmail tab and enforces strict https://mail.google.com/ origin", async () => {
+  const backgroundSource = fs.readFileSync(path.join(EXT_DIR, "background.js"), "utf8");
+
+  let openGmailTabs: Array<{ id: number; url: string }> = [
+    { id: 91, url: "https://mail.google.com/mail/u/0/#inbox" },
+  ];
+  const updatedTabs: Array<{ tabId: number; props: { url: string; active: boolean } }> = [];
+  const createdTabs: Array<{ url: string }> = [];
+
+  let backgroundListener: ((msg: Record<string, unknown>, sender: unknown, sendResponse: (r: unknown) => void) => boolean) | null = null;
+
+  const backgroundContext = vm.createContext({
+    Promise,
+    URL,
+    JSON,
+    encodeURIComponent,
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+    chrome: {
+      sidePanel: {
+        setPanelBehavior() {
+          return Promise.resolve();
+        },
+      },
+      tabs: {
+        query() {
+          return Promise.resolve(openGmailTabs);
+        },
+        sendMessage() {
+          return Promise.resolve({ ok: true });
+        },
+        update(tabId: number, props: { url: string; active: boolean }) {
+          updatedTabs.push({ tabId, props: JSON.parse(JSON.stringify(props)) });
+          return Promise.resolve({ id: tabId, ...props });
+        },
+        create(props: { url: string }) {
+          createdTabs.push(JSON.parse(JSON.stringify(props)));
+          return Promise.resolve({ id: 105, ...props });
+        },
+      },
+      scripting: {
+        executeScript() {
+          return Promise.resolve();
+        },
+      },
+      runtime: {
+        onMessage: {
+          addListener(fn: typeof backgroundListener) {
+            backgroundListener = fn;
+          },
+        },
+      },
+    },
+  });
+
+  vm.runInContext(backgroundSource, backgroundContext);
+  assert.ok(backgroundListener);
+
+  const sidepanelHarness = createSidepanelHarness({
+    onRuntimeMessage(msg) {
+      return new Promise((resolve) => {
+        backgroundListener!(msg, {}, (res) => resolve(res));
+      });
+    },
+  });
+
+  // 1. Navigate existing mail.google.com tab to a 16-hex thread permalink
+  const [openExistingRes] = await sidepanelHarness.dispatchPanelPostMessage({
+    type: "PF_EXT_BRIDGE",
+    action: "openGmailThread",
+    requestId: "open-1",
+    payload: {
+      permalink: "https://mail.google.com/mail/u/0/#inbox/1933f9a001122334",
+    },
+  });
+  assert.deepEqual(openExistingRes.payload, {
+    type: "PF_EXT_BRIDGE_RES",
+    action: "openGmailThread",
+    requestId: "open-1",
+    ok: true,
+  });
+  assert.equal(updatedTabs.length, 1);
+  assert.equal(updatedTabs[0].tabId, 91);
+  assert.deepEqual(updatedTabs[0].props, {
+    url: "https://mail.google.com/mail/u/0/#inbox/1933f9a001122334",
+    active: true,
+  });
+
+  // 2. Open a new Gmail search tab when no Gmail tab is currently open
+  openGmailTabs = [];
+  const [openCreatedRes] = await sidepanelHarness.dispatchPanelPostMessage({
+    type: "PF_EXT_BRIDGE",
+    action: "openGmailThread",
+    requestId: "open-2",
+    payload: {
+      query: "PO 99104 IMC Logistics",
+    },
+  });
+  assert.equal(openCreatedRes.payload.ok, true);
+  assert.equal(createdTabs.length, 1);
+  assert.equal(
+    createdTabs[0].url,
+    "https://mail.google.com/mail/u/0/#search/PO%2099104%20IMC%20Logistics",
+  );
+
+  // 3. Reject non-Gmail origins in both sidepanel.js and background.js
+  for (const badUrl of [
+    "https://evil.example.com/mail/u/0/#inbox/1933f9a001122334",
+    "http://mail.google.com/mail/u/0/#inbox/1933f9a001122334",
+    "javascript:alert(1)",
+    "https://fivenines-ops.fly.dev/?panel=1",
+  ]) {
+    const [rejectedBridge] = await sidepanelHarness.dispatchPanelPostMessage({
+      type: "PF_EXT_BRIDGE",
+      action: "openGmailThread",
+      requestId: `bad-${badUrl.slice(0, 8)}`,
+      payload: { url: badUrl },
+    });
+    assert.equal(rejectedBridge.payload.ok, false);
+    assert.equal(rejectedBridge.payload.error, "invalid_gmail_origin");
+
+    const directBgRes = await new Promise<Record<string, unknown>>((resolve) => {
+      backgroundListener!(
+        { type: "PF_BG_OPEN_GMAIL_THREAD", payload: { url: badUrl } },
+        {},
+        (res) => resolve(res as Record<string, unknown>),
+      );
+    });
+    assert.equal(directBgRes.ok, false);
+    assert.equal(directBgRes.error, "invalid_gmail_origin");
+  }
+
+  assert.equal(updatedTabs.length, 1, "rejected URLs must never update tabs");
+  assert.equal(createdTabs.length, 1, "rejected URLs must never create tabs");
 });

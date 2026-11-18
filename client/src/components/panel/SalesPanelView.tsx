@@ -1,12 +1,14 @@
 import React, { useMemo, useState } from "react";
 import type { LoadEntry } from "@shared/load-entry";
-import type { CrmLeadItem, CrmLeadStage } from "@shared/tai-webhook-schema";
-import { Plus, Rocket, Search, Send } from "lucide-react";
+import type { CrmLeadItem, CrmLeadStage, CustomerOption, OpsShipment } from "@shared/tai-webhook-schema";
+import { AlertTriangle, Plus, Rocket, Search, Send } from "lucide-react";
 import { panelFetchJson, type PanelApiContext } from "./panelApi";
-import type { PanelViewId } from "./panelTypes";
+import { buildExistingCustomerSet, isKnownExistingCustomer, type PanelViewId } from "./panelTypes";
 
 interface SalesPanelViewProps {
   leads: CrmLeadItem[];
+  customers?: CustomerOption[];
+  shipments?: OpsShipment[];
   builderEntry: LoadEntry;
   onBuilderChange: (next: LoadEntry) => void;
   apiCtx?: PanelApiContext;
@@ -19,6 +21,8 @@ const STAGES: CrmLeadStage[] = ["New", "Researching", "Contacted", "Qualified", 
 
 export const SalesPanelView: React.FC<SalesPanelViewProps> = ({
   leads,
+  customers = [],
+  shipments = [],
   builderEntry,
   onBuilderChange,
   apiCtx,
@@ -39,23 +43,42 @@ export const SalesPanelView: React.FC<SalesPanelViewProps> = ({
   const [estimatedLanes, setEstimatedLanes] = useState("");
   const [evidence, setEvidence] = useState("");
 
+  const existingCustomerKeys = useMemo(
+    () => buildExistingCustomerSet(customers, shipments),
+    [customers, shipments],
+  );
+
+  const netNewLeads = useMemo(
+    () => leads.filter((l) => !isKnownExistingCustomer(l.company, existingCustomerKeys)),
+    [leads, existingCustomerKeys],
+  );
+
+  const typedCompanyIsExisting = useMemo(
+    () => isKnownExistingCustomer(company, existingCustomerKeys),
+    [company, existingCustomerKeys],
+  );
+
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return leads.filter((l) => {
+    return netNewLeads.filter((l) => {
       if (stageFilter !== "All" && l.status !== stageFilter) return false;
       if (!q) return true;
       return `${l.company} ${l.contact} ${l.email} ${l.location} ${l.estimatedLanes || ""} ${l.evidence}`
         .toLowerCase()
         .includes(q);
     });
-  }, [leads, stageFilter, query]);
+  }, [netNewLeads, stageFilter, query]);
 
   const handleAddLead = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!company.trim()) return;
+    if (typedCompanyIsExisting) {
+      onToast(`"${company.trim()}" is already an existing TAI customer — Sales CRM is for net-new prospects only.`, "error");
+      return;
+    }
     setSaving(true);
     try {
-      const { ok, data } = await panelFetchJson<{ ok?: boolean; message?: string }>(
+      const { ok, data } = await panelFetchJson<{ ok?: boolean; blockedExistingCustomer?: boolean; message?: string }>(
         "/api/crm/leads",
         {
           method: "POST",
@@ -135,9 +158,9 @@ export const SalesPanelView: React.FC<SalesPanelViewProps> = ({
       {/* Header & Quick Add Toggle */}
       <div className="flex items-center justify-between gap-2">
         <div>
-          <div className="text-xs font-bold">Houston / Five Nines Sales Lead Board</div>
+          <div className="text-xs font-bold">Houston / Five Nines Net-New Prospects</div>
           <div className="text-[10px]" style={{ color: "var(--pf-text-muted)" }}>
-            {leads.length} pipeline leads · Clay / ImportYeti / Gmail capture
+            {netNewLeads.length} net-new leads · Existing TAI customers excluded
           </div>
         </div>
         <button
@@ -157,6 +180,14 @@ export const SalesPanelView: React.FC<SalesPanelViewProps> = ({
           className="p-2.5 rounded-xl space-y-1.5"
           style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-action)" }}
         >
+          {typedCompanyIsExisting && (
+            <div
+              className="p-2 rounded-lg text-[10.5px] font-semibold inline-flex items-center gap-1 w-full"
+              style={{ background: "var(--pf-warning-dim)", color: "var(--pf-warning)" }}
+            >
+              <AlertTriangle size={12} /> Existing TAI customer — Sales CRM accepts net-new prospects only.
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-1.5">
             <input
               required
@@ -205,8 +236,8 @@ export const SalesPanelView: React.FC<SalesPanelViewProps> = ({
           />
           <button
             type="submit"
-            disabled={saving}
-            className="w-full py-1.5 rounded-lg text-xs font-bold"
+            disabled={saving || typedCompanyIsExisting}
+            className="w-full py-1.5 rounded-lg text-xs font-bold disabled:opacity-45"
             style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
           >
             {saving ? "Saving…" : "Save Lead to SalesOps CRM"}

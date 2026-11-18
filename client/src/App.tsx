@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import type { LoadEntry } from "@shared/load-entry";
 import type { BootstrapPayload, CrmLeadItem, CrucialEmailItem, OpsShipment } from "@shared/tai-webhook-schema";
@@ -7,11 +7,13 @@ import { POD_FILE_ACCEPT, podMimeTypeForFile } from "./lib/pod-file";
 import { CompactLoadBuilder } from "./components/CompactLoadBuilder";
 import { UnifiedDispatchView } from "./components/UnifiedDispatchView";
 import { GmailToolkitPanel } from "./components/GmailToolkitPanel";
-import { isStandalonePanelLocation } from "./components/panel/panelTypes";
+import { captureGmailInbox, openEmailInGmail } from "./components/panel/extensionBridge";
+import { isStandalonePanelLocation, type LiveCrucialEmail } from "./components/panel/panelTypes";
 import { SalesOpsCrmView } from "./components/SalesOpsCrmView";
 import {
   Activity,
   Bot,
+  CheckCircle2,
   ExternalLink,
   FileCheck2,
   Handshake,
@@ -22,8 +24,10 @@ import {
   Package,
   PanelRight,
   PlusCircle,
+  RefreshCw,
   Search,
   Send,
+  Sparkles,
   Sun,
   Trash2,
   UserPlus,
@@ -129,20 +133,45 @@ export const App: React.FC = () => {
   const [toastKind, setToastKind] = useState<"ok" | "error">("ok");
   const [builderEntry, setBuilderEntry] = useState<LoadEntry>(() => createDefaultBuilderEntry());
   const [reviewEmail, setReviewEmail] = useState<CrucialEmailItem | null>(null);
+  const [reviewPoDraft, setReviewPoDraft] = useState("");
+  const [reviewSellDraft, setReviewSellDraft] = useState("");
+  const [reviewBuyDraft, setReviewBuyDraft] = useState("");
+  const [reviewNoteDraft, setReviewNoteDraft] = useState("");
+  const [reviewExtractedEntry, setReviewExtractedEntry] = useState<LoadEntry | null>(null);
+  const [extractingModal, setExtractingModal] = useState(false);
+  const [savingModalUpdate, setSavingModalUpdate] = useState(false);
   const [noteDraft, setNoteDraft] = useState("");
   const [pasteEmailDraft, setPasteEmailDraft] = useState("");
   const [authGateUrl, setAuthGateUrl] = useState<string | null>(null);
+  const [selectedAiEmailId, setSelectedAiEmailId] = useState<string>("none");
+  const [aiSending, setAiSending] = useState(false);
   const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; text: string }>>([
     {
       role: "assistant",
-      text: "Ready! Ask about PA→GA historical lane runners, carrier MC/insurance, load status, or TAI webhook/write-back health.",
+      text: "Connected to live TAI & Supabase operations data. Ask about any customer, carrier MC/setup status, uncovered shipments, historical lane runners, or attach an inbox email.",
     },
   ]);
   const [aiDraft, setAiDraft] = useState("");
+  const [liveInboxItems, setLiveInboxItems] = useState<LiveCrucialEmail[]>([]);
+  const [syncingInbox, setSyncingInbox] = useState(false);
 
   const showToast = useCallback((msg: string, kind: "ok" | "error" = "ok") => {
     setToastKind(kind);
     setToast(msg);
+  }, []);
+
+  const refreshInboxStream = useCallback(async () => {
+    try {
+      const res = await fetch("/api/inbox", { credentials: "include" });
+      if (!res.ok) return;
+      const json = (await res.json()) as { items?: LiveCrucialEmail[]; emails?: LiveCrucialEmail[] };
+      const rows = json.items || json.emails;
+      if (Array.isArray(rows)) {
+        setLiveInboxItems(rows);
+      }
+    } catch {
+      // Keep bootstrap inbox fallback
+    }
   }, []);
 
   const refreshBootstrap = useCallback(async () => {
@@ -158,20 +187,70 @@ export const App: React.FC = () => {
     setData(json);
   }, []);
 
+  const handleSyncDashboardInbox = useCallback(async () => {
+    setSyncingInbox(true);
+    try {
+      const cap = await captureGmailInbox();
+      if (cap.ok && cap.items.length > 0) {
+        await fetch("/api/inbox/ingest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ items: cap.items }),
+        }).catch(() => {});
+      }
+      let syncRes = await fetch("/api/inbox/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+      });
+      if (syncRes.status === 404) {
+        syncRes = await fetch("/api/inbox/sync-gmail", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+        });
+      }
+      const syncOut = (await syncRes.json().catch(() => ({}))) as {
+        ok?: boolean;
+        message?: string;
+        ingested?: number;
+        count?: number;
+      };
+      await Promise.all([refreshInboxStream(), refreshBootstrap()]);
+      const syncedCount = syncOut.ingested ?? syncOut.count ?? cap.items.length;
+      showToast(
+        syncOut.message ||
+          (syncedCount > 0
+            ? `Synced ${syncedCount} Gmail message(s) into Live Operations Inbox`
+            : "Refreshed Live Gmail & Supabase Inbox stream"),
+      );
+    } catch (err) {
+      showToast(`Inbox sync error: ${err instanceof Error ? err.message : String(err)}`, "error");
+    } finally {
+      setSyncingInbox(false);
+    }
+  }, [refreshBootstrap, refreshInboxStream, showToast]);
+
   useEffect(() => {
-    refreshBootstrap();
+    void refreshBootstrap();
+    void refreshInboxStream();
     const params = new URLSearchParams(window.location.search);
     const targetLoad = params.get("load");
     if (targetLoad) {
       setExpandedLoadId(targetLoad);
     }
-  }, [refreshBootstrap]);
+  }, [refreshBootstrap, refreshInboxStream]);
 
-  // Live SSE listener for Supabase Realtime & Inbound TAI Webhooks
+  // Live SSE listener for Supabase Realtime, Inbound TAI Webhooks & Extension Inbox Sync
   useEffect(() => {
     if (authGateUrl) return;
     const es = new EventSource("/api/events");
     const onLiveUpdate = () => {
+      refreshBootstrap().catch(() => {});
+    };
+    const onInboxUpdate = () => {
+      refreshInboxStream().catch(() => {});
       refreshBootstrap().catch(() => {});
     };
     es.addEventListener("shipment_updated", onLiveUpdate);
@@ -179,8 +258,9 @@ export const App: React.FC = () => {
     es.addEventListener("writeback_verified", onLiveUpdate);
     es.addEventListener("invoice_updated", onLiveUpdate);
     es.addEventListener("crm_updated", onLiveUpdate);
+    es.addEventListener("inbox_updated", onInboxUpdate);
     return () => es.close();
-  }, [authGateUrl, refreshBootstrap]);
+  }, [authGateUrl, refreshBootstrap, refreshInboxStream]);
 
   const extractMultiStopTender = useCallback(() => {
     setBuilderEntry({
@@ -426,27 +506,241 @@ export const App: React.FC = () => {
     [setLocation, showToast],
   );
 
-  const handleApplyEmailAction = async (em: CrucialEmailItem) => {
-    if (em.diffType === "new_tender") {
+  const runLiveEmailExtraction = useCallback(
+    async (em: CrucialEmailItem, toastOnSuccess = false): Promise<LoadEntry | null> => {
+      setExtractingModal(true);
+      try {
+        const res = await fetch("/api/extract-email", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            subject: em.subject,
+            sender: em.from,
+            bodyText: em.fullBody || em.body,
+          }),
+        });
+        const out = (await res.json().catch(() => ({}))) as {
+          ok?: boolean;
+          entry?: LoadEntry;
+          summary?: string;
+        };
+        if (res.ok && out.entry) {
+          setReviewExtractedEntry(out.entry);
+          setReviewPoDraft((prev) => prev || out.entry?.references.customerPO || "");
+          setReviewSellDraft((prev) =>
+            prev || (out.entry?.pricing.linehaulSell ? String(out.entry.pricing.linehaulSell) : ""),
+          );
+          setReviewBuyDraft((prev) =>
+            prev || (out.entry?.pricing.linehaulBuy ? String(out.entry.pricing.linehaulBuy) : ""),
+          );
+          if (toastOnSuccess) {
+            showToast(out.summary || `Extracted live load fields from "${em.subject}"`);
+          }
+          return out.entry;
+        }
+      } catch {
+        // Keep extractedFields / email regex fallback
+      } finally {
+        setExtractingModal(false);
+      }
+      return null;
+    },
+    [showToast],
+  );
+
+  const openReviewModal = useCallback(
+    (em: CrucialEmailItem) => {
+      const liveEm = em as LiveCrucialEmail;
+      const matched =
+        em.loadId !== "NEW" ? data?.shipments.find((s) => s.id === em.loadId) : undefined;
+      setReviewEmail(em);
+      setReviewExtractedEntry(null);
+      setReviewPoDraft(liveEm.extractedFields?.po || em.extractedPo || matched?.po || "");
+      const sellCandidate = liveEm.extractedFields?.rate ?? em.extractedAmount ?? matched?.sell;
+      setReviewSellDraft(sellCandidate !== undefined && sellCandidate > 0 ? String(sellCandidate) : "");
+      setReviewBuyDraft(matched?.buy !== undefined && matched.buy > 0 ? String(matched.buy) : "");
+      setReviewNoteDraft(em.operationalNote || matched?.operationalNote || "");
+      void runLiveEmailExtraction(em, false);
+    },
+    [data?.shipments, runLiveEmailExtraction],
+  );
+
+  const handleExtractModalToBuilder = useCallback(
+    async (em: CrucialEmailItem) => {
+      let extracted = reviewExtractedEntry;
+      if (!extracted) {
+        extracted = await runLiveEmailExtraction(em, false);
+      }
+      const matched =
+        em.loadId !== "NEW" ? data?.shipments.find((s) => s.id === em.loadId) : undefined;
+
+      if (extracted) {
+        const nextEntry: LoadEntry = {
+          ...extracted,
+          references: {
+            ...extracted.references,
+            customerPO: reviewPoDraft.trim() || extracted.references.customerPO || em.extractedPo || "",
+          },
+          pricing: {
+            ...extracted.pricing,
+            linehaulSell:
+              Number(reviewSellDraft) > 0
+                ? Number(reviewSellDraft)
+                : extracted.pricing.linehaulSell,
+            linehaulBuy:
+              Number(reviewBuyDraft) > 0
+                ? Number(reviewBuyDraft)
+                : extracted.pricing.linehaulBuy,
+          },
+          specialInstructions:
+            reviewNoteDraft.trim() || extracted.specialInstructions || em.operationalNote || "",
+        };
+        setBuilderEntry(nextEntry);
+        setReviewEmail(null);
+        setLocation("/load-builder");
+        showToast(`Extracted "${em.subject}" into Compact Load Builder.`);
+        return;
+      }
+
+      if (matched) {
+        setBuilderEntry({
+          shipmentType: "Truckload",
+          status: "Committed",
+          customer: { name: matched.customer, taiOrganizationId: matched.taiOrgId || "" },
+          references: {
+            customerPO: reviewPoDraft.trim() || em.extractedPo || matched.po || "",
+            bolNumber: matched.bol || "",
+            invoiceRef: em.extractedInvoice || matched.bol || "",
+            carrierProNumber: matched.pro || "",
+            pickupNumber: "",
+          },
+          stops: matched.stops.length >= 2 ? matched.stops : createDefaultBuilderEntry().stops,
+          items: matched.commodities.length >= 1 ? matched.commodities : createDefaultBuilderEntry().items,
+          accessorials: [],
+          equipment: {
+            trailerSize: matched.trailerSize || "Full",
+            trailerType: matched.equip || "53 ft Van | Dry",
+            equipmentLength: "53",
+            mileage: matched.mileage || 0,
+            stackable: false,
+          },
+          pricing: {
+            linehaulSell: Number(reviewSellDraft) > 0 ? Number(reviewSellDraft) : matched.sell,
+            fuelSell: 0,
+            linehaulBuy: Number(reviewBuyDraft) > 0 ? Number(reviewBuyDraft) : matched.buy,
+            fuelBuy: 0,
+          },
+          carrier: {
+            name: em.extractedCarrier || matched.carrier || "",
+            mcNumber: matched.mc || "",
+            serviceLevel: "Normal",
+          },
+          specialInstructions: reviewNoteDraft.trim() || matched.operationalNote || "",
+          sendToTai: true,
+        });
+        setReviewEmail(null);
+        setLocation("/load-builder");
+        showToast(`Loaded #${matched.id} with email updates into Compact Load Builder.`);
+        return;
+      }
+
       extractMultiStopTender();
       setReviewEmail(null);
       setLocation("/load-builder");
+    },
+    [
+      data?.shipments,
+      extractMultiStopTender,
+      reviewBuyDraft,
+      reviewExtractedEntry,
+      reviewNoteDraft,
+      reviewPoDraft,
+      reviewSellDraft,
+      runLiveEmailExtraction,
+      setLocation,
+      showToast,
+    ],
+  );
+
+  const handleApplyEmailAction = async (em: CrucialEmailItem) => {
+    if (em.diffType === "new_tender" || em.loadId === "NEW") {
+      await handleExtractModalToBuilder(em);
       return;
     }
     if (em.diffType === "missing_pod") {
-      // The server cannot read Gmail attachments; the POD file must be chosen and streamed to TAI for real.
-      if (em.loadId === "NEW") {
-        showToast("This email is not linked to a TAI shipment ID, so a POD cannot be uploaded from it.");
-        return;
-      }
       promptPodUpload(em.loadId);
       return;
     }
-    const res = await fetch(`/api/inbox/${em.id}/apply`, { method: "POST" });
-    const out = await res.json();
+    const res = await fetch(`/api/inbox/${encodeURIComponent(em.id)}/apply`, {
+      method: "POST",
+      credentials: "include",
+    });
+    const out = (await res.json().catch(() => ({}))) as { message?: string };
     showToast(out.message || "Applied email diff");
     setReviewEmail((prev) => (prev && prev.id === em.id ? { ...prev, applied: true } : prev));
     await refreshBootstrap();
+  };
+
+  const handleApplyModalToLoadAndTai = async (em: CrucialEmailItem) => {
+    if (em.loadId === "NEW") {
+      await handleExtractModalToBuilder(em);
+      return;
+    }
+    setSavingModalUpdate(true);
+    try {
+      const patchPayload: Record<string, unknown> = {
+        pushToTai: true,
+      };
+      if (reviewPoDraft.trim()) patchPayload.po = reviewPoDraft.trim();
+      if (reviewSellDraft.trim() !== "" && !Number.isNaN(Number(reviewSellDraft))) {
+        patchPayload.sell = Number(reviewSellDraft);
+      }
+      if (reviewBuyDraft.trim() !== "" && !Number.isNaN(Number(reviewBuyDraft))) {
+        patchPayload.buy = Number(reviewBuyDraft);
+      }
+      if (reviewNoteDraft.trim()) {
+        patchPayload.operationalNote = reviewNoteDraft.trim();
+      }
+
+      const [patchRes, applyRes] = await Promise.all([
+        fetch(`/api/loads/${encodeURIComponent(em.loadId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(patchPayload),
+        }),
+        fetch(`/api/inbox/${encodeURIComponent(em.id)}/apply`, {
+          method: "POST",
+          credentials: "include",
+        }),
+      ]);
+
+      const patchJson = (await patchRes.json().catch(() => ({}))) as {
+        ok?: boolean;
+        message?: string;
+        taiWriteback?: { pushed?: boolean; message?: string };
+      };
+      const applyJson = (await applyRes.json().catch(() => ({}))) as { message?: string };
+
+      const ok = patchRes.ok && patchJson.ok !== false;
+      showToast(
+        patchJson.taiWriteback?.message ||
+          patchJson.message ||
+          applyJson.message ||
+          `Updated Load #${em.loadId} & pushed to TAI`,
+        ok ? "ok" : "error",
+      );
+      setReviewEmail((prev) => (prev && prev.id === em.id ? { ...prev, applied: true } : prev));
+      await refreshBootstrap();
+    } catch (err) {
+      showToast(
+        `Failed to apply update to Load #${em.loadId}: ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+      );
+    } finally {
+      setSavingModalUpdate(false);
+    }
   };
 
   const openLoadInDispatch = useCallback(
@@ -465,7 +759,7 @@ export const App: React.FC = () => {
         status: "Committed",
         customer: { name: s.customer, taiOrganizationId: s.taiOrgId || "" },
         references: {
-          customerPO: em?.extractedPo || s.po || "",
+          customerPO: reviewPoDraft.trim() || em?.extractedPo || s.po || "",
           bolNumber: s.bol || "",
           invoiceRef: em?.extractedInvoice || s.bol || "",
           carrierProNumber: s.pro || "",
@@ -482,9 +776,14 @@ export const App: React.FC = () => {
           stackable: false,
         },
         pricing: {
-          linehaulSell: em?.extractedAmount && em.extractedAmount > s.sell ? em.extractedAmount : s.sell,
+          linehaulSell:
+            Number(reviewSellDraft) > 0
+              ? Number(reviewSellDraft)
+              : em?.extractedAmount && em.extractedAmount > s.sell
+              ? em.extractedAmount
+              : s.sell,
           fuelSell: 0,
-          linehaulBuy: s.buy,
+          linehaulBuy: Number(reviewBuyDraft) > 0 ? Number(reviewBuyDraft) : s.buy,
           fuelBuy: 0,
         },
         carrier: {
@@ -492,27 +791,117 @@ export const App: React.FC = () => {
           mcNumber: s.mc || "",
           serviceLevel: "Normal",
         },
-        specialInstructions: "",
+        specialInstructions: reviewNoteDraft.trim() || s.operationalNote || "",
         sendToTai: true,
       });
       setReviewEmail(null);
       setLocation("/load-builder");
       showToast(`Loaded #${s.id} (${s.origin} → ${s.dest}) into Compact Builder.`);
     },
-    [setLocation, showToast],
+    [reviewBuyDraft, reviewNoteDraft, reviewPoDraft, reviewSellDraft, setLocation, showToast],
   );
 
-  const handleAskAi = async (q: string) => {
+  const mergedInboxEmails = useMemo<CrucialEmailItem[]>(() => {
+    const byKey = new Map<string, CrucialEmailItem>();
+    for (const item of liveInboxItems) {
+      const k = item.threadId || item.id;
+      byKey.set(k, item);
+    }
+    for (const item of data?.crucialEmails || []) {
+      const k = item.threadId || item.id;
+      if (!byKey.has(k)) {
+        byKey.set(k, item);
+      } else {
+        const existing = byKey.get(k)!;
+        byKey.set(k, {
+          ...item,
+          ...existing,
+          applied: Boolean(existing.applied || item.applied),
+        });
+      }
+    }
+    return [...byKey.values()];
+  }, [liveInboxItems, data?.crucialEmails]);
+
+  const handleAskAi = async (
+    q: string,
+    explicitEmail?: { subject?: string; from?: string; body?: string } | null,
+  ) => {
     const trimmed = q.trim();
     if (!trimmed) return;
+    const priorHistory = chatHistory.slice(-10);
     setChatHistory((prev) => [...prev, { role: "user", text: trimmed }]);
-    const res = await fetch("/api/assistant/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: trimmed }),
-    });
-    const out = await res.json();
-    setChatHistory((prev) => [...prev, { role: "assistant", text: out.answer }]);
+
+    let resolvedEmail: { subject?: string; from?: string; body?: string } | null = null;
+    if (explicitEmail !== undefined) {
+      resolvedEmail = explicitEmail;
+    } else if (selectedAiEmailId !== "none") {
+      const found =
+        (reviewEmail && reviewEmail.id === selectedAiEmailId ? reviewEmail : null) ||
+        mergedInboxEmails.find((e) => e.id === selectedAiEmailId) ||
+        null;
+      if (found) {
+        resolvedEmail = {
+          subject: found.subject,
+          from: found.from,
+          body: found.fullBody || found.body,
+        };
+      }
+    } else if (reviewEmail) {
+      resolvedEmail = {
+        subject: reviewEmail.subject,
+        from: reviewEmail.from,
+        body: reviewEmail.fullBody || reviewEmail.body,
+      };
+    }
+
+    setAiSending(true);
+    try {
+      let res = await fetch("/api/ai/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          question: trimmed,
+          activeEmail: resolvedEmail,
+          history: priorHistory,
+        }),
+      });
+      if (res.status === 404) {
+        res = await fetch("/api/assistant/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            question: trimmed,
+            activeEmail: resolvedEmail,
+            history: priorHistory,
+          }),
+        });
+      }
+      const out = (await res.json().catch(() => ({}))) as {
+        answer?: string;
+        message?: string;
+        error?: string;
+      };
+      setChatHistory((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          text: out.answer || out.message || out.error || `AI request failed (HTTP ${res.status}).`,
+        },
+      ]);
+    } catch (err) {
+      setChatHistory((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          text: `Unable to reach TAI Copilot: ${err instanceof Error ? err.message : String(err)}`,
+        },
+      ]);
+    } finally {
+      setAiSending(false);
+    }
   };
 
   const simulateWebhook = async (kind: "gps" | "invoice") => {
@@ -533,14 +922,18 @@ export const App: React.FC = () => {
           className="max-w-sm w-full p-6 rounded-2xl space-y-4 text-center"
           style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
         >
-          <div className="pf-brand-rule rounded overflow-hidden">
-            <div style={{ background: "#1D2C5E" }} />
-            <div style={{ background: "#682C87" }} />
-            <div style={{ background: "#D52A3B" }} />
-            <div style={{ background: "#F0641E" }} />
-            <div style={{ background: "#F5B841" }} />
+          <div className="pf-brand-rule rounded overflow-hidden" />
+          <div className="flex justify-center pt-1">
+            <svg width="36" height="36" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+              <rect width="32" height="32" rx="7" fill="#12345a" />
+              <rect x="6" y="19" width="3" height="7" rx="1" fill="#ffffff" />
+              <rect x="10.5" y="16" width="3" height="10" rx="1" fill="#ffffff" />
+              <rect x="15" y="13" width="3" height="13" rx="1" fill="#ffffff" />
+              <rect x="19.5" y="10" width="3" height="16" rx="1" fill="#ffffff" />
+              <rect x="24" y="6" width="3" height="20" rx="1" fill="#21b975" />
+            </svg>
           </div>
-          <div className="font-serif font-bold text-lg">Five Nines Operations</div>
+          <div className="font-bold text-lg tracking-tight">Five Nines Operations</div>
           <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
             Sign in with your verified <code>@primarycompanies.com</code> or <code>@shipfivenines.com</code> Google Workspace account to access live shipments and TAI write-back.
           </p>
@@ -588,8 +981,8 @@ export const App: React.FC = () => {
       className="px-4 py-2 text-xs font-medium flex items-center justify-between gap-3 shrink-0"
       style={
         toastKind === "error"
-          ? { background: "#3a1a1a", color: "#f3a3a3", borderBottom: "1px solid #6b2a2a" }
-          : { background: "#163528", color: "#8ce6b8", borderBottom: "1px solid #255943" }
+          ? { background: "var(--pf-danger-dim)", color: "var(--pf-danger)", borderBottom: "1px solid var(--pf-danger)" }
+          : { background: "var(--pf-primary-dim)", color: "var(--pf-primary-bright, #66d9a2)", borderBottom: "1px solid var(--pf-primary)" }
       }
     >
       <span>
@@ -610,7 +1003,7 @@ export const App: React.FC = () => {
           <GmailToolkitPanel
             fullScreen
             shipments={data.shipments}
-            crucialEmails={data.crucialEmails}
+            crucialEmails={mergedInboxEmails}
             facilities={data.facilities}
             customers={data.customers}
             carriers={data.carriers}
@@ -639,48 +1032,82 @@ export const App: React.FC = () => {
     );
   }
 
-  const openActionsCount = data.crucialEmails.filter((e) => !e.applied).length;
+  const liveData = data as BootstrapPayload & {
+    supabaseConnected?: boolean;
+    supabaseError?: string | null;
+    lastSyncAt?: string;
+    counts?: {
+      totalShipments: number;
+      uncoveredCommitted: number;
+      coveredCommitted: number;
+      dispatched: number;
+      inTransit: number;
+      delivered: number;
+      cancelled: number;
+      customers: number;
+      carriers: number;
+      facilities: number;
+    };
+  };
+  const sbConnected = liveData.supabaseConnected ?? data.mode.supabaseConnected;
+  const sbError = liveData.supabaseError || null;
+  const totalShipmentsCount = liveData.counts?.totalShipments ?? data.kpis.totalShipments ?? data.shipments.length;
+  const uncoveredCommittedCount = liveData.counts?.uncoveredCommitted ?? data.kpis.uncoveredCommitted;
+  const inTransitCount = liveData.counts?.inTransit ?? data.kpis.inTransitNow;
+  const customersCount = liveData.counts?.customers ?? data.kpis.customersCount;
+
+  const openActionsCount = mergedInboxEmails.filter((e) => !e.applied).length;
   const navItems = [
-    { path: "/", label: "Crucial Inbox", icon: Inbox, badge: openActionsCount },
-    { path: "/dispatch", label: "Unified Dispatch", icon: Layers, badge: data.shipments.length },
+    { path: "/", label: "Live Ops Inbox", icon: Inbox, badge: openActionsCount },
+    { path: "/dispatch", label: "Unified Dispatch", icon: Layers, badge: totalShipmentsCount.toLocaleString() },
     { path: "/load-builder", label: "Compact Builder", icon: PlusCircle, badge: "Fast" },
     { path: "/salesops", label: "SalesOps CRM", icon: Handshake, badge: data.crmLeads?.length ?? 0 },
     { path: "/ai-assistant", label: "TAI Copilot", icon: Bot, badge: null },
     { path: "/pod-billing", label: "POD & Webhooks", icon: FileCheck2, badge: data.kpis.emailPodReady },
   ];
 
+  const filteredDashboardEmails = mergedInboxEmails.filter((e) => {
+    if (inboxFilter === "all") return true;
+    if (inboxFilter === "tenders") {
+      return e.category === "tenders" || e.diffType === "new_tender" || e.loadId === "NEW";
+    }
+    if (inboxFilter === "diffs") {
+      return e.category === "diffs" || (Boolean(e.loadId) && e.loadId !== "NEW" && e.category !== "pod");
+    }
+    if (inboxFilter === "pod") {
+      return e.category === "pod" || e.diffType === "missing_pod";
+    }
+    return true;
+  });
+
   return (
     <div data-theme={theme} className="pf-app min-h-screen flex flex-col">
       {podFileInput}
-      {/* Top 5-Stroke Primary Freight Brand Rule */}
-      <div className="pf-brand-rule shrink-0">
-        <div style={{ background: "#1D2C5E" }} />
-        <div style={{ background: "#682C87" }} />
-        <div style={{ background: "#D52A3B" }} />
-        <div style={{ background: "#F0641E" }} />
-        <div style={{ background: "#F5B841" }} />
-      </div>
+      {/* Five Nines Logistics Brand Rule (#12345a -> #1768b2 -> #21b975 -> #66d9a2) */}
+      <div className="pf-brand-rule shrink-0" />
 
       {toastBanner}
 
       <div className="flex-1 flex min-h-0">
-        {/* Left Consolidated Sidebar */}
+        {/* Left Consolidated Sidebar — Matched Deep Charcoal Canvas + fivenineslogistics.com Accents */}
         <aside
           className="w-56 shrink-0 flex flex-col justify-between p-3"
-          style={{ background: "var(--pf-sidebar)", borderRight: "1px solid var(--pf-border)", color: "#f2f0ea" }}
+          style={{ background: "var(--pf-sidebar)", borderRight: "1px solid var(--pf-border)", color: "#f8fafc" }}
         >
           <div className="space-y-4">
-            <div className="px-2 pt-1 pb-3" style={{ borderBottom: "1px solid rgba(255,255,255,0.1)" }}>
+            <div className="px-2 pt-1 pb-3" style={{ borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
               <div className="flex items-center gap-2.5">
-                <div
-                  className="w-7 h-7 rounded-md flex items-center justify-center font-bold text-xs"
-                  style={{ background: "#F0641E", color: "#ffffff" }}
-                >
-                  59
-                </div>
+                <svg width="28" height="28" viewBox="0 0 32 32" fill="none" className="shrink-0" aria-hidden="true">
+                  <rect width="32" height="32" rx="7" fill="#12345a" />
+                  <rect x="6" y="19" width="3" height="7" rx="1" fill="#ffffff" />
+                  <rect x="10.5" y="16" width="3" height="10" rx="1" fill="#ffffff" />
+                  <rect x="15" y="13" width="3" height="13" rx="1" fill="#ffffff" />
+                  <rect x="19.5" y="10" width="3" height="16" rx="1" fill="#ffffff" />
+                  <rect x="24" y="6" width="3" height="20" rx="1" fill="#21b975" />
+                </svg>
                 <div>
-                  <div className="font-serif font-bold text-sm text-white">Five Nines Ops</div>
-                  <div className="font-mono text-[10px]" style={{ color: "#8e97a3" }}>
+                  <div className="font-bold text-sm text-white tracking-tight">Five Nines Ops</div>
+                  <div className="font-mono text-[10px]" style={{ color: "#66d9a2" }}>
                     {data.mode.safeSandbox ? "SANDBOX · SAFE MODE" : "LIVE TAI SYNC"}
                   </div>
                 </div>
@@ -698,18 +1125,21 @@ export const App: React.FC = () => {
                     onClick={() => setLocation(it.path)}
                     className="w-full px-2.5 py-2 rounded-lg text-xs font-medium flex items-center justify-between transition-all text-left"
                     style={{
-                      background: active ? "rgba(240,100,30,0.22)" : "transparent",
-                      color: active ? "#ffffff" : "#cbd5e1",
-                      border: active ? "1px solid rgba(240,100,30,0.5)" : "1px solid transparent",
+                      background: active ? "rgba(23, 104, 178, 0.24)" : "transparent",
+                      color: active ? "#ffffff" : "#c1d1e0",
+                      border: active ? "1px solid #1768b2" : "1px solid transparent",
                     }}
                   >
                     <span className="inline-flex items-center gap-2">
-                      <Icon size={14} /> {it.label}
+                      <Icon size={14} style={{ color: active ? "#66d9a2" : undefined }} /> {it.label}
                     </span>
                     {it.badge !== null && (
                       <span
                         className="px-1.5 py-0.5 rounded-full font-mono text-[10px] font-semibold"
-                        style={{ background: "rgba(255,255,255,0.14)", color: "#ffffff" }}
+                        style={{
+                          background: active ? "#21b975" : "rgba(255,255,255,0.1)",
+                          color: active ? "#04130b" : "#ffffff",
+                        }}
                       >
                         {it.badge}
                       </span>
@@ -720,24 +1150,31 @@ export const App: React.FC = () => {
             </nav>
 
             <div className="pt-3 space-y-1.5 text-xs" style={{ borderTop: "1px solid rgba(255,255,255,0.08)" }}>
-              <div className="px-2 text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#8e97a3" }}>
+              <div className="px-2 text-[10px] font-semibold uppercase tracking-wider" style={{ color: "#94a3b8" }}>
                 Live Sync &amp; Poller
               </div>
-              <div className="px-2 flex justify-between" style={{ color: "#cbd5e1" }}>
-                <span>Supabase DB</span>
-                <span className="font-mono text-[11px]" style={{ color: data.mode.supabaseConnected ? "#3ebf82" : "#d4a04a" }}>
-                  ● {data.mode.supabaseConnected ? "Live" : "Seeded"}
+              <div
+                className="px-2 flex justify-between items-center gap-1"
+                style={{ color: "#c1d1e0" }}
+                title={sbError || (sbConnected ? `Connected to Supabase (${totalShipmentsCount.toLocaleString()} loads)` : "Seeded fallback")}
+              >
+                <span className="shrink-0">Supabase DB</span>
+                <span
+                  className="font-mono text-[10px] truncate"
+                  style={{ color: sbConnected ? "#66d9a2" : sbError ? "#ff525a" : "#f5ae39" }}
+                >
+                  ● {sbConnected ? `Live (${totalShipmentsCount.toLocaleString()} loads)` : sbError ? "Offline / Error" : "Offline / Error"}
                 </span>
               </div>
-              <div className="px-2 flex justify-between" style={{ color: "#cbd5e1" }}>
+              <div className="px-2 flex justify-between" style={{ color: "#c1d1e0" }}>
                 <span>Realtime Stream</span>
-                <span className="font-mono text-[11px]" style={{ color: data.mode.realtimeSubscribed ? "#3ebf82" : "#8e97a3" }}>
+                <span className="font-mono text-[11px]" style={{ color: data.mode.realtimeSubscribed ? "#66d9a2" : "#94a3b8" }}>
                   ● {data.mode.realtimeSubscribed ? "Active" : "SSE Ready"}
                 </span>
               </div>
-              <div className="px-2 flex justify-between" style={{ color: "#cbd5e1" }}>
+              <div className="px-2 flex justify-between" style={{ color: "#c1d1e0" }}>
                 <span>Write-Back Poller</span>
-                <span className="font-mono text-[11px]" style={{ color: "#3ebf82" }}>
+                <span className="font-mono text-[11px]" style={{ color: "#66d9a2" }}>
                   ● {data.mode.pollerEnabled ? `Local (${data.mode.pollerScope})` : "Shared Queue"}
                 </span>
               </div>
@@ -746,16 +1183,16 @@ export const App: React.FC = () => {
 
           <div
             className="p-2.5 rounded-lg text-[11px] space-y-1"
-            style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.09)" }}
+            style={{ background: "#13171d", border: "1px solid #222933" }}
           >
-            <div className="truncate font-mono text-[10px]" style={{ color: "#3ebf82" }}>
+            <div className="truncate font-mono text-[10px]" style={{ color: "#66d9a2" }}>
               {data.user?.email || "chriss@primarycompanies.com"}
             </div>
             <div className="flex justify-between font-mono">
-              <span className="text-white">{data.kpis.totalShipments.toLocaleString()} loads</span>
-              <span style={{ color: "#8e97a3" }}>{data.kpis.customersCount} cust</span>
+              <span className="text-white">{totalShipmentsCount.toLocaleString()} loads</span>
+              <span style={{ color: "#94a3b8" }}>{customersCount} cust</span>
             </div>
-            <div style={{ color: "#8e97a3" }}>
+            <div style={{ color: "#94a3b8" }}>
               30d Net: <strong className="text-white font-mono">${(data.kpis.rev30d - data.kpis.buy30d).toLocaleString()}</strong>
             </div>
           </div>
@@ -789,7 +1226,7 @@ export const App: React.FC = () => {
                 style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
               >
                 {theme === "dark" ? <Sun size={13} /> : <Moon size={13} />}
-                {theme === "dark" ? "Light (#F4F6FA)" : "Dark (#0F1217)"}
+                {theme === "dark" ? "Light (#F7F9FC)" : "Dark (#0B0E11)"}
               </button>
 
               <button
@@ -818,18 +1255,18 @@ export const App: React.FC = () => {
           </header>
 
           <main className="flex-1 p-5 overflow-y-auto pf-scroll space-y-5">
-            {/* ROUTE 1: CRUCIAL ACTION INBOX */}
+            {/* ROUTE 1: LIVE GMAIL & SUPABASE INBOX FEEDING DIRECTLY INTO DASHBOARD */}
             {location === "/" && (
               <div className="space-y-4">
                 {/* KPI Command Strip */}
                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
                   <div className="p-3.5 rounded-xl" style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}>
                     <div className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>Uncovered Committed</div>
-                    <div className="text-xl font-bold font-mono mt-0.5" style={{ color: "var(--pf-warning)" }}>{data.kpis.uncoveredCommitted}</div>
+                    <div className="text-xl font-bold font-mono mt-0.5" style={{ color: "var(--pf-warning)" }}>{uncoveredCommittedCount}</div>
                   </div>
                   <div className="p-3.5 rounded-xl" style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}>
                     <div className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>In Transit Now</div>
-                    <div className="text-xl font-bold font-mono mt-0.5" style={{ color: "var(--pf-info)" }}>{data.kpis.inTransitNow}</div>
+                    <div className="text-xl font-bold font-mono mt-0.5" style={{ color: "var(--pf-info)" }}>{inTransitCount}</div>
                   </div>
                   <div className="p-3.5 rounded-xl" style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}>
                     <div className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>Gmail PODs Ready for TAI</div>
@@ -845,45 +1282,56 @@ export const App: React.FC = () => {
 
                 <div className="flex flex-wrap items-end justify-between gap-3">
                   <div>
-                    <div className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--pf-action)" }}>
-                      Crucial Emails ONLY · Zero General Inbox Clutter
+                    <div className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--pf-primary)" }}>
+                      Live Gmail Extension &amp; Supabase Feed · Real-Time SSE Stream
                     </div>
-                    <h1 className="text-xl font-semibold tracking-tight mt-0.5">Action Stream &amp; 1-Click Load Extraction</h1>
+                    <h1 className="text-xl font-semibold tracking-tight mt-0.5">Live Gmail Inbox &amp; 1-Click Load Extraction</h1>
                   </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {[
-                      ["all", "All Crucial"],
-                      ["tenders", "Unbooked Tenders"],
-                      ["diffs", "PO & Rate Diffs"],
-                      ["pod", "Missing PODs"],
-                    ].map(([id, lbl]) => (
-                      <button
-                        key={id}
-                        type="button"
-                        onClick={() => setInboxFilter(id)}
-                        className="px-3 py-1 rounded-full text-xs font-medium"
-                        style={{
-                          background: inboxFilter === id ? "var(--pf-action)" : "var(--pf-surface)",
-                          color: inboxFilter === id ? "#ffffff" : "var(--pf-text-muted)",
-                          border: "1px solid var(--pf-border)",
-                        }}
-                      >
-                        {lbl}
-                      </button>
-                    ))}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={syncingInbox}
+                      onClick={() => void handleSyncDashboardInbox()}
+                      className="px-3 py-1.5 rounded-lg text-xs font-bold inline-flex items-center gap-1.5 transition-opacity disabled:opacity-60"
+                      style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
+                    >
+                      <RefreshCw size={12} className={syncingInbox ? "animate-spin" : ""} />
+                      {syncingInbox ? "Syncing…" : "↻ Sync Gmail Inbox"}
+                    </button>
+                    <div className="flex flex-wrap gap-1.5">
+                      {[
+                        ["all", `All Live Inbox (${mergedInboxEmails.length})`],
+                        ["tenders", "Unbooked Tenders"],
+                        ["diffs", "Load & PO Updates"],
+                        ["pod", "Missing PODs"],
+                      ].map(([id, lbl]) => (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() => setInboxFilter(id)}
+                          className="px-3 py-1 rounded-full text-xs font-semibold transition-colors"
+                          style={{
+                            background: inboxFilter === id ? "var(--pf-action)" : "var(--pf-surface)",
+                            color: inboxFilter === id ? "#ffffff" : "var(--pf-text-muted)",
+                            border: `1px solid ${inboxFilter === id ? "var(--pf-action)" : "var(--pf-border)"}`,
+                          }}
+                        >
+                          {lbl}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
 
                 <div className="grid lg:grid-cols-2 gap-3.5">
-                  {data.crucialEmails
-                    .filter((e) => inboxFilter === "all" || e.category === inboxFilter)
-                    .map((em) => {
+                  {filteredDashboardEmails.map((em) => {
                       const matchedLoad = em.loadId !== "NEW" ? data.shipments.find((s) => s.id === em.loadId) : undefined;
+                      const liveEm = em as LiveCrucialEmail;
                       return (
                         <div
                           key={em.id}
-                          onClick={() => setReviewEmail(em)}
-                          className="p-4 rounded-xl flex flex-col justify-between gap-3 cursor-pointer transition-all hover:border-[#F0641E]"
+                          onClick={() => openReviewModal(em)}
+                          className="p-4 rounded-xl flex flex-col justify-between gap-3 cursor-pointer transition-all hover:border-[#1768b2]"
                           style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
                         >
                           <div className="space-y-1.5">
@@ -924,6 +1372,24 @@ export const App: React.FC = () => {
                                   type="button"
                                   onClick={(e) => {
                                     e.stopPropagation();
+                                    void openEmailInGmail({
+                                      permalink: em.permalink,
+                                      threadId: em.threadId,
+                                      messageId: liveEm.messageId,
+                                      subject: em.subject,
+                                      loadId: em.loadId,
+                                    });
+                                  }}
+                                  className="px-1.5 py-0.5 rounded text-[10px] font-semibold inline-flex items-center gap-0.5 shrink-0 hover:opacity-85"
+                                  style={{ background: "var(--pf-surface-raised)", color: "var(--pf-text)", border: "1px solid var(--pf-border)" }}
+                                  title="Open thread in Gmail"
+                                >
+                                  Gmail <ExternalLink size={9} />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
                                     handleDeleteInboxItem(em.id);
                                   }}
                                   className="p-1 rounded shrink-0 hover:opacity-80"
@@ -959,20 +1425,33 @@ export const App: React.FC = () => {
 
                           <div className="space-y-2">
                             <div
-                              className="p-2 rounded-lg text-xs flex items-center justify-between gap-2"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openReviewModal(em);
+                              }}
+                              className="p-2 rounded-lg text-xs flex items-center justify-between gap-2 cursor-pointer hover:opacity-90"
                               style={{ background: "var(--pf-surface-raised)" }}
                             >
                               <span className="truncate">{em.diffLabel}</span>
-                              <strong className="font-mono shrink-0" style={{ color: "var(--pf-primary)" }}>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openReviewModal(em);
+                                }}
+                                className="px-2 py-0.5 rounded font-mono font-bold shrink-0 hover:underline"
+                                style={{ background: "var(--pf-primary-dim)", color: "var(--pf-primary)" }}
+                                title="Open Review Extraction & Load Modal"
+                              >
                                 {em.diffValue}
-                              </strong>
+                              </button>
                             </div>
                             <div className="grid grid-cols-2 gap-2">
                               <button
                                 type="button"
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  setReviewEmail(em);
+                                  openReviewModal(em);
                                 }}
                                 className="py-2 px-2.5 rounded-lg text-xs font-semibold inline-flex items-center justify-center gap-1.5"
                                 style={{
@@ -1018,8 +1497,10 @@ export const App: React.FC = () => {
                 onUploadPod={promptPodUpload}
                 onSaveNote={handleSaveLoadNote}
                 onDeleteLoad={handleDeleteLoad}
+                onRefreshBootstrap={refreshBootstrap}
+                counts={liveData.counts || null}
                 onAskAi={(q) => {
-                  handleAskAi(q);
+                  void handleAskAi(q);
                   setLocation("/ai-assistant");
                 }}
               />
@@ -1029,6 +1510,8 @@ export const App: React.FC = () => {
             {location === "/salesops" && (
               <SalesOpsCrmView
                 leads={data.crmLeads || []}
+                customers={data.customers}
+                shipments={data.shipments}
                 crmWebhookUrl={data.crmWebhookUrl}
                 onAddLead={handleAddCrmLead}
                 onBulkImportLeads={handleBulkImportCrmLeads}
@@ -1070,24 +1553,47 @@ export const App: React.FC = () => {
             {/* ROUTE 4: TAI AI ASSISTANT */}
             {location === "/ai-assistant" && (
               <div className="max-w-3xl space-y-4">
-                <div>
-                  <div className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--pf-text-muted)" }}>
-                    Grounded on Shipments, Carriers, Lanes &amp; TAI Sync Status
+                <div className="flex flex-wrap items-end justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--pf-text-muted)" }}>
+                      Grounded on Live Shipments ({totalShipmentsCount.toLocaleString()}), Carriers, Lanes &amp; Inbox Context
+                    </div>
+                    <h1 className="text-xl font-semibold tracking-tight mt-0.5">TAI Operations Copilot</h1>
                   </div>
-                  <h1 className="text-xl font-semibold tracking-tight mt-0.5">TAI Operations Copilot</h1>
+                  <div className="flex items-center gap-2 text-xs">
+                    <label htmlFor="ai-email-context-select" className="font-mono text-[11px]" style={{ color: "var(--pf-text-muted)" }}>
+                      Email Context:
+                    </label>
+                    <select
+                      id="ai-email-context-select"
+                      value={selectedAiEmailId}
+                      onChange={(e) => setSelectedAiEmailId(e.target.value)}
+                      className="pf-input py-1 px-2.5 text-xs max-w-xs"
+                    >
+                      <option value="none">None — All Live Loads</option>
+                      {mergedInboxEmails.map((em) => (
+                        <option key={em.id} value={em.id}>
+                          {em.loadId !== "NEW" ? `[#${em.loadId}] ` : "[TENDER] "}
+                          {em.subject.slice(0, 48)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
 
                 <div className="flex flex-wrap gap-2">
                   {[
+                    "Do we have any uncovered shipments for customer IMC Logistics?",
                     "Top historical lane runners for PA → GA flatbed?",
-                    "Check TAI webhook and Fly write-back poller health",
-                    "Check status on load 132738007",
+                    "Is carrier Just Drive Transport set up in TAI?",
+                    "Which uncovered loads pick up first?",
                   ].map((prompt) => (
                     <button
                       key={prompt}
                       type="button"
-                      onClick={() => handleAskAi(prompt)}
-                      className="px-3 py-1.5 rounded-full text-xs font-medium"
+                      disabled={aiSending}
+                      onClick={() => void handleAskAi(prompt)}
+                      className="px-3 py-1.5 rounded-full text-xs font-medium disabled:opacity-50"
                       style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
                     >
                       ✦ {prompt}
@@ -1102,7 +1608,7 @@ export const App: React.FC = () => {
                   {chatHistory.map((m, i) => (
                     <div
                       key={i}
-                      className="p-3 rounded-lg text-xs leading-relaxed"
+                      className="p-3 rounded-lg text-xs leading-relaxed whitespace-pre-wrap"
                       style={{
                         background: m.role === "user" ? "var(--pf-surface-raised)" : "var(--pf-bg)",
                         border: "1px solid var(--pf-border)",
@@ -1114,28 +1620,34 @@ export const App: React.FC = () => {
                       {m.text}
                     </div>
                   ))}
+                  {aiSending && (
+                    <div className="text-xs font-mono" style={{ color: "var(--pf-text-muted)" }}>
+                      Querying live TAI / Supabase data…
+                    </div>
+                  )}
                   <div className="flex gap-2 pt-2">
                     <input
                       value={aiDraft}
                       onChange={(e) => setAiDraft(e.target.value)}
                       onKeyDown={(e) => {
-                        if (e.key === "Enter" && aiDraft.trim()) {
-                          handleAskAi(aiDraft);
+                        if (e.key === "Enter" && aiDraft.trim() && !aiSending) {
+                          void handleAskAi(aiDraft);
                           setAiDraft("");
                         }
                       }}
-                      placeholder="Ask anything about loads, carriers, lanes, or TAI webhooks…"
+                      placeholder="Ask about any customer, carrier MC/setup, lane runners, or uncovered loads…"
                       className="pf-input flex-1"
                     />
                     <button
                       type="button"
+                      disabled={aiSending}
                       onClick={() => {
                         if (aiDraft.trim()) {
-                          handleAskAi(aiDraft);
+                          void handleAskAi(aiDraft);
                           setAiDraft("");
                         }
                       }}
-                      className="px-4 py-2 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
+                      className="px-4 py-2 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 disabled:opacity-50"
                       style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
                     >
                       <Send size={13} /> Ask
@@ -1205,40 +1717,63 @@ export const App: React.FC = () => {
           </main>
         </div>
 
-        {/* EMAIL & LOAD SIDE-BY-SIDE REVIEW MODAL */}
+        {/* EMAIL & LOAD SIDE-BY-SIDE REVIEW EXTRACTION MODAL */}
         {reviewEmail && (() => {
+          const liveReviewEm = reviewEmail as LiveCrucialEmail;
           const linkedLoad =
             reviewEmail.loadId !== "NEW"
               ? data.shipments.find((s) => s.id === reviewEmail.loadId)
               : undefined;
           const modalContainer = reviewEmail.containerNumber || linkedLoad?.containerNumber;
-          const gmailUrl =
-            reviewEmail.permalink ||
-            `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(
-              reviewEmail.loadId !== "NEW" ? reviewEmail.loadId : reviewEmail.subject,
-            )}`;
           const containerSearchUrl = modalContainer
             ? buildGmailContainerSearchUrl(modalContainer, reviewEmail.loadId, reviewEmail.subject)
             : null;
           const activeNote = linkedLoad?.operationalNote || reviewEmail.operationalNote;
 
+          const ef = liveReviewEm.extractedFields || {};
+          const extPick = reviewExtractedEntry?.stops[0];
+          const extDrop =
+            reviewExtractedEntry && reviewExtractedEntry.stops.length > 1
+              ? reviewExtractedEntry.stops[reviewExtractedEntry.stops.length - 1]
+              : undefined;
+          const extractedCustomer =
+            reviewExtractedEntry?.customer.name || ef.customer || linkedLoad?.customer || "—";
+          const extractedPoVal =
+            reviewPoDraft ||
+            reviewExtractedEntry?.references.customerPO ||
+            ef.po ||
+            ef.customerPO ||
+            reviewEmail.extractedPo ||
+            "—";
+          const extractedOrigin = extPick
+            ? `${extPick.city}, ${extPick.state} ${extPick.zipCode}`.trim()
+            : ef.origin || linkedLoad?.origin || "—";
+          const extractedDest = extDrop
+            ? `${extDrop.city}, ${extDrop.state} ${extDrop.zipCode}`.trim()
+            : ef.destination || ef.dest || linkedLoad?.dest || "—";
+          const extractedReadyDate =
+            extPick?.readyDate || ef.readyDate || linkedLoad?.shipDate || "—";
+          const extractedEquipment =
+            reviewExtractedEntry?.equipment.trailerType || ef.equipment || linkedLoad?.equip || "—";
+          const extractedSellVal =
+            Number(reviewSellDraft) ||
+            reviewExtractedEntry?.pricing.linehaulSell ||
+            ef.rate ||
+            ef.sellRate ||
+            reviewEmail.extractedAmount ||
+            0;
+
           return (
             <div
               onClick={() => setReviewEmail(null)}
-              className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4"
+              className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
             >
               <div
                 onClick={(e) => e.stopPropagation()}
-                className="max-w-5xl w-full max-h-[90vh] flex flex-col rounded-2xl overflow-hidden shadow-2xl"
+                className="max-w-5xl w-full max-h-[92vh] flex flex-col rounded-2xl overflow-hidden shadow-2xl"
                 style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
               >
-                <div className="pf-brand-rule shrink-0">
-                  <div style={{ background: "#1D2C5E" }} />
-                  <div style={{ background: "#682C87" }} />
-                  <div style={{ background: "#D52A3B" }} />
-                  <div style={{ background: "#F0641E" }} />
-                  <div style={{ background: "#F5B841" }} />
-                </div>
+                <div className="pf-brand-rule shrink-0" />
 
                 <div
                   className="px-5 py-3 flex flex-wrap items-center justify-between gap-3 shrink-0"
@@ -1270,25 +1805,36 @@ export const App: React.FC = () => {
 
                   <div className="flex items-center gap-2 shrink-0 flex-wrap">
                     {containerSearchUrl && (
-                      <a
-                        href={containerSearchUrl}
-                        target="_blank"
-                        rel="noreferrer"
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void openEmailInGmail({
+                            permalink: containerSearchUrl,
+                            query: modalContainer || reviewEmail.subject,
+                          })
+                        }
                         className="px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
                         style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)", border: "1px solid var(--pf-border)" }}
                       >
                         <Search size={12} /> Search Container # in Gmail
-                      </a>
+                      </button>
                     )}
-                    <a
-                      href={gmailUrl}
-                      target="_blank"
-                      rel="noreferrer"
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void openEmailInGmail({
+                          permalink: reviewEmail.permalink,
+                          threadId: reviewEmail.threadId,
+                          messageId: liveReviewEm.messageId,
+                          subject: reviewEmail.subject,
+                          loadId: reviewEmail.loadId,
+                        })
+                      }
                       className="px-3 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
-                      style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                      style={{ background: "var(--pf-action)", color: "#ffffff" }}
                     >
                       <ExternalLink size={12} /> Open in Gmail
-                    </a>
+                    </button>
                     <button
                       type="button"
                       onClick={() => handleSaveSenderToCrm(reviewEmail)}
@@ -1318,7 +1864,7 @@ export const App: React.FC = () => {
                 </div>
 
                 <div className="p-5 grid lg:grid-cols-12 gap-4 overflow-y-auto pf-scroll">
-                  {/* Left 7 Columns: Full Email Body & Container Events */}
+                  {/* Left 7 Columns: Extracted Fields Summary + Full Email Body + Container Timeline */}
                   <div className="lg:col-span-7 space-y-3">
                     {activeNote && (
                       <div
@@ -1326,44 +1872,72 @@ export const App: React.FC = () => {
                         style={{
                           background: "var(--pf-warning-dim)",
                           color: "var(--pf-warning)",
-                          border: "1px solid rgba(212,160,74,0.4)",
+                          border: "1px solid var(--pf-warning)",
                         }}
                       >
                         {activeNote}
                       </div>
                     )}
 
-                    <div className="flex flex-wrap gap-2 text-xs font-mono">
-                      {reviewEmail.extractedPo && (
-                        <span className="px-2.5 py-1 rounded-md" style={{ background: "var(--pf-surface-raised)" }}>
-                          PO: <strong style={{ color: "var(--pf-primary)" }}>{reviewEmail.extractedPo}</strong>
+                    {/* Structured Extracted Freight Fields Card */}
+                    <div
+                      className="p-3.5 rounded-xl space-y-2.5 text-xs"
+                      style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-bold uppercase tracking-wider inline-flex items-center gap-1.5" style={{ color: "var(--pf-primary)" }}>
+                          <Sparkles size={12} /> Extracted Email Freight Fields
                         </span>
+                        <button
+                          type="button"
+                          disabled={extractingModal}
+                          onClick={() => void runLiveEmailExtraction(reviewEmail, true)}
+                          className="px-2.5 py-1 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1"
+                          style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                        >
+                          <RefreshCw size={11} className={extractingModal ? "animate-spin" : ""} />
+                          {extractingModal ? "Extracting…" : "↻ Re-run Extraction"}
+                        </button>
+                      </div>
+
+                      <div className="grid sm:grid-cols-2 gap-2 font-mono text-[11px]">
+                        <div className="p-2 rounded-lg" style={{ background: "var(--pf-surface)" }}>
+                          <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>CUSTOMER</div>
+                          <div className="font-semibold truncate">{extractedCustomer}</div>
+                        </div>
+                        <div className="p-2 rounded-lg" style={{ background: "var(--pf-surface)" }}>
+                          <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>CUSTOMER PO / INV</div>
+                          <div className="font-bold" style={{ color: "var(--pf-primary)" }}>
+                            {extractedPoVal}
+                            {reviewEmail.extractedInvoice ? ` · Inv ${reviewEmail.extractedInvoice}` : ""}
+                          </div>
+                        </div>
+                        <div className="p-2 rounded-lg" style={{ background: "var(--pf-surface)" }}>
+                          <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>ORIGIN → DESTINATION</div>
+                          <div className="truncate">{extractedOrigin} → {extractedDest}</div>
+                        </div>
+                        <div className="p-2 rounded-lg" style={{ background: "var(--pf-surface)" }}>
+                          <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>READY DATE / EQUIP / RATE</div>
+                          <div className="truncate">
+                            {extractedReadyDate} · {extractedEquipment}
+                            {extractedSellVal > 0 ? ` · $${extractedSellVal.toLocaleString()}` : ""}
+                          </div>
+                        </div>
+                      </div>
+
+                      {reviewEmail.attachments && reviewEmail.attachments.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5 pt-0.5">
+                          {reviewEmail.attachments.map((att, idx) => (
+                            <span
+                              key={idx}
+                              className="px-2.5 py-1 rounded-md font-mono text-[11px]"
+                              style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)" }}
+                            >
+                              📎 {att.filename || "attachment"}
+                            </span>
+                          ))}
+                        </div>
                       )}
-                      {reviewEmail.extractedAmount && (
-                        <span className="px-2.5 py-1 rounded-md" style={{ background: "var(--pf-surface-raised)" }}>
-                          Rate: <strong style={{ color: "var(--pf-primary)" }}>${reviewEmail.extractedAmount.toLocaleString()}</strong>
-                        </span>
-                      )}
-                      {reviewEmail.extractedCarrier && (
-                        <span className="px-2.5 py-1 rounded-md" style={{ background: "var(--pf-surface-raised)" }}>
-                          Carrier: <strong>{reviewEmail.extractedCarrier}</strong>
-                        </span>
-                      )}
-                      {reviewEmail.extractedInvoice && (
-                        <span className="px-2.5 py-1 rounded-md" style={{ background: "var(--pf-surface-raised)" }}>
-                          Inv: <strong>{reviewEmail.extractedInvoice}</strong>
-                        </span>
-                      )}
-                      {reviewEmail.attachments &&
-                        reviewEmail.attachments.map((att, idx) => (
-                          <span
-                            key={idx}
-                            className="px-2.5 py-1 rounded-md"
-                            style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)" }}
-                          >
-                            📎 {att.filename || "attachment"}
-                          </span>
-                        ))}
                     </div>
 
                     <div
@@ -1412,7 +1986,7 @@ export const App: React.FC = () => {
                     )}
                   </div>
 
-                  {/* Right 5 Columns: Linked Load Review + Inline Exception Note Editor */}
+                  {/* Right 5 Columns: Side-by-Side Load Comparison + Editable PO/Sell/Note + 1-Click Actions */}
                   <div className="lg:col-span-5 space-y-3">
                     {linkedLoad ? (
                       <div
@@ -1420,7 +1994,7 @@ export const App: React.FC = () => {
                         style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
                       >
                         <div className="flex items-center justify-between">
-                          <span className="font-mono text-xs font-bold" style={{ color: "var(--pf-action)" }}>
+                          <span className="font-mono text-xs font-bold" style={{ color: "var(--pf-info)" }}>
                             LINKED LOAD #{linkedLoad.id}
                           </span>
                           <span
@@ -1443,167 +2017,145 @@ export const App: React.FC = () => {
                           style={{ background: "var(--pf-surface)" }}
                         >
                           <div>
-                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
-                              DATES
-                            </div>
-                            <div>
-                              {linkedLoad.shipDate} → {linkedLoad.delivDate}
-                            </div>
+                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>DATES</div>
+                            <div>{linkedLoad.shipDate} → {linkedLoad.delivDate}</div>
                           </div>
                           <div>
-                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
-                              EQUIPMENT / WT
-                            </div>
+                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>EQUIPMENT</div>
                             <div className="truncate">{linkedLoad.equip}</div>
                           </div>
                           <div>
-                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
-                              SELL / BUY / MGN
-                            </div>
-                            <div>
-                              ${linkedLoad.sell.toLocaleString()} / ${linkedLoad.buy.toLocaleString()}
-                            </div>
+                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>CURRENT SELL / BUY</div>
+                            <div>${linkedLoad.sell.toLocaleString()} / ${linkedLoad.buy.toLocaleString()}</div>
                           </div>
                           <div>
-                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>
-                              CONTAINER / POD
-                            </div>
-                            <div>
-                              {linkedLoad.containerNumber || linkedLoad.po || "—"} · {linkedLoad.podCount} POD
-                            </div>
+                            <div className="text-[10px]" style={{ color: "var(--pf-text-subtle)" }}>CARRIER / POD</div>
+                            <div className="truncate">{linkedLoad.carrier || "Unassigned"} · {linkedLoad.podCount} POD</div>
                           </div>
                         </div>
-
-                        <div className="text-xs space-y-1">
-                          <div>
-                            <strong style={{ color: "var(--pf-text-muted)" }}>Carrier:</strong>{" "}
-                            {linkedLoad.carrier || "Unassigned"}
-                          </div>
-                          <div>
-                            <strong style={{ color: "var(--pf-text-muted)" }}>BOL / Ref:</strong>{" "}
-                            <span className="font-mono">{linkedLoad.bol || "—"}</span>
-                          </div>
-                          <div>
-                            <strong style={{ color: "var(--pf-text-muted)" }}>Location:</strong> {linkedLoad.location}
-                          </div>
-                          <div className="font-mono text-[11px]" style={{ color: "var(--pf-primary)" }}>
-                            {linkedLoad.writebackState}
-                          </div>
-                        </div>
-
-                        {/* Operational Note & Paste Container Email Extractor */}
-                        <div className="p-2.5 rounded-lg space-y-2" style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}>
-                          <div className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--pf-text-muted)" }}>
-                            Operational Note / Paste Container Email
-                          </div>
-                          <textarea
-                            rows={2}
-                            value={pasteEmailDraft || noteDraft}
-                            onChange={(e) => setPasteEmailDraft(e.target.value)}
-                            placeholder="Paste email about CAAU724710-0 / forklift breakdown / TONU, or type an operational note…"
-                            className="pf-input"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const txt = (pasteEmailDraft || noteDraft).trim();
-                              if (!txt) return;
-                              handleSaveLoadNote(linkedLoad.id, {
-                                pastedEmailText: txt,
-                                containerNumber: modalContainer || undefined,
-                              });
-                            }}
-                            className="w-full py-1.5 px-2.5 rounded-lg text-xs font-semibold"
-                            style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
-                          >
-                            Extract Container # &amp; Save Exception Note
-                          </button>
-                        </div>
-
-                        <div className="space-y-2 pt-1">
-                          <button
-                            type="button"
-                            onClick={() => handleApplyEmailAction(reviewEmail)}
-                            className="w-full py-2 px-3 rounded-lg text-xs font-bold"
-                            style={{
-                              background: reviewEmail.applied ? "var(--pf-primary-dim)" : "var(--pf-action)",
-                              color: reviewEmail.applied ? "var(--pf-primary)" : "#ffffff",
-                            }}
-                          >
-                            {reviewEmail.applied ? "✓ Email Update Synced" : reviewEmail.ctaLabel}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => openLoadInDispatch(linkedLoad.id)}
-                            className="w-full py-2 px-3 rounded-lg text-xs font-semibold"
-                            style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
-                          >
-                            ⇄ Open Full Load #{linkedLoad.id} in Unified Dispatch
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => loadShipmentIntoBuilder(linkedLoad, reviewEmail)}
-                            className="w-full py-2 px-3 rounded-lg text-xs font-semibold"
-                            style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
-                          >
-                            + Copy Load to Compact Builder
-                          </button>
-                        </div>
-                      </div>
-                    ) : reviewEmail.loadId === "NEW" ? (
-                      <div
-                        className="p-4 rounded-xl space-y-3"
-                        style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
-                      >
-                        <div className="font-mono text-xs font-bold" style={{ color: "var(--pf-action)" }}>
-                          UNBOOKED CUSTOMER TENDER
-                        </div>
-                        <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
-                          Ready to extract stops, origin/destination ZIPs, piece counts, weights, and commodity descriptions into the TAI Compact Load Builder.
-                        </p>
-                        <button
-                          type="button"
-                          onClick={() => handleApplyEmailAction(reviewEmail)}
-                          className="w-full py-2 px-3 rounded-lg text-xs font-bold"
-                          style={{ background: "var(--pf-action)", color: "#ffffff" }}
-                        >
-                          + Extract to Compact Load Builder
-                        </button>
                       </div>
                     ) : (
                       <div
-                        className="p-4 rounded-xl space-y-3"
+                        className="p-4 rounded-xl space-y-1.5"
                         style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
                       >
-                        <div className="font-mono text-xs font-bold" style={{ color: "var(--pf-action)" }}>
-                          LOAD #{reviewEmail.loadId}
+                        <div className="font-mono text-xs font-bold" style={{ color: "var(--pf-primary)" }}>
+                          {reviewEmail.loadId === "NEW"
+                            ? "UNBOOKED CUSTOMER TENDER"
+                            : `MATCHED SHIPMENT #${reviewEmail.loadId}`}
                         </div>
-                        <p className="text-xs" style={{ color: "var(--pf-text-muted)" }}>
-                          Search this shipment in Unified Dispatch or apply the extracted update directly.
+                        <p className="text-xs leading-relaxed" style={{ color: "var(--pf-text-muted)" }}>
+                          Review or edit the extracted PO, sell/buy rate, and operational note below, then extract into Compact Load Builder or apply straight to TAI.
                         </p>
-                        <button
-                          type="button"
-                          onClick={() => handleApplyEmailAction(reviewEmail)}
-                          className="w-full py-2 px-3 rounded-lg text-xs font-bold"
-                          style={{ background: "var(--pf-action)", color: "#ffffff" }}
-                        >
-                          {reviewEmail.applied ? "✓ Applied" : reviewEmail.ctaLabel}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const id = reviewEmail.loadId;
-                            setReviewEmail(null);
-                            setSearchQuery(id);
-                            setLocation("/dispatch");
-                          }}
-                          className="w-full py-2 px-3 rounded-lg text-xs font-semibold"
-                          style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
-                        >
-                          ↗ Search #{reviewEmail.loadId} in Unified Dispatch
-                        </button>
                       </div>
                     )}
+
+                    {/* Editable PO / Sell / Buy / Operational Note Inputs */}
+                    <div
+                      className="p-4 rounded-xl space-y-2.5 text-xs"
+                      style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+                    >
+                      <div className="text-[11px] font-bold uppercase tracking-wider" style={{ color: "var(--pf-text-muted)" }}>
+                        Review &amp; Edit Extracted Update
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-2">
+                        <div>
+                          <label className="block text-[10px] mb-1" style={{ color: "var(--pf-text-muted)" }}>
+                            Customer PO #
+                          </label>
+                          <input
+                            value={reviewPoDraft}
+                            onChange={(e) => setReviewPoDraft(e.target.value)}
+                            placeholder="PO #"
+                            className="pf-input font-mono font-semibold"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] mb-1" style={{ color: "var(--pf-text-muted)" }}>
+                            Sell ($)
+                          </label>
+                          <input
+                            type="number"
+                            value={reviewSellDraft}
+                            onChange={(e) => setReviewSellDraft(e.target.value)}
+                            placeholder="0"
+                            className="pf-input font-mono font-bold"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-[10px] mb-1" style={{ color: "var(--pf-text-muted)" }}>
+                            Buy ($)
+                          </label>
+                          <input
+                            type="number"
+                            value={reviewBuyDraft}
+                            onChange={(e) => setReviewBuyDraft(e.target.value)}
+                            placeholder="0"
+                            className="pf-input font-mono font-semibold"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] mb-1" style={{ color: "var(--pf-text-muted)" }}>
+                          Operational / Exception Note
+                        </label>
+                        <textarea
+                          rows={2}
+                          value={reviewNoteDraft}
+                          onChange={(e) => setReviewNoteDraft(e.target.value)}
+                          placeholder="Add PO update note, container exception, or carrier instructions…"
+                          className="pf-input"
+                        />
+                      </div>
+
+                      <div className="space-y-2 pt-1">
+                        {reviewEmail.loadId !== "NEW" && (
+                          <button
+                            type="button"
+                            disabled={savingModalUpdate}
+                            onClick={() => void handleApplyModalToLoadAndTai(reviewEmail)}
+                            className="w-full py-2 px-3 rounded-lg text-xs font-bold inline-flex items-center justify-center gap-1.5"
+                            style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
+                          >
+                            <CheckCircle2 size={13} />
+                            {savingModalUpdate
+                              ? "Pushing Update to TAI…"
+                              : reviewEmail.applied
+                              ? `✓ Re-Sync Update to Load #${reviewEmail.loadId} & TAI`
+                              : `Apply Update to Load #${reviewEmail.loadId} & TAI`}
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          disabled={extractingModal}
+                          onClick={() => void handleExtractModalToBuilder(reviewEmail)}
+                          className="w-full py-2 px-3 rounded-lg text-xs font-bold inline-flex items-center justify-center gap-1.5"
+                          style={{ background: "var(--pf-action)", color: "#ffffff" }}
+                        >
+                          <PlusCircle size={13} /> Extract to Compact Builder
+                        </button>
+
+                        {reviewEmail.loadId !== "NEW" && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const id = reviewEmail.loadId;
+                              setReviewEmail(null);
+                              setExpandedLoadId(id);
+                              setSearchQuery(id);
+                              setLocation("/dispatch");
+                            }}
+                            className="w-full py-2 px-3 rounded-lg text-xs font-semibold"
+                            style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                          >
+                            ⇄ Open Load #{reviewEmail.loadId} in Unified Dispatch
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1619,7 +2171,7 @@ export const App: React.FC = () => {
           >
             <GmailToolkitPanel
               shipments={data.shipments}
-              crucialEmails={data.crucialEmails}
+              crucialEmails={mergedInboxEmails}
               facilities={data.facilities}
               customers={data.customers}
               carriers={data.carriers}

@@ -1,9 +1,10 @@
 import React, { useMemo, useState } from "react";
 import type { LoadEntry } from "@shared/load-entry";
 import type { OpsShipment } from "@shared/tai-webhook-schema";
-import { ChevronDown, ChevronRight, Copy, FileText, MapPin, Save, Search, Upload } from "lucide-react";
+import { ArrowUpRight, ChevronDown, ChevronRight, Copy, FileText, MapPin, Save, Search, Upload } from "lucide-react";
+import { insertGmailReply } from "./extensionBridge";
 import { panelFetchJson, type PanelApiContext } from "./panelApi";
-import { shipmentToLoadEntry, type PanelViewId } from "./panelTypes";
+import { shipmentToLoadEntry, type LiveOpsShipment, type PanelViewId } from "./panelTypes";
 
 interface AllLoadsViewProps {
   shipments: OpsShipment[];
@@ -36,13 +37,28 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
   const [stageFilter, setStageFilter] = useState<string>("All");
   const [equipFilter, setEquipFilter] = useState<string>("All");
   const [noteDrafts, setNoteDrafts] = useState<Record<string, string>>({});
+  const [editSell, setEditSell] = useState<Record<string, number>>({});
+  const [editBuy, setEditBuy] = useState<Record<string, number>>({});
+  const [editPo, setEditPo] = useState<Record<string, string>>({});
 
   const effectiveQuery = (localQuery || universalQuery).trim().toLowerCase();
 
   const filtered = useMemo(() => {
-    return shipments.filter((s) => {
+    return (shipments as LiveOpsShipment[]).filter((s) => {
+      const isCancelled = s.stage === "Cancelled" || /cancel/i.test(String(s.rawStatus || ""));
+      if (stageFilter === "Cancelled") return isCancelled;
+      if (stageFilter === "Needs truck" && (isCancelled || Boolean(s.carrier && s.carrier.trim()) || s.stage !== "Needs truck")) {
+        return false;
+      }
       if (stageFilter === "Missing POD" && !(s.stage === "Delivered" && s.podCount === 0)) return false;
-      if (stageFilter !== "All" && stageFilter !== "Missing POD" && s.stage !== stageFilter) return false;
+      if (
+        stageFilter !== "All" &&
+        stageFilter !== "Missing POD" &&
+        stageFilter !== "Needs truck" &&
+        (isCancelled || s.stage !== stageFilter)
+      ) {
+        return false;
+      }
       if (equipFilter !== "All" && !s.equip.toLowerCase().includes(equipFilter.toLowerCase())) return false;
       if (!effectiveQuery) return true;
       const hay = [
@@ -64,6 +80,47 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
       return hay.includes(effectiveQuery);
     });
   }, [shipments, stageFilter, equipFilter, effectiveQuery]);
+
+  const handleInlineEditSave = async (s: LiveOpsShipment) => {
+    const { ok, data } = await panelFetchJson<{ ok?: boolean; message?: string }>(
+      `/api/loads/${encodeURIComponent(s.id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          sell: editSell[s.id] ?? s.sell,
+          buy: editBuy[s.id] ?? s.buy,
+          po: editPo[s.id] ?? s.po,
+          operationalNote: noteDrafts[s.id] ?? s.operationalNote ?? "",
+          pushToTai: true,
+        }),
+      },
+      apiCtx,
+    );
+    onToast(data.message || `Updated Load #${s.id}`, ok && data.ok !== false ? "ok" : "error");
+    await onRefresh();
+  };
+
+  const handleSendRateCon = async (s: LiveOpsShipment) => {
+    const { ok, data } = await panelFetchJson<{ summaryText?: string }>(
+      `/api/loads/${encodeURIComponent(s.id)}/ratecon`,
+      { method: "GET" },
+      apiCtx,
+    );
+    const text =
+      (ok && data.summaryText) ||
+      `CARRIER RATE CONFIRMATION — Load #${s.id}\nCarrier: ${s.carrier || "TBD"}\nLane: ${s.origin} -> ${s.dest}\nCarrier Pay: $${(s.buy || 0).toLocaleString()}`;
+    const replyRes = await insertGmailReply({
+      text,
+      subject: `Rate Confirmation — Load #${s.id}`,
+    });
+    await panelFetchJson(
+      `/api/loads/${encodeURIComponent(s.id)}/ratecon-status`,
+      { method: "PATCH", body: JSON.stringify({ rateconStatus: "Sent" }) },
+      apiCtx,
+    );
+    onToast(replyRes.message);
+    await onRefresh();
+  };
 
   const saveLoadNote = async (s: OpsShipment) => {
     const note = (noteDrafts[s.id] ?? s.operationalNote ?? "").trim();
@@ -104,6 +161,7 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
             <option value="In transit">In transit</option>
             <option value="Delivered">Delivered</option>
             <option value="Missing POD">Missing POD</option>
+            <option value="Cancelled">Cancelled</option>
           </select>
           <select value={equipFilter} onChange={(e) => setEquipFilter(e.target.value)} className="pf-input text-[11px]">
             <option value="All">Equipment: All</option>
@@ -157,7 +215,7 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
                   {s.origin} → {s.dest}
                 </div>
                 <div className="flex items-center justify-between text-[10px] font-mono pt-0.5" style={{ color: "var(--pf-text-subtle)" }}>
-                  <span>PO: {s.po || "—"} · {s.equip}</span>
+                  <span>PO: {s.po || "—"} · RC: {s.rateconStatus || "Not Sent"}</span>
                   <span style={{ color: "var(--pf-primary)" }}>
                     ${s.sell.toLocaleString()} / ${s.buy.toLocaleString()}
                   </span>
@@ -220,6 +278,30 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
                     ))}
                   </div>
 
+                  {/* Inline Edit PO / Sell / Buy + Note (PATCH /api/loads/:id) */}
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <input
+                      value={editPo[s.id] ?? s.po}
+                      onChange={(e) => setEditPo({ ...editPo, [s.id]: e.target.value })}
+                      placeholder="PO #"
+                      className="pf-input font-mono text-[11px]"
+                    />
+                    <input
+                      type="number"
+                      value={editSell[s.id] ?? s.sell}
+                      onChange={(e) => setEditSell({ ...editSell, [s.id]: Number(e.target.value) || 0 })}
+                      placeholder="Sell $"
+                      className="pf-input font-mono text-[11px]"
+                    />
+                    <input
+                      type="number"
+                      value={editBuy[s.id] ?? s.buy}
+                      onChange={(e) => setEditBuy({ ...editBuy, [s.id]: Number(e.target.value) || 0 })}
+                      placeholder="Buy $"
+                      className="pf-input font-mono text-[11px]"
+                    />
+                  </div>
+
                   {/* Operational Note */}
                   <div className="flex items-center gap-1.5">
                     <input
@@ -230,30 +312,39 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
                     />
                     <button
                       type="button"
-                      onClick={() => void saveLoadNote(s)}
-                      className="px-2 py-1.5 rounded text-[10px] font-semibold inline-flex items-center gap-1 shrink-0"
-                      style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                      onClick={() => void handleInlineEditSave(s)}
+                      className="px-2.5 py-1.5 rounded text-[10px] font-bold inline-flex items-center gap-1 shrink-0"
+                      style={{ background: "#21b975", color: "#07130c" }}
                     >
-                      <Save size={11} /> Save
+                      <Save size={11} /> Save &amp; Sync
                     </button>
                   </div>
 
                   {/* Quick Document & Navigation Actions */}
-                  <div className="grid grid-cols-3 gap-1.5">
+                  <div className="grid grid-cols-4 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void handleSendRateCon(s)}
+                      className="py-1.5 px-1.5 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
+                      style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                    >
+                      <ArrowUpRight size={10} /> Send RC
+                    </button>
+
                     <button
                       type="button"
                       onClick={() => onOpenBol(s.id)}
-                      className="py-1.5 px-2 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
+                      className="py-1.5 px-1.5 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
                       style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
                     >
-                      <FileText size={10} /> BOL PDF
+                      <FileText size={10} /> BOL
                     </button>
 
                     {onUploadPod && (
                       <button
                         type="button"
                         onClick={() => onUploadPod(s.id)}
-                        className="py-1.5 px-2 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
+                        className="py-1.5 px-1.5 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
                         style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
                       >
                         <Upload size={10} /> POD ({s.podCount})
@@ -266,10 +357,10 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
                         onCopyToBuilder(shipmentToLoadEntry(s));
                         onNavigate("build-load");
                       }}
-                      className="py-1.5 px-2 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
+                      className="py-1.5 px-1.5 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
                       style={{ background: "var(--pf-primary-dim)", color: "var(--pf-primary)" }}
                     >
-                      <Copy size={10} /> Clone Load
+                      <Copy size={10} /> Clone
                     </button>
                   </div>
                 </div>

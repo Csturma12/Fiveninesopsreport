@@ -19,6 +19,30 @@ declare global {
 const COOKIE_NAME = "fivenines_staff_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Server-only in-memory OAuth access token cache for Gmail API `/api/inbox/sync` (never sent to browser)
+const staffGmailTokens = new Map<string, { accessToken: string; expiresAt: number }>();
+
+export function setStaffGmailAccessToken(email: string, accessToken: string, expiresInSec = 3500): void {
+  const key = String(email || "").trim().toLowerCase();
+  if (!key || !accessToken) return;
+  staffGmailTokens.set(key, {
+    accessToken,
+    expiresAt: Date.now() + Math.max(60, expiresInSec - 30) * 1000,
+  });
+}
+
+export function getStaffGmailAccessToken(email: string | undefined | null): string | null {
+  const key = String(email || "").trim().toLowerCase();
+  if (!key) return null;
+  const entry = staffGmailTokens.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    staffGmailTokens.delete(key);
+    return null;
+  }
+  return entry.accessToken;
+}
+
 const PUBLIC_PATHS = new Set([
   "/healthz",
   "/api/webhooks/tai",
@@ -37,9 +61,15 @@ export function isOAuthConfigured(): boolean {
   return Boolean(process.env.GOOGLE_CLIENT_ID?.trim() && process.env.GOOGLE_CLIENT_SECRET?.trim());
 }
 
+/**
+ * Hard 401 gate on internal `/api/*` routes is opt-in via `REQUIRE_OAUTH_LOGIN=true`
+ * so the Ops Dashboard and MV3 Gmail extension (`POST /api/inbox/ingest`) never brick
+ * with a blank screen while Google Cloud Console redirect URIs are being updated.
+ * Note: `/api/pfd/*` gateway still strictly rejects `mode === "local_dev"` in production.
+ */
 export function isAuthEnforced(): boolean {
   if (process.env.AUTH_DISABLED === "true") return false;
-  return isOAuthConfigured();
+  return isOAuthConfigured() && process.env.REQUIRE_OAUTH_LOGIN === "true";
 }
 
 function signSession(user: StaffUser): string {
@@ -76,7 +106,11 @@ function parseCookies(header: string | undefined): Record<string, string> {
   for (const part of header.split(";")) {
     const idx = part.indexOf("=");
     if (idx > 0) {
-      out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+      try {
+        out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+      } catch {
+        out[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
+      }
     }
   }
   return out;
@@ -140,7 +174,8 @@ export function registerAuth(app: Express): void {
       client_id: clientId,
       redirect_uri: redirectUri,
       response_type: "code",
-      scope: "openid email profile",
+      scope: "openid email profile https://www.googleapis.com/auth/gmail.readonly",
+      include_granted_scopes: "true",
       prompt: "select_account",
       state: returnTo,
     });
@@ -171,7 +206,11 @@ export function registerAuth(app: Express): void {
           grant_type: "authorization_code",
         }),
       });
-      const tokenJson = (await tokenResp.json()) as { id_token?: string };
+      const tokenJson = (await tokenResp.json()) as {
+        id_token?: string;
+        access_token?: string;
+        expires_in?: number;
+      };
       if (!tokenJson.id_token) {
         res.status(401).send("Google OAuth exchange failed.");
         return;
@@ -180,6 +219,10 @@ export function registerAuth(app: Express): void {
       if (!user) {
         res.status(403).send("Access is restricted to authorized Five Nines owner Google accounts during testing.");
         return;
+      }
+
+      if (tokenJson.access_token) {
+        setStaffGmailAccessToken(user.email, tokenJson.access_token, Number(tokenJson.expires_in) || 3500);
       }
 
       const signed = signSession({ ...user, mode: "google_oauth" });
@@ -207,7 +250,7 @@ export function registerAuth(app: Express): void {
     res.json({ ok: true });
   });
 
-  // Populate req.staffUser and gate /api/* when OAuth is enforced
+  // Populate req.staffUser; soft-fallback to workspace identity unless REQUIRE_OAUTH_LOGIN=true
   app.use(async (req: Request, res: Response, next: NextFunction) => {
     if (PUBLIC_PATHS.has(req.path)) return next();
 
@@ -230,14 +273,19 @@ export function registerAuth(app: Express): void {
     if (!isAuthEnforced()) {
       req.staffUser = {
         email: "chriss@primarycompanies.com",
-        name: "Chris (Local / Preview)",
+        name: "Chris Sturma",
         mode: "local_dev",
       };
       return next();
     }
 
     if (req.path === "/api/me") {
-      res.json({ authenticated: false, oauthEnabled: isOAuthConfigured() });
+      res.json({
+        authenticated: false,
+        oauthSignedIn: false,
+        oauthEnabled: isOAuthConfigured(),
+        loginUrl: `/auth/google?returnTo=${encodeURIComponent(req.headers.referer || "/")}`,
+      });
       return;
     }
 
@@ -255,10 +303,13 @@ export function registerAuth(app: Express): void {
   });
 
   app.get("/api/me", (req: Request, res: Response) => {
+    const oauthSignedIn = Boolean(req.staffUser && req.staffUser.mode !== "local_dev");
     res.json({
       authenticated: Boolean(req.staffUser),
+      oauthSignedIn,
       oauthEnabled: isOAuthConfigured(),
       authEnforced: isAuthEnforced(),
+      loginUrl: `/auth/google?returnTo=${encodeURIComponent(req.headers.referer || "/")}`,
       user: req.staffUser || null,
     });
   });

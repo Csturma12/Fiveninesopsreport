@@ -9,6 +9,7 @@ import {
   ExternalLink,
   FileSpreadsheet,
   FileText,
+  Inbox,
   LayoutGrid,
   Mail,
   MessageSquare,
@@ -23,6 +24,7 @@ import type { PanelViewId } from "./panelTypes";
 interface HomeLauncherViewProps {
   onNavigate: (view: PanelViewId) => void;
   attentionCount: number;
+  inboxCount?: number;
   shipments: OpsShipment[];
   customers: CustomerOption[];
   facilities: SavedFacility[];
@@ -36,12 +38,15 @@ interface LauncherCardItem {
   subtitle: string;
   icon: LucideIcon;
   isAttention?: boolean;
+  badgeCount?: number;
+  badgeColor?: string;
   onClick: (e: React.MouseEvent) => void;
 }
 
 export const HomeLauncherView: React.FC<HomeLauncherViewProps> = ({
   onNavigate,
   attentionCount,
+  inboxCount = 0,
   shipments,
   customers,
   facilities,
@@ -54,6 +59,15 @@ export const HomeLauncherView: React.FC<HomeLauncherViewProps> = ({
   const addressesTotal = kpis?.facilitiesCount ?? facilities.length;
 
   const workQueues: LauncherCardItem[] = [
+    {
+      id: "inbox",
+      title: "Inbox",
+      subtitle: "Live Gmail stream via extension",
+      icon: Inbox,
+      badgeCount: inboxCount,
+      badgeColor: "#66d9a2",
+      onClick: () => onNavigate("inbox"),
+    },
     {
       id: "attention",
       title: "Attention",
@@ -199,10 +213,10 @@ export const HomeLauncherView: React.FC<HomeLauncherViewProps> = ({
               key={card.id}
               type="button"
               onClick={card.onClick}
-              className="p-3.5 rounded-2xl text-left flex flex-col justify-between gap-3 transition-all hover:brightness-110"
+              className="p-3.5 rounded-2xl text-left flex flex-col justify-between gap-3 transition-all hover:border-[#1768b2] hover:brightness-110"
               style={{
-                background: "#131820",
-                border: "1px solid #222936",
+                background: "#13171d",
+                border: "1px solid #222933",
               }}
             >
               <div className="flex items-start justify-between gap-2 w-full">
@@ -210,8 +224,8 @@ export const HomeLauncherView: React.FC<HomeLauncherViewProps> = ({
                   className="w-9 h-9 rounded-xl flex items-center justify-center shrink-0"
                   style={
                     card.isAttention
-                      ? { background: "rgba(220, 68, 70, 0.14)", color: "#e24b4a" }
-                      : { background: "#1b222d", color: "#b8c1cf" }
+                      ? { background: "rgba(255, 82, 90, 0.15)", color: "#ff525a" }
+                      : { background: "#191f28", color: "#c1d1e0" }
                   }
                 >
                   <Icon size={17} strokeWidth={1.9} />
@@ -221,16 +235,24 @@ export const HomeLauncherView: React.FC<HomeLauncherViewProps> = ({
                   <span
                     id="nav-attention-badge"
                     className="px-2.5 py-0.5 rounded-full text-[11px] font-bold"
-                    style={{ background: "#dc4446", color: "#ffffff" }}
+                    style={{ background: "#d42f34", color: "#ffffff" }}
                   >
                     {attentionCount}
+                  </span>
+                )}
+                {!card.isAttention && typeof card.badgeCount === "number" && card.badgeCount > 0 && (
+                  <span
+                    className="px-2.5 py-0.5 rounded-full text-[11px] font-bold"
+                    style={{ background: "rgba(33, 185, 117, 0.16)", color: card.badgeColor || "#66d9a2" }}
+                  >
+                    {card.badgeCount}
                   </span>
                 )}
               </div>
 
               <div className="space-y-0.5 min-w-0">
                 <div className="text-[14px] font-bold text-white truncate">{card.title}</div>
-                <div className="text-[12px] leading-snug truncate" style={{ color: "#7d8797" }}>
+                <div className="text-[12px] leading-snug truncate" style={{ color: "#94a3b8" }}>
                   {card.subtitle}
                 </div>
               </div>
@@ -252,24 +274,26 @@ export const HomeLauncherView: React.FC<HomeLauncherViewProps> = ({
       <div className="grid grid-cols-2 gap-2.5 pt-1">
         <div
           className="p-3.5 rounded-2xl space-y-1.5"
-          style={{ background: "#131820", border: "1px solid #222936" }}
+          style={{ background: "#13171d", border: "1px solid #222933" }}
         >
           <div
             className="text-[10.5px] font-semibold uppercase tracking-[0.07em]"
-            style={{ color: "#7d8797" }}
+            style={{ color: "#94a3b8" }}
           >
             PICKED UP THIS WEEK
           </div>
-          <div className="text-[22px] font-bold text-white leading-none">{pickedUpWeek}</div>
+          <div className="text-[22px] font-bold leading-none" style={{ color: "#66d9a2" }}>
+            {pickedUpWeek}
+          </div>
         </div>
 
         <div
           className="p-3.5 rounded-2xl space-y-1.5"
-          style={{ background: "#131820", border: "1px solid #222936" }}
+          style={{ background: "#13171d", border: "1px solid #222933" }}
         >
           <div
             className="text-[10.5px] font-semibold uppercase tracking-[0.07em]"
-            style={{ color: "#7d8797" }}
+            style={{ color: "#94a3b8" }}
           >
             DELIVERED THIS WEEK
           </div>
@@ -278,7 +302,7 @@ export const HomeLauncherView: React.FC<HomeLauncherViewProps> = ({
       </div>
 
       {/* Subtle Directory Counts Footer */}
-      <div className="text-center text-xs pt-0.5" style={{ color: "#6e7787" }}>
+      <div className="text-center text-xs pt-0.5" style={{ color: "#64748b" }}>
         {customersTotal.toLocaleString()} customers · {addressesTotal.toLocaleString()} addresses
       </div>
     </div>

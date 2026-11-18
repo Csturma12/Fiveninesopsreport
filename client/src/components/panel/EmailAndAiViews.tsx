@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from "react";
 import type { CrucialEmailItem, OpsShipment } from "@shared/tai-webhook-schema";
-import { AlertOctagon, CheckCircle2, ExternalLink, PlusCircle, Reply, Search, Settings2, Sparkles } from "lucide-react";
+import { AlertOctagon, CheckCircle2, ExternalLink, PlusCircle, RefreshCw, Reply, Search, Settings2, Sparkles } from "lucide-react";
 import {
   captureGmailThread,
   getPanelPref,
   insertGmailReply,
+  openEmailInGmail,
   setPanelPref,
   type ApTaskConfigPref,
   type CapturedGmailThread,
@@ -340,20 +341,65 @@ export const CheckEmailView: React.FC<CheckEmailViewProps> = ({
 
 interface AiAssistantViewProps {
   chatHistory: Array<{ role: "user" | "assistant"; text: string }>;
-  onAskAi: (question: string) => Promise<void>;
+  onAskAi: (question: string, activeEmail?: { subject?: string; from?: string; body?: string } | null) => Promise<void>;
+  liveThread?: CapturedGmailThread | null;
+  crucialEmails?: CrucialEmailItem[];
+  onThreadCaptured?: (thread: CapturedGmailThread) => void;
   onToast: (msg: string, kind?: "ok" | "error") => void;
 }
 
-export const AiAssistantView: React.FC<AiAssistantViewProps> = ({ chatHistory, onAskAi, onToast }) => {
+export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
+  chatHistory,
+  onAskAi,
+  liveThread = null,
+  crucialEmails = [],
+  onThreadCaptured,
+  onToast,
+}) => {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [contextMode, setContextMode] = useState<"all-loads" | "active-email">("all-loads");
+  const [capturing, setCapturing] = useState(false);
+
+  const activeEmailContext =
+    contextMode === "active-email"
+      ? liveThread && (liveThread.subject || liveThread.bodyText)
+        ? {
+            subject: liveThread.subject,
+            from: liveThread.sender,
+            body: liveThread.bodyText,
+          }
+        : crucialEmails[0]
+        ? {
+            subject: crucialEmails[0].subject,
+            from: crucialEmails[0].from,
+            body: crucialEmails[0].fullBody || crucialEmails[0].body,
+          }
+        : null
+      : null;
+
+  const handleCaptureEmailForAi = async () => {
+    setCapturing(true);
+    try {
+      const cap = await captureGmailThread();
+      if (cap.ok && cap.thread) {
+        onThreadCaptured?.(cap.thread);
+        setContextMode("active-email");
+        onToast(`Attached open Gmail thread: "${cap.thread.subject}"`);
+      } else {
+        onToast(cap.error || "Open a Gmail thread first, or ask across All Live TAI Loads.", "error");
+      }
+    } finally {
+      setCapturing(false);
+    }
+  };
 
   const ask = async (q: string) => {
     const trimmed = q.trim();
     if (!trimmed) return;
     setSending(true);
     try {
-      await onAskAi(trimmed);
+      await onAskAi(trimmed, activeEmailContext);
     } finally {
       setSending(false);
     }
@@ -361,19 +407,59 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({ chatHistory, o
 
   return (
     <div className="flex flex-col min-h-[calc(100vh-110px)] justify-between gap-4">
-      <div className="space-y-4">
-        <div>
-          <h1 className="text-[20px] font-bold text-white tracking-tight">AI Assistant</h1>
-          <p className="text-xs mt-0.5" style={{ color: "#8b95a5" }}>
-            Ask about loads, carriers, and coverage
-          </p>
+      <div className="space-y-3.5">
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <h1 className="text-[20px] font-bold text-white tracking-tight">AI Assistant</h1>
+            <p className="text-xs mt-0.5" style={{ color: "#8b95a5" }}>
+              Grounded on live shipments, 5,000+ TAI carriers &amp; lane history
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={capturing}
+            onClick={() => void handleCaptureEmailForAi()}
+            className="px-2.5 py-1 rounded-xl text-[10.5px] font-semibold inline-flex items-center gap-1 shrink-0"
+            style={{ background: "#161c26", border: "1px solid #262f3d", color: "#21b975" }}
+          >
+            <RefreshCw size={10} className={capturing ? "animate-spin" : ""} /> ↻ Capture Open Email
+          </button>
+        </div>
+
+        {/* Dynamic Context Selector Pill: All Live TAI Loads vs Active Gmail Thread */}
+        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+          <button
+            type="button"
+            onClick={() => setContextMode("all-loads")}
+            className="px-3 py-1 rounded-full font-semibold transition-colors"
+            style={
+              contextMode === "all-loads"
+                ? { background: "rgba(56,201,118,0.16)", color: "#21b975", border: "1px solid rgba(56,201,118,0.5)" }
+                : { background: "#131820", color: "#8b95a5", border: "1px solid #222936" }
+            }
+          >
+            All Live TAI Loads
+          </button>
+          <button
+            type="button"
+            onClick={() => setContextMode("active-email")}
+            className="px-3 py-1 rounded-full font-semibold transition-colors truncate max-w-[210px]"
+            style={
+              contextMode === "active-email"
+                ? { background: "rgba(56,201,118,0.16)", color: "#21b975", border: "1px solid rgba(56,201,118,0.5)" }
+                : { background: "#131820", color: "#8b95a5", border: "1px solid #222936" }
+            }
+          >
+            Active Gmail Thread{liveThread?.subject ? `: ${liveThread.subject}` : ""}
+          </button>
         </div>
 
         <div className="flex flex-wrap gap-1.5">
           {[
-            "Top PA→GA flatbed lane runners?",
-            "Check status on load 132738007",
-            "Any coverage issues this week?",
+            "Do we have any uncovered shipments for customer IMC Logistics?",
+            "Top historical lane runners for PA → GA flatbed?",
+            "Is carrier Just Drive Transport set up in TAI?",
+            "Which uncovered loads pick up first?",
           ].map((chip) => (
             <button
               key={chip}
@@ -414,7 +500,7 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({ chatHistory, o
                       onToast(res.message, res.ok ? "ok" : "error");
                     }}
                     className="inline-flex items-center gap-0.5 text-[10px] hover:underline"
-                    style={{ color: "#38c976" }}
+                    style={{ color: "#21b975" }}
                   >
                     <Reply size={10} /> Insert
                   </button>
@@ -459,7 +545,7 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({ chatHistory, o
             void ask(q);
           }}
           className="w-10 h-10 rounded-xl flex items-center justify-center font-bold text-base shrink-0 disabled:opacity-50 transition-opacity"
-          style={{ background: "#38c976", color: "#07130c" }}
+          style={{ background: "#21b975", color: "#07130c" }}
           aria-label="Send message"
         >
           →
@@ -592,15 +678,14 @@ export const ApEmailsView: React.FC<ApEmailsViewProps> = ({
             >
               <Settings2 size={10} /> Rules
             </button>
-            <a
-              href={`https://mail.google.com/mail/u/0/#search/${encodeURIComponent(filterQuery)}`}
-              target="_blank"
-              rel="noreferrer"
+            <button
+              type="button"
+              onClick={() => void openEmailInGmail({ query: filterQuery })}
               className="px-2 py-1 rounded text-[10px] font-semibold inline-flex items-center gap-1"
               style={{ background: "var(--pf-info-dim)", color: "var(--pf-info)" }}
             >
               <ExternalLink size={10} /> Open in Gmail
-            </a>
+            </button>
           </div>
         </div>
 

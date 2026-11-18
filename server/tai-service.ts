@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { extractContainerNumbers, sameContainerNumber } from "../shared/container-extractor";
 import {
   buildTaiShipmentRequest,
   extractTaiShipmentId,
@@ -11,19 +12,27 @@ import {
   type TaiValidationIssue,
 } from "../shared/load-entry";
 import {
+  deriveRateconStatus,
   extractDateShort,
   mapTaiStatusToStage,
   type CarrierOption,
   type CustomerOption,
   type DispatchStage,
   type OpsShipment,
+  type RateconStatus,
   type SavedFacility,
   type TaiInvoiceWebhookPayload,
   type TaiShipmentWebhookPayload,
 } from "../shared/tai-webhook-schema";
 import { broadcastOpsEvent } from "./events";
 import { isPfdGatewayConfigured } from "./pfd-gateway";
-import { store } from "./store";
+import {
+  mapSupabaseShipmentRow,
+  normalizeCompanyIdentity,
+  PLACEHOLDER_CUSTOMER_NAMES,
+  SHIPMENT_SELECT_COLS,
+  store,
+} from "./store";
 import {
   haltTaiOnAuthFailure,
   isTaiAuthFailureStatus,
@@ -1579,9 +1588,10 @@ export async function pushShipmentCheckCall(
     params.stage === "Needs truck" ||
     params.stage === "Assigned" ||
     params.stage === "In transit" ||
-    params.stage === "Delivered"
+    params.stage === "Delivered" ||
+    params.stage === "Cancelled"
       ? params.stage
-      : mapTaiStatusToStage(taiStatus);
+      : mapTaiStatusToStage(taiStatus, s.carrier);
 
   const locText = String(params.location || "").trim();
   const noteText = String(params.operationalNote ?? params.note ?? "").trim();
@@ -2263,8 +2273,11 @@ export function handleTaiShipmentWebhook(
   teeWebhookIfConfigured("/api/webhooks/tai/shipment", payload, headers);
 
   let target = store.shipments.find((s) => s.id === id);
-  const stage = payload.status ? mapTaiStatusToStage(payload.status) : target?.stage || "Needs truck";
   const topCarrier = payload.carrierList?.[0];
+  const effectiveCarrier = topCarrier?.name || target?.carrier || "";
+  const stage = payload.status
+    ? mapTaiStatusToStage(payload.status, effectiveCarrier)
+    : target?.stage || mapTaiStatusToStage("Committed", effectiveCarrier);
   const poRef = payload.shipmentReferenceNumbers?.find(
     (r) => (r.referenceType || "").toLowerCase() === "customer po number",
   )?.value;
@@ -2517,5 +2530,1225 @@ export function handleTaiInvoiceWebhook(
     paymentStatus,
     lineItems,
     observedAccessorials: getObservedInvoiceAccessorials(),
+  };
+}
+
+export interface EditShipmentInput {
+  customer?: string;
+  customerName?: string;
+  status?: string;
+  rawStatus?: string;
+  shipDate?: string;
+  delivDate?: string;
+  deliveryDate?: string;
+  originCity?: string;
+  fromCity?: string;
+  originState?: string;
+  fromState?: string;
+  originZip?: string;
+  destCity?: string;
+  toCity?: string;
+  destState?: string;
+  toState?: string;
+  destZip?: string;
+  carrier?: string;
+  carrierName?: string;
+  mc?: string;
+  carrierMasterId?: number | string;
+  buy?: number | string;
+  buyRate?: number | string;
+  sell?: number | string;
+  sellRate?: number | string;
+  po?: string;
+  customerPO?: string;
+  bol?: string;
+  bolNumber?: string;
+  shipperReference?: string;
+  pro?: string;
+  carrierProNumber?: string;
+  equip?: string;
+  equipmentType?: string;
+  rateconStatus?: RateconStatus | string;
+  operationalNote?: string;
+  note?: string;
+  notes?: string;
+  currentLocation?: string;
+  location?: string;
+  driverPhone?: string;
+  trailerNumber?: string;
+  pushToTai?: boolean;
+}
+
+export interface EditShipmentHelperOptions extends DirectTaiHelperOptions {
+  billingWriteEnabled?: boolean;
+}
+
+async function findOrHydrateShipment(shipmentId: string): Promise<OpsShipment | null> {
+  const id = String(shipmentId || "").trim();
+  if (!id) return null;
+  const inMemory = store.shipments.find((s) => s.id === id);
+  if (inMemory) return inMemory;
+
+  const sb = store.getSupabase();
+  if (sb && store.supabaseConnected) {
+    const { data } = await sb
+      .from("shipments")
+      .select(SHIPMENT_SELECT_COLS)
+      .eq("shipment_id", id)
+      .maybeSingle();
+    if (data) {
+      const mapped = mapSupabaseShipmentRow(data as Record<string, unknown>, undefined, store.facilities);
+      store.shipments.unshift(mapped);
+      return mapped;
+    }
+  }
+  return null;
+}
+
+export async function updateShipmentRateconStatus(
+  shipmentId: string,
+  rawRateconStatus: unknown,
+  actor = "ops-desk",
+) {
+  const s = await findOrHydrateShipment(shipmentId);
+  if (!s) {
+    return { ok: false, status: 404, message: `Shipment #${shipmentId} not found` };
+  }
+
+  const trimmed = String(rawRateconStatus ?? "").trim();
+  const nextStatus: RateconStatus = trimmed
+    ? deriveRateconStatus({ ratecon_status: trimmed })
+    : deriveRateconStatus({ tai_raw_status: s.taiRawStatus, status: s.rawStatus });
+
+  s.rateconStatus = nextStatus;
+  s.writebackState = `RateCon marked ${nextStatus} by ${actor}`;
+
+  const sb = store.getSupabase();
+  if (sb && !store.isSafeSandbox) {
+    try {
+      await sb
+        .from("shipments")
+        .update({
+          ratecon_status: trimmed ? nextStatus : "",
+          ratecon_source: trimmed ? "manual" : "",
+          ratecon_updated_at: new Date().toISOString(),
+          ratecon_updated_by: actor,
+        })
+        .eq("shipment_id", s.id);
+    } catch {
+      // non-fatal
+    }
+  }
+
+  broadcastOpsEvent("shipment_updated", { shipmentId: s.id });
+  return {
+    ok: true,
+    status: 200,
+    shipment: s,
+    rateconStatus: s.rateconStatus,
+    message: `Updated RateCon status on #${s.id} to ${s.rateconStatus}`,
+  };
+}
+
+/**
+ * Full Edit Shipment handler (`PATCH /api/loads/:id` & `PUT /api/loads/:id`):
+ * updates `store.shipments` + Supabase `public.shipments`, and when `pushToTai !== false`
+ * on a numeric TAI `shipmentId`, executes guarded TAI v2 write-backs for changed sell,
+ * carrier/buy, references, and tracking/dates.
+ */
+export async function updateShipmentFull(
+  shipmentId: string,
+  patch: EditShipmentInput,
+  options: EditShipmentHelperOptions = {},
+) {
+  const s = await findOrHydrateShipment(shipmentId);
+  if (!s) {
+    return { ok: false, status: 404, message: `Shipment #${shipmentId} not found` };
+  }
+
+  const prev = {
+    sell: s.sell,
+    buy: s.buy,
+    carrier: s.carrier,
+    po: s.po,
+    bol: s.bol,
+    pro: s.pro,
+    rawStatus: s.rawStatus,
+    shipDateIso: s.shipDateIso || s.stops[0]?.readyDate || "",
+    delivDateIso: s.delivDateIso || s.stops[s.stops.length - 1]?.readyDate || "",
+  };
+
+  const nextCustomer = patch.customer ?? patch.customerName;
+  if (nextCustomer !== undefined && String(nextCustomer).trim()) {
+    s.customer = String(nextCustomer).trim();
+  }
+
+  const nextCarrier = patch.carrier ?? patch.carrierName;
+  if (nextCarrier !== undefined) {
+    s.carrier = String(nextCarrier).trim();
+    const matchedCarr = store.carriers.find(
+      (c) => normalizeCompanyIdentity(c.name) === normalizeCompanyIdentity(s.carrier),
+    );
+    if (patch.mc !== undefined) s.mc = String(patch.mc).trim();
+    else if (matchedCarr?.mc) s.mc = matchedCarr.mc;
+  } else if (patch.mc !== undefined) {
+    s.mc = String(patch.mc).trim();
+  }
+
+  const nextBuy = patch.buy ?? patch.buyRate;
+  if (nextBuy !== undefined && nextBuy !== "") {
+    s.buy = Math.max(0, Number(nextBuy) || 0);
+  }
+  const nextSell = patch.sell ?? patch.sellRate;
+  if (nextSell !== undefined && nextSell !== "") {
+    s.sell = Math.max(0, Number(nextSell) || 0);
+    if (s.sell >= s.buy) delete s.mismatchNote;
+  }
+
+  const nextPo = patch.po ?? patch.customerPO;
+  if (nextPo !== undefined) s.po = String(nextPo).trim();
+  const nextBol = patch.bol ?? patch.bolNumber ?? patch.shipperReference;
+  if (nextBol !== undefined) s.bol = String(nextBol).trim();
+  const nextPro = patch.pro ?? patch.carrierProNumber;
+  if (nextPro !== undefined) s.pro = String(nextPro).trim();
+
+  const nextEquip = patch.equip ?? patch.equipmentType;
+  if (nextEquip !== undefined && String(nextEquip).trim()) {
+    s.equip = String(nextEquip).trim();
+  }
+
+  const nextShipIso = patch.shipDate !== undefined ? String(patch.shipDate).trim().slice(0, 10) : undefined;
+  if (nextShipIso !== undefined) {
+    s.shipDateIso = nextShipIso || undefined;
+    s.shipDate = nextShipIso ? extractDateShort(nextShipIso) : "";
+    if (s.stops[0] && nextShipIso) s.stops[0].readyDate = nextShipIso;
+  }
+
+  const rawDelivInput = patch.delivDate ?? patch.deliveryDate;
+  const nextDelivIso = rawDelivInput !== undefined ? String(rawDelivInput).trim().slice(0, 10) : undefined;
+  if (nextDelivIso !== undefined) {
+    s.delivDateIso = nextDelivIso || undefined;
+    s.delivDate = nextDelivIso ? extractDateShort(nextDelivIso) : "";
+    if (s.stops.length > 0 && nextDelivIso) s.stops[s.stops.length - 1].readyDate = nextDelivIso;
+  }
+
+  const origCity = patch.originCity ?? patch.fromCity;
+  const origState = patch.originState ?? patch.fromState;
+  if (origCity !== undefined || origState !== undefined || patch.originZip !== undefined) {
+    const first = s.stops[0];
+    if (first) {
+      if (origCity !== undefined) first.city = String(origCity).trim();
+      if (origState !== undefined) first.state = String(origState).trim().toUpperCase();
+      if (patch.originZip !== undefined) first.zipCode = String(patch.originZip).trim();
+      s.origin = `${first.city}${first.state ? `, ${first.state}` : ""}${first.zipCode ? ` ${first.zipCode}` : ""}`.trim();
+    } else {
+      s.origin = `${origCity ?? ""}${origState ? `, ${String(origState).toUpperCase()}` : ""}`.trim();
+    }
+  }
+
+  const destCity = patch.destCity ?? patch.toCity;
+  const destState = patch.destState ?? patch.toState;
+  if (destCity !== undefined || destState !== undefined || patch.destZip !== undefined) {
+    const last = s.stops[s.stops.length - 1];
+    if (last && s.stops.length >= 2) {
+      if (destCity !== undefined) last.city = String(destCity).trim();
+      if (destState !== undefined) last.state = String(destState).trim().toUpperCase();
+      if (patch.destZip !== undefined) last.zipCode = String(patch.destZip).trim();
+      s.dest = `${last.city}${last.state ? `, ${last.state}` : ""}${last.zipCode ? ` ${last.zipCode}` : ""}`.trim();
+    } else {
+      s.dest = `${destCity ?? ""}${destState ? `, ${String(destState).toUpperCase()}` : ""}`.trim();
+    }
+  }
+
+  const nextStatus = patch.status ?? patch.rawStatus;
+  if (nextStatus !== undefined && String(nextStatus).trim()) {
+    s.rawStatus = String(nextStatus).trim();
+    s.taiRawStatus = normalizeTaiTrackingStatus(s.rawStatus);
+  }
+  s.stage = mapTaiStatusToStage(s.taiRawStatus || s.rawStatus, s.carrier);
+
+  if (patch.rateconStatus !== undefined) {
+    s.rateconStatus = deriveRateconStatus({ ratecon_status: patch.rateconStatus });
+  }
+
+  const nextNote = patch.operationalNote ?? patch.note ?? patch.notes;
+  if (nextNote !== undefined) {
+    s.operationalNote = String(nextNote).trim();
+  }
+
+  const nextLoc = patch.currentLocation ?? patch.location;
+  if (nextLoc !== undefined) {
+    const locTrimmed = String(nextLoc).trim();
+    s.currentLocation = locTrimmed;
+    if (locTrimmed) s.location = locTrimmed;
+  }
+
+  if (patch.driverPhone !== undefined) s.driverPhone = String(patch.driverPhone).trim();
+  if (patch.trailerNumber !== undefined) s.trailerNumber = String(patch.trailerNumber).trim();
+
+  // Persist to Supabase `shipments` when configured
+  const sb = options.supabaseClient !== undefined ? options.supabaseClient : store.getSupabase();
+  if (sb && !store.isSafeSandbox) {
+    const dbPatch: Record<string, unknown> = {
+      customer_name: s.customer,
+      status: s.rawStatus,
+      tai_raw_status: s.taiRawStatus || s.rawStatus,
+      carrier_name: s.carrier,
+      buy: s.buy,
+      sell: s.sell,
+      margin: s.sell - s.buy,
+      customer_po: s.po,
+      shipper_reference: s.bol,
+      carrier_pro_number: s.pro,
+      equipment_type: s.equip,
+      ratecon_status: s.rateconStatus,
+      updated_at: new Date().toISOString(),
+    };
+    if (s.shipDateIso !== undefined) dbPatch.ship_date = s.shipDateIso;
+    if (s.delivDateIso !== undefined) dbPatch.delivery_date = s.delivDateIso;
+    if (s.stops[0]?.city) dbPatch.from_city = s.stops[0].city.toUpperCase();
+    if (s.stops[0]?.state) dbPatch.from_state = s.stops[0].state.toUpperCase();
+    if (s.stops[s.stops.length - 1]?.city) dbPatch.to_city = s.stops[s.stops.length - 1].city.toUpperCase();
+    if (s.stops[s.stops.length - 1]?.state) dbPatch.to_state = s.stops[s.stops.length - 1].state.toUpperCase();
+    if (s.operationalNote !== undefined) dbPatch.notes = s.operationalNote;
+    if (s.currentLocation !== undefined) dbPatch.current_location = s.currentLocation;
+    if (s.driverPhone !== undefined) dbPatch.driver_phone = s.driverPhone;
+    if (s.trailerNumber !== undefined) dbPatch.trailer_number = s.trailerNumber;
+
+    try {
+      await sb.from("shipments").update(dbPatch).eq("shipment_id", s.id);
+    } catch {
+      // non-fatal
+    }
+  }
+
+  const pushToTai = patch.pushToTai !== false;
+  const sellChanged = s.sell !== prev.sell && s.sell > 0;
+  const carrierOrBuyChanged =
+    (s.carrier !== prev.carrier || s.buy !== prev.buy) && (Boolean(s.carrier) || s.buy > 0);
+  const refsChanged = s.po !== prev.po || s.bol !== prev.bol || s.pro !== prev.pro;
+  const trackingChanged =
+    s.rawStatus !== prev.rawStatus ||
+    (s.shipDateIso || "") !== prev.shipDateIso ||
+    (s.delivDateIso || "") !== prev.delivDateIso;
+
+  const cred = options.credential !== undefined ? taiApiKey(options.credential) : taiApiKey();
+  const liveAllowed =
+    options.liveAllowed !== undefined ? Boolean(options.liveAllowed && cred) : Boolean(!store.isSafeSandbox && cred);
+  const billingWriteEnabled =
+    options.billingWriteEnabled !== undefined
+      ? options.billingWriteEnabled
+      : process.env.BILLING_TAI_WRITE_ENABLED !== "false";
+  const writebackEnabled =
+    options.writebackEnabled !== undefined
+      ? options.writebackEnabled
+      : process.env.TAI_WRITEBACK_ENABLED !== "false";
+  const doFetch = options.fetchImpl ?? fetch;
+  const taiBase = resolveTaiBaseUrl(options.baseUrl);
+  const auditSb = sb as unknown as SupabaseInsertLike | null;
+  const liveInsertAudit = options.liveInsertAudit ?? Boolean(liveAllowed && auditSb);
+
+  const taiWriteback: {
+    attempted: boolean;
+    sellCharges?: { ok: boolean; status?: number | null; message: string };
+    carrierCharges?: { ok: boolean; status?: number | null; message: string };
+    references?: { ok: boolean; status?: number | null; message: string };
+    tracking?: { ok: boolean; status?: number | null; message: string };
+  } = { attempted: false };
+
+  if (pushToTai && liveAllowed && isNumericTaiShipmentId(s.id) && !isTaiAuthHalted(cred)) {
+    const reqHeaders = {
+      "x-api-key": cred,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    };
+
+    // 1. Sell Charges write-back
+    if (sellChanged && billingWriteEnabled && !isTaiAuthHalted(cred)) {
+      taiWriteback.attempted = true;
+      const sellPayload = {
+        referenceNumbers: [{ referenceType: "Shipment Id", value: String(s.id) }],
+        transitType: "Linehaul",
+        charges: [{ chargeType: "Linehaul", price: s.sell, calculationType: "Flat" }],
+      };
+      try {
+        const resp = await doFetch(`${taiBase}${TAI_SHIPMENT_CHARGES_PATH}`, {
+          method: "PUT",
+          headers: reqHeaders,
+          body: JSON.stringify(sellPayload),
+          signal: AbortSignal.timeout(25_000),
+        });
+        const txt = await resp.text();
+        if (isTaiAuthFailureStatus(resp.status)) {
+          haltTaiOnAuthFailure(cred, `TAI HTTP ${resp.status} on PUT /ShipmentCharges`);
+        }
+        taiWriteback.sellCharges = {
+          ok: resp.ok,
+          status: resp.status,
+          message: resp.ok
+            ? `Pushed $${s.sell.toLocaleString()} sell to TAI`
+            : `TAI ShipmentCharges HTTP ${resp.status}`,
+        };
+        void recordTaiPush({
+          shipmentId: s.id,
+          kind: "sell_charges",
+          method: "PUT",
+          endpoint: TAI_SHIPMENT_CHARGES_PATH,
+          requestHeaders: reqHeaders,
+          requestPayload: sellPayload,
+          responseStatus: resp.status,
+          responseBody: txt,
+          ok: resp.ok,
+          needsHuman: !resp.ok,
+          errorMessage: resp.ok ? null : taiWriteback.sellCharges.message,
+          actor: options.actor ?? null,
+          supabaseClient: auditSb,
+          liveInsert: liveInsertAudit,
+          redactValues: [cred],
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        taiWriteback.sellCharges = { ok: false, status: null, message: msg };
+        void recordTaiPush({
+          shipmentId: s.id,
+          kind: "sell_charges",
+          method: "PUT",
+          endpoint: TAI_SHIPMENT_CHARGES_PATH,
+          requestHeaders: reqHeaders,
+          requestPayload: sellPayload,
+          responseStatus: null,
+          ok: false,
+          needsHuman: true,
+          errorMessage: msg,
+          actor: options.actor ?? null,
+          supabaseClient: auditSb,
+          liveInsert: liveInsertAudit,
+          redactValues: [cred],
+        });
+      }
+    }
+
+    // 2. Carrier & Buy Rate write-back
+    if (carrierOrBuyChanged && writebackEnabled && !isTaiAuthHalted(cred)) {
+      taiWriteback.attempted = true;
+      const matchedCarrier = store.carriers.find(
+        (c) => normalizeCompanyIdentity(c.name) === normalizeCompanyIdentity(s.carrier),
+      );
+      const explicitMaster = parsePositiveInt(patch.carrierMasterId ?? matchedCarrier?.taiMasterId);
+
+      if (options.fetchImpl || (!sb && explicitMaster)) {
+        if (explicitMaster && s.buy > 0) {
+          const buyPayload = {
+            referenceNumbers: [{ referenceType: "Shipment Id", value: String(s.id) }],
+            transitType: "Linehaul",
+            charges: [{ chargeType: "Linehaul", price: s.buy, calculationType: "Flat" }],
+            carrierMasterId: explicitMaster,
+          };
+          try {
+            const resp = await doFetch(`${taiBase}${TAI_CARRIER_CHARGES_PATH}`, {
+              method: "PUT",
+              headers: reqHeaders,
+              body: JSON.stringify(buyPayload),
+              signal: AbortSignal.timeout(25_000),
+            });
+            const txt = await resp.text();
+            if (isTaiAuthFailureStatus(resp.status)) {
+              haltTaiOnAuthFailure(cred, `TAI HTTP ${resp.status} on PUT /CarrierCharges`);
+            }
+            taiWriteback.carrierCharges = {
+              ok: resp.ok,
+              status: resp.status,
+              message: resp.ok
+                ? `Pushed ${s.carrier} ($${s.buy.toLocaleString()} buy, Master #${explicitMaster}) to TAI`
+                : `TAI CarrierCharges HTTP ${resp.status}`,
+            };
+            void recordTaiPush({
+              shipmentId: s.id,
+              kind: "carrier_charges",
+              method: "PUT",
+              endpoint: TAI_CARRIER_CHARGES_PATH,
+              requestHeaders: reqHeaders,
+              requestPayload: buyPayload,
+              responseStatus: resp.status,
+              responseBody: txt,
+              ok: resp.ok,
+              needsHuman: !resp.ok,
+              errorMessage: resp.ok ? null : taiWriteback.carrierCharges.message,
+              actor: options.actor ?? null,
+              supabaseClient: auditSb,
+              liveInsert: liveInsertAudit,
+              redactValues: [cred],
+            });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            taiWriteback.carrierCharges = { ok: false, status: null, message: msg };
+          }
+        } else {
+          taiWriteback.carrierCharges = {
+            ok: false,
+            status: 409,
+            message: `Carrier master ID unavailable or zero buy rate for "${s.carrier}"`,
+          };
+        }
+      } else if (s.carrier) {
+        const queued = await enqueueCarrierWriteback({
+          shipmentId: s.id,
+          carrierName: s.carrier,
+          buyRate: s.buy,
+          requestedBy: options.actor || "fivenines-ops",
+        });
+        taiWriteback.carrierCharges = {
+          ok: queued.ok,
+          status: queued.status,
+          message: queued.message,
+        };
+      }
+    }
+
+    // 3. Reference Numbers write-back
+    if (refsChanged && writebackEnabled && !isTaiAuthHalted(cred)) {
+      taiWriteback.attempted = true;
+      const refRes = await pushShipmentReferences(
+        s.id,
+        { po: s.po, bol: s.bol, pro: s.pro },
+        { ...options, liveAllowed, writebackEnabled, fetchImpl: doFetch, baseUrl: taiBase, credential: cred },
+      );
+      taiWriteback.references = {
+        ok: Boolean(refRes.taiSynced),
+        status: refRes.status,
+        message: refRes.message,
+      };
+    }
+
+    // 4. Tracking / Planning Dates write-back ("Canceled" spelled with one l)
+    if (trackingChanged && writebackEnabled && !isTaiAuthHalted(cred)) {
+      taiWriteback.attempted = true;
+      const taiStatus = normalizeTaiTrackingStatus(s.rawStatus);
+      const trackingPayload = {
+        shipmentId: Number(s.id),
+        transitType: "Linehaul",
+        trackingUpdate: {
+          shipmentStatus: taiStatus,
+          ...(s.shipDateIso ? { pickupReadyDateTime: `${s.shipDateIso}T08:00:00` } : {}),
+          ...(s.delivDateIso ? { deliveryEstimatedDateTime: `${s.delivDateIso}T15:00:00` } : {}),
+        },
+      };
+      try {
+        const resp = await doFetch(`${taiBase}${TAI_TRACKING_PATH}`, {
+          method: "PUT",
+          headers: reqHeaders,
+          body: JSON.stringify(trackingPayload),
+          signal: AbortSignal.timeout(20_000),
+        });
+        const txt = await resp.text();
+        if (isTaiAuthFailureStatus(resp.status)) {
+          haltTaiOnAuthFailure(cred, `TAI HTTP ${resp.status} on PUT /Tracking`);
+        }
+        taiWriteback.tracking = {
+          ok: resp.ok,
+          status: resp.status,
+          message: resp.ok ? `Synced TAI status (${taiStatus})` : `TAI Tracking HTTP ${resp.status}`,
+        };
+        void recordTaiPush({
+          shipmentId: s.id,
+          kind: "tracking",
+          method: "PUT",
+          endpoint: TAI_TRACKING_PATH,
+          requestHeaders: reqHeaders,
+          requestPayload: trackingPayload,
+          responseStatus: resp.status,
+          responseBody: txt,
+          ok: resp.ok,
+          needsHuman: !resp.ok,
+          errorMessage: resp.ok ? null : taiWriteback.tracking.message,
+          actor: options.actor ?? null,
+          supabaseClient: auditSb,
+          liveInsert: liveInsertAudit,
+          redactValues: [cred],
+        });
+      } catch (err) {
+        taiWriteback.tracking = {
+          ok: false,
+          status: null,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+  }
+
+  const wbNotes = [
+    taiWriteback.sellCharges?.message,
+    taiWriteback.carrierCharges?.message,
+    taiWriteback.references?.ok ? "Refs ✓" : undefined,
+    taiWriteback.tracking?.message,
+  ].filter(Boolean);
+  s.writebackState =
+    wbNotes.length > 0 ? wbNotes.join(" · ") : `Updated #${s.id} (${s.rawStatus} · ${s.carrier || "Uncovered"})`;
+
+  broadcastOpsEvent("shipment_updated", { shipmentId: s.id });
+  return {
+    ok: true,
+    status: 200,
+    shipment: s,
+    taiWriteback,
+    message: s.writebackState,
+  };
+}
+
+// ============================================================================
+// GROUNDED LIVE AI COPILOT / ASSISTANT (Zero Hardcoded Fake Carriers or Counts)
+// ============================================================================
+
+const US_STATE_NAME_TO_CODE: Record<string, string> = {
+  alabama: "AL",
+  arizona: "AZ",
+  arkansas: "AR",
+  california: "CA",
+  colorado: "CO",
+  connecticut: "CT",
+  delaware: "DE",
+  florida: "FL",
+  georgia: "GA",
+  idaho: "ID",
+  illinois: "IL",
+  indiana: "IN",
+  iowa: "IA",
+  kansas: "KS",
+  kentucky: "KY",
+  louisiana: "LA",
+  maine: "ME",
+  maryland: "MD",
+  massachusetts: "MA",
+  michigan: "MI",
+  minnesota: "MN",
+  mississippi: "MS",
+  missouri: "MO",
+  montana: "MT",
+  nebraska: "NE",
+  nevada: "NV",
+  "new hampshire": "NH",
+  "new jersey": "NJ",
+  "new mexico": "NM",
+  "new york": "NY",
+  "north carolina": "NC",
+  "north dakota": "ND",
+  ohio: "OH",
+  oklahoma: "OK",
+  oregon: "OR",
+  pennsylvania: "PA",
+  "rhode island": "RI",
+  "south carolina": "SC",
+  "south dakota": "SD",
+  tennessee: "TN",
+  texas: "TX",
+  utah: "UT",
+  vermont: "VT",
+  virginia: "VA",
+  washington: "WA",
+  "west virginia": "WV",
+  wisconsin: "WI",
+  wyoming: "WY",
+};
+
+const VALID_US_STATES = new Set(Object.values(US_STATE_NAME_TO_CODE));
+
+function levenshteinAtMostOne(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      i++;
+      j++;
+    } else {
+      edits++;
+      if (edits > 1) return false;
+      if (a.length > b.length) i++;
+      else if (b.length > a.length) j++;
+      else {
+        i++;
+        j++;
+      }
+    }
+  }
+  if (i < a.length || j < b.length) edits++;
+  return edits <= 1;
+}
+
+function parseLaneFromQuestion(q: string): { origState: string; destState: string; equipFilter?: EquipmentFamily } | null {
+  let normalized = q;
+  for (const [fullName, code] of Object.entries(US_STATE_NAME_TO_CODE)) {
+    const re = new RegExp(`\\b${fullName}\\b`, "gi");
+    normalized = normalized.replace(re, code);
+  }
+
+  const arrowMatch = normalized.match(
+    /\b([A-Za-z]{2})\s*(?:->|→|=>|to|into|->)\s*([A-Za-z]{2})\b/,
+  );
+  if (!arrowMatch) return null;
+  const orig = arrowMatch[1].toUpperCase();
+  const dest = arrowMatch[2].toUpperCase();
+  if (!VALID_US_STATES.has(orig) || !VALID_US_STATES.has(dest)) return null;
+
+  let equipFilter: EquipmentFamily | undefined;
+  if (/flatbed/i.test(q)) equipFilter = "flatbed";
+  else if (/step\s*deck/i.test(q)) equipFilter = "step_deck";
+  else if (/reefer|refrigerated/i.test(q)) equipFilter = "reefer";
+  else if (/drayage|container|intermodal/i.test(q)) equipFilter = "drayage";
+  else if (/sprinter/i.test(q)) equipFilter = "sprinter";
+  else if (/conestoga/i.test(q)) equipFilter = "conestoga";
+  else if (/\bvan\b|dry\s*van/i.test(q)) equipFilter = "dry_van";
+
+  return { origState: orig, destState: dest, ...(equipFilter ? { equipFilter } : {}) };
+}
+
+const AI_STOP_WORDS = new Set([
+  "do",
+  "we",
+  "have",
+  "any",
+  "is",
+  "are",
+  "the",
+  "a",
+  "an",
+  "in",
+  "on",
+  "for",
+  "to",
+  "from",
+  "with",
+  "about",
+  "tell",
+  "me",
+  "show",
+  "find",
+  "check",
+  "lookup",
+  "look",
+  "up",
+  "set",
+  "setup",
+  "tai",
+  "carrier",
+  "carriers",
+  "customer",
+  "customers",
+  "shipment",
+  "shipments",
+  "load",
+  "loads",
+  "uncovered",
+  "covered",
+  "active",
+  "open",
+  "status",
+  "what",
+  "which",
+  "who",
+  "top",
+  "historical",
+  "lane",
+  "runners",
+  "runner",
+  "our",
+  "can",
+  "you",
+  "please",
+]);
+
+export interface GroundedAiOptions {
+  fetchImpl?: typeof fetch;
+  geminiApiKey?: string;
+  openaiApiKey?: string;
+  disableLlm?: boolean;
+}
+
+export async function answerGroundedOpsQuestion(
+  input: {
+    question: string;
+    activeEmail?: Record<string, unknown> | null;
+    history?: Array<{ role: string; text: string }>;
+  },
+  options: GroundedAiOptions = {},
+) {
+  const q = String(input.question || "").trim();
+  if (!q) {
+    return {
+      ok: false,
+      status: 400,
+      answer: "Ask a question about a load #, carrier, customer, lane, or active email.",
+    };
+  }
+
+  const ql = q.toLowerCase();
+  const sb = store.getSupabase();
+
+  // Ensure live data is initialized if Supabase is configured and never synced yet
+  if (store.isSupabaseConfigured && !store.supabaseSyncedOnce) {
+    await store.initSupabaseSyncAndRealtime();
+  }
+
+  const factSections: string[] = [];
+  const matchedContext: {
+    carriers: Array<Record<string, unknown>>;
+    customer: string | null;
+    lane: { origState: string; destState: string; equipFilter?: string } | null;
+    shipments: Array<Record<string, unknown>>;
+  } = {
+    carriers: [],
+    customer: null,
+    lane: null,
+    shipments: [],
+  };
+
+  // 1. Specific Shipment ID or Container # lookup
+  const explicitIds = Array.from(q.matchAll(/\b(\d{6,10})\b/g), (m) => m[1]);
+  const explicitContainers = extractContainerNumbers(q);
+  for (const id of explicitIds) {
+    const s = await findOrHydrateShipment(id);
+    if (s) {
+      matchedContext.shipments.push({
+        id: s.id,
+        customer: s.customer,
+        stage: s.stage,
+        rawStatus: s.rawStatus,
+        origin: s.origin,
+        dest: s.dest,
+        shipDate: s.shipDateIso || s.shipDate,
+        carrier: s.carrier || "UNCOVERED",
+        sell: s.sell,
+        buy: s.buy,
+        po: s.po,
+        rateconStatus: s.rateconStatus,
+      });
+      factSections.push(
+        `Shipment #${s.id}${s.containerNumber ? ` [${s.containerNumber}]` : ""}: Customer ${s.customer} · ${s.origin} → ${s.dest} · Ship ${s.shipDateIso || s.shipDate || "TBD"} · Status: ${s.rawStatus} (Stage: ${s.stage}) · Carrier: ${s.carrier || "UNCOVERED"} · Sell $${s.sell.toLocaleString()} / Buy $${s.buy.toLocaleString()} · RateCon: ${s.rateconStatus}${s.po ? ` · PO ${s.po}` : ""}${s.operationalNote ? ` · Note: ${s.operationalNote}` : ""}`,
+      );
+    }
+  }
+  for (const cn of explicitContainers) {
+    const s = store.shipments.find((x) => x.containerNumber && sameContainerNumber(x.containerNumber, cn));
+    if (s && !matchedContext.shipments.some((m) => m.id === s.id)) {
+      matchedContext.shipments.push({ id: s.id, containerNumber: cn, customer: s.customer, stage: s.stage });
+      factSections.push(
+        `Container ${cn} matches Load #${s.id} (${s.customer}): ${s.origin} → ${s.dest} · Stage: ${s.stage} · Carrier: ${s.carrier || "UNCOVERED"}${s.operationalNote ? ` · Note: ${s.operationalNote}` : ""}`,
+      );
+    }
+  }
+
+  // 2. Historical Lane Runners Lookup (e.g., "Top historical lane runners for PA → GA flatbed?")
+  const lane = parseLaneFromQuestion(q);
+  if (lane) {
+    matchedContext.lane = lane;
+    interface RawLaneRow {
+      shipment_id: string;
+      carrier_name: string;
+      buy: number;
+      sell: number;
+      equipment_type: string;
+      ship_date: string;
+    }
+    let laneRows: RawLaneRow[] = [];
+
+    if (sb && store.supabaseConnected) {
+      const { data } = await sb
+        .from("shipments")
+        .select("shipment_id,carrier_name,buy,sell,equipment_type,ship_date,status")
+        .eq("from_state", lane.origState)
+        .eq("to_state", lane.destState)
+        .neq("carrier_name", "")
+        .not("status", "ilike", "Cancel%")
+        .order("ship_date", { ascending: false })
+        .limit(800);
+      if (Array.isArray(data)) {
+        laneRows = (data as Record<string, unknown>[]).map((r) => ({
+          shipment_id: String(r.shipment_id || ""),
+          carrier_name: String(r.carrier_name || "").trim(),
+          buy: Number(r.buy) || 0,
+          sell: Number(r.sell) || 0,
+          equipment_type: String(r.equipment_type || ""),
+          ship_date: String(r.ship_date || "").slice(0, 10),
+        }));
+      }
+    } else {
+      laneRows = store.shipments
+        .filter(
+          (s) =>
+            s.stage !== "Cancelled" &&
+            Boolean(s.carrier.trim()) &&
+            (s.stops[0]?.state || "").toUpperCase() === lane.origState &&
+            (s.stops[s.stops.length - 1]?.state || "").toUpperCase() === lane.destState,
+        )
+        .map((s) => ({
+          shipment_id: s.id,
+          carrier_name: s.carrier.trim(),
+          buy: s.buy,
+          sell: s.sell,
+          equipment_type: s.equip,
+          ship_date: s.shipDateIso || s.shipDate,
+        }));
+    }
+
+    const equipFiltered = lane.equipFilter
+      ? laneRows.filter((r) => normalizeEquipmentFamily(r.equipment_type) === lane.equipFilter)
+      : laneRows;
+    const rowsToAggregate = equipFiltered.length > 0 ? equipFiltered : laneRows;
+    const usedFallbackAllEquip = Boolean(lane.equipFilter && equipFiltered.length === 0 && laneRows.length > 0);
+
+    const byCarrier = new Map<
+      string,
+      { name: string; count: number; buys: number[]; lastDate: string; sampleId: string }
+    >();
+    for (const r of rowsToAggregate) {
+      if (!r.carrier_name) continue;
+      const key = r.carrier_name.toUpperCase();
+      const cur = byCarrier.get(key) || {
+        name: r.carrier_name,
+        count: 0,
+        buys: [],
+        lastDate: r.ship_date,
+        sampleId: r.shipment_id,
+      };
+      cur.count += 1;
+      if (r.buy > 0) cur.buys.push(r.buy);
+      if (r.ship_date > cur.lastDate) cur.lastDate = r.ship_date;
+      byCarrier.set(key, cur);
+    }
+
+    const topRunners = Array.from(byCarrier.values())
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 6);
+
+    if (topRunners.length === 0) {
+      factSections.push(
+        `Historical Lane Runners (${lane.origState} → ${lane.destState}${lane.equipFilter ? ` · ${lane.equipFilter}` : ""}): 0 historical covered shipments found in the database for ${lane.origState} → ${lane.destState}.`,
+      );
+    } else {
+      const runnerLines = topRunners.map((r, idx) => {
+        const avgBuy =
+          r.buys.length > 0 ? Math.round(r.buys.reduce((a, b) => a + b, 0) / r.buys.length) : 0;
+        const carrMeta = store.carriers.find(
+          (c) => normalizeCompanyIdentity(c.name) === normalizeCompanyIdentity(r.name),
+        );
+        const mcPart = carrMeta?.mc ? ` · MC ${carrMeta.mc}` : "";
+        const taiPart = carrMeta?.taiMasterId ? ` · TAI #${carrMeta.taiMasterId}` : "";
+        return `(${idx + 1}) ${r.name}${mcPart}${taiPart} — ${r.count} load(s), ${avgBuy > 0 ? `avg $${avgBuy.toLocaleString()} buy` : "rate unrecorded"}${r.lastDate ? `, last ${r.lastDate}` : ""} (e.g. #${r.sampleId})`;
+      });
+      factSections.push(
+        `Historical ${lane.origState} → ${lane.destState}${lane.equipFilter && !usedFallbackAllEquip ? ` (${lane.equipFilter})` : usedFallbackAllEquip ? ` (0 exact ${lane.equipFilter}-tagged rows; showing all ${rowsToAggregate.length} covered loads on ${lane.origState} → ${lane.destState})` : ""} Lane Runners (${rowsToAggregate.length} total covered shipments):\n${runnerLines.join("\n")}`,
+      );
+    }
+  }
+
+  // 3. Customer & Uncovered / Active Shipments Lookup
+  const asksCustomerOrUncovered =
+    /\bcustomer\b|\buncovered\b|\bneeds?\s*truck\b|\bopen\s*loads?\b|\bactive\s*loads?\b|\bpick\s*up\s*first\b/i.test(q);
+
+  // Match customer name against all 342 customers + shipment customers
+  let matchedCustomerName: string | null = null;
+  const customerCandidates = Array.from(
+    new Set([
+      ...store.customers.map((c) => c.name),
+      ...store.shipments.map((s) => s.customer),
+    ]),
+  )
+    .filter((name) => {
+      const norm = normalizeCompanyIdentity(name);
+      return norm.length >= 3 && !PLACEHOLDER_CUSTOMER_NAMES.has(norm);
+    })
+    .sort((a, b) => b.length - a.length);
+
+  const qNormForCust = q.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ");
+  for (const custName of customerCandidates) {
+    const cClean = custName.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+    const cRoot = normalizeCompanyIdentity(custName);
+    if (
+      (cClean.length >= 4 && qNormForCust.includes(cClean)) ||
+      (cRoot.length >= 4 && qNormForCust.includes(cRoot))
+    ) {
+      matchedCustomerName = custName;
+      break;
+    }
+  }
+
+  if (matchedCustomerName) {
+    matchedContext.customer = matchedCustomerName;
+    const custKey = normalizeCompanyIdentity(matchedCustomerName);
+    const custShipments = store.shipments.filter(
+      (s) => s.stage !== "Cancelled" && normalizeCompanyIdentity(s.customer) === custKey,
+    );
+    const uncovered = custShipments
+      .filter((s) => s.stage === "Needs truck")
+      .sort((a, b) => (a.shipDateIso || "9999").localeCompare(b.shipDateIso || "9999"));
+    const covered = custShipments.filter((s) => s.stage === "Assigned");
+    const transit = custShipments.filter((s) => s.stage === "In transit");
+
+    const uncoveredPreview = uncovered
+      .slice(0, 8)
+      .map(
+        (s) =>
+          `#${s.id} (${s.origin} → ${s.dest} · Ship ${s.shipDateIso || s.shipDate || "TBD"} · Sell $${s.sell.toLocaleString()}${s.po ? ` · PO ${s.po}` : ""})`,
+      )
+      .join("; ");
+
+    factSections.push(
+      `Customer "${matchedCustomerName}": ${uncovered.length} uncovered Committed shipment(s) needing a truck, ${covered.length} covered/assigned, and ${transit.length} in transit.${
+        uncovered.length > 0
+          ? ` Uncovered loads: ${uncoveredPreview}${uncovered.length > 8 ? ` (+${uncovered.length - 8} more)` : ""}.`
+          : ""
+      }`,
+    );
+  } else if (asksCustomerOrUncovered && !lane) {
+    const allUncovered = store.shipments
+      .filter((s) => s.stage === "Needs truck")
+      .sort((a, b) => (a.shipDateIso || "9999").localeCompare(b.shipDateIso || "9999"));
+    const sampleUncovered = allUncovered
+      .slice(0, 6)
+      .map(
+        (s) =>
+          `#${s.id} ${s.customer} (${s.origin} → ${s.dest} · Ship ${s.shipDateIso || s.shipDate || "TBD"} · Sell $${s.sell.toLocaleString()})`,
+      )
+      .join("; ");
+    factSections.push(
+      `Live Uncovered Queue: ${store.liveCounts.uncoveredCommitted} uncovered Committed loads (plus ${store.liveCounts.coveredCommitted} covered Committed, ${store.liveCounts.dispatched} Dispatched, ${store.liveCounts.inTransit} In Transit across ${store.liveCounts.totalShipments.toLocaleString()} total loads). Earliest uncovered pickups: ${sampleUncovered || "none"}.`,
+    );
+  }
+
+  // 4. Carrier Lookup across all 5,022 carriers + historical shipments (handles bare carrier names like "just drive transport")
+  const tokens = q
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 2 && !AI_STOP_WORDS.has(t));
+  const candidatePhrase = tokens.join(" ").trim();
+  const candidateIdentity = normalizeCompanyIdentity(candidatePhrase);
+
+  const looksLikeCarrierLookup =
+    /\bcarrier\b|\bmc\b|\bdot\b|\binsurance\b|\btransport|\btrucking|\bexpress|\bfreight|\bhauling|\blogistics|\blines\b|\bdelivery\b/i.test(
+      q,
+    ) ||
+    (!matchedCustomerName && !lane && matchedContext.shipments.length === 0 && tokens.length >= 1 && tokens.length <= 5);
+
+  if (looksLikeCarrierLookup && !matchedCustomerName && !lane && candidatePhrase.length >= 3) {
+    const exactAndSubMatches = store.carriers.filter((c) => {
+      const cLower = c.name.toLowerCase();
+      const cIdent = normalizeCompanyIdentity(c.name);
+      if (candidateIdentity && cIdent === candidateIdentity) return true;
+      if (candidatePhrase.length >= 4 && cLower.includes(candidatePhrase)) return true;
+      if (c.mc && tokens.includes(c.mc.toLowerCase())) return true;
+      if (c.dot && tokens.includes(c.dot.toLowerCase())) return true;
+      if (tokens.length >= 2) {
+        const cWords = cIdent.split(/\s+/).filter(Boolean);
+        const matchedTokens = tokens.filter((tok) =>
+          cWords.some((cw) => cw === tok || (tok.length >= 4 && cw.length >= 4 && levenshteinAtMostOne(cw, tok))),
+        );
+        if (matchedTokens.length === tokens.length) return true;
+      }
+      return false;
+    });
+
+    const topCarrierMatches = exactAndSubMatches.slice(0, 5);
+    if (topCarrierMatches.length > 0) {
+      for (const c of topCarrierMatches) {
+        let haulCount = 0;
+        let avgBuy = 0;
+        if (sb && store.supabaseConnected) {
+          const { data: cLoads, count } = await sb
+            .from("shipments")
+            .select("shipment_id,buy,from_state,to_state,ship_date", { count: "exact" })
+            .ilike("carrier_name", c.name)
+            .not("status", "ilike", "Cancel%")
+            .limit(50);
+          haulCount = count ?? (cLoads?.length || 0);
+          const buys = ((cLoads || []) as Record<string, unknown>[]).map((r) => Number(r.buy) || 0).filter((v) => v > 0);
+          if (buys.length > 0) avgBuy = Math.round(buys.reduce((a, b) => a + b, 0) / buys.length);
+        } else {
+          const cLoads = store.shipments.filter(
+            (s) => s.stage !== "Cancelled" && normalizeCompanyIdentity(s.carrier) === normalizeCompanyIdentity(c.name),
+          );
+          haulCount = cLoads.length;
+          const buys = cLoads.map((s) => s.buy).filter((v) => v > 0);
+          if (buys.length > 0) avgBuy = Math.round(buys.reduce((a, b) => a + b, 0) / buys.length);
+        }
+
+        matchedContext.carriers.push({
+          name: c.name,
+          taiMasterId: c.taiMasterId || null,
+          mc: c.mc || null,
+          dot: c.dot || null,
+          insuranceStatus: c.insuranceStatus,
+          haulCount,
+          avgBuy,
+        });
+        factSections.push(
+          `Carrier Match: ${c.name} · TAI Master ID: ${c.taiMasterId ? `#${c.taiMasterId} (Set up in TAI)` : "Not linked"} · MC: ${c.mc || "—"} · DOT: ${c.dot || "—"} · Insurance: ${c.insuranceStatus}${c.phone ? ` · Phone: ${c.phone}` : ""} · Historical Shipments Hauled: ${haulCount}${avgBuy > 0 ? ` (avg $${avgBuy.toLocaleString()} buy)` : ""}.`,
+        );
+      }
+    } else {
+      // Also check shipments table carrier_name directly in case carrier hauled a load without being in carriers table
+      let shipmentCarrierHits = 0;
+      if (sb && store.supabaseConnected) {
+        const { count } = await sb
+          .from("shipments")
+          .select("id", { count: "exact", head: true })
+          .ilike("carrier_name", `%${candidatePhrase.replace(/[,%()'"\\]/g, "")}%`);
+        shipmentCarrierHits = count ?? 0;
+      }
+      if (shipmentCarrierHits > 0) {
+        factSections.push(
+          `Carrier Lookup for "${candidatePhrase}": Not found in the ${store.carriers.length.toLocaleString()} master carriers table, but matched ${shipmentCarrierHits} historical shipment row(s) by carrier_name.`,
+        );
+      } else {
+        factSections.push(
+          `Carrier Lookup for "${candidatePhrase}": No matching carrier found across ${store.carriers.length.toLocaleString()} TAI carriers or ${store.liveCounts.totalShipments.toLocaleString()} shipments (not currently set up under that name).`,
+        );
+      }
+    }
+  }
+
+  // 5. Active Email Context (when attached by user in Panel / Dashboard)
+  if (input.activeEmail && typeof input.activeEmail === "object") {
+    const em = input.activeEmail;
+    const emSubj = String(em.subject || "").trim();
+    const emFrom = String(em.from || em.sender || "").trim();
+    const emBody = String(em.fullBody || em.bodyText || em.body || "").trim();
+    const emLoadId = String(em.loadId || "").trim();
+    if (emSubj || emBody) {
+      factSections.push(
+        `Attached Email Context: Subject "${emSubj}" from ${emFrom}${emLoadId && emLoadId !== "NEW" ? ` (Matched Load #${emLoadId})` : ""} — Snippet: "${emBody.slice(0, 320)}"`,
+      );
+    }
+  }
+
+  // Fallback general live snapshot if no narrower facet fired
+  if (factSections.length === 0) {
+    const c = store.liveCounts;
+    factSections.push(
+      `Live Operations Snapshot (${store.supabaseConnected ? "Supabase Live" : "Local Store"}): ${c.totalShipments.toLocaleString()} total shipments · ${c.uncoveredCommitted} uncovered Committed loads needing a truck · ${c.coveredCommitted} covered Committed · ${c.dispatched} Dispatched · ${c.inTransit} In Transit · ${c.delivered.toLocaleString()} Delivered · ${c.customers} customers · ${c.carriers.toLocaleString()} carriers.`,
+    );
+  }
+
+  const groundedSummary = factSections.join("\n\n");
+  const doFetch = options.fetchImpl ?? fetch;
+  const geminiKey = String(options.geminiApiKey ?? process.env.GEMINI_API_KEY ?? "").trim();
+  const openaiKey = String(options.openaiApiKey ?? process.env.OPENAI_API_KEY ?? "").trim();
+
+  if (!options.disableLlm && geminiKey) {
+    const rawModel = String(process.env.GMAIL_FREIGHT_TOOLKIT_MODEL || "gemini-2.5-flash").trim();
+    const model = /^gemini-/i.test(rawModel) ? rawModel : "gemini-2.5-flash";
+    try {
+      const resp = await doFetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": geminiKey,
+          },
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [
+                {
+                  text: "You are the Five Nines / Primary Freight Operations Assistant. Answer concisely and strictly using ONLY the VERIFIED LIVE DATA provided. Cite exact Shipment IDs, Carrier names, TAI Master IDs, MC numbers, and dollar amounts from VERIFIED LIVE DATA. NEVER invent carriers, MC numbers, insurance dates, load IDs, or rates. If a carrier or load is not found in VERIFIED LIVE DATA, state clearly that it was not found.",
+                },
+              ],
+            },
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: `USER QUESTION:\n${q}\n\nVERIFIED LIVE DATA:\n${groundedSummary}`,
+                  },
+                ],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.1,
+              maxOutputTokens: 500,
+            },
+          }),
+          signal: AbortSignal.timeout(12_000),
+        },
+      );
+      if (resp.ok) {
+        const data = (await resp.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        };
+        const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("").trim();
+        if (text) {
+          return {
+            ok: true,
+            status: 200,
+            answer: text,
+            grounded: true,
+            provider: "gemini",
+            facts: groundedSummary,
+            matchedContext,
+          };
+        }
+      }
+    } catch {
+      // fall through to OpenAI or deterministic grounded facts
+    }
+  }
+
+  if (!options.disableLlm && openaiKey) {
+    try {
+      const resp = await doFetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${openaiKey}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          temperature: 0.1,
+          max_tokens: 450,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are the Five Nines / Primary Freight Operations Assistant. Answer strictly using ONLY the VERIFIED LIVE DATA provided. Never invent carriers, MC numbers, load IDs, or rates.",
+            },
+            {
+              role: "user",
+              content: `USER QUESTION:\n${q}\n\nVERIFIED LIVE DATA:\n${groundedSummary}`,
+            },
+          ],
+        }),
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as { choices?: Array<{ message?: { content?: string } }> };
+        const text = data.choices?.[0]?.message?.content?.trim();
+        if (text) {
+          return {
+            ok: true,
+            status: 200,
+            answer: text,
+            grounded: true,
+            provider: "openai",
+            facts: groundedSummary,
+            matchedContext,
+          };
+        }
+      }
+    } catch {
+      // fall through to deterministic grounded facts
+    }
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    answer: groundedSummary,
+    grounded: true,
+    provider: "live_facts",
+    facts: groundedSummary,
+    matchedContext,
   };
 }

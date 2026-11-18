@@ -209,6 +209,98 @@
     return attachments;
   }
 
+  function extractHexThreadId(raw) {
+    const trimmed = String(raw || "").trim();
+    return /^[0-9a-f]{15,16}$/i.test(trimmed) ? trimmed : "";
+  }
+
+  function buildGmailBasePrefix() {
+    const origin = window.location?.origin || "https://mail.google.com";
+    const pathname = window.location?.pathname || "/mail/u/0/";
+    return `${origin}${pathname}`;
+  }
+
+  function captureInboxList() {
+    const rows = [...document.querySelectorAll("tr.zA")].filter(isVisible);
+    const items = [];
+    const seen = new Set();
+    const basePrefix = buildGmailBasePrefix();
+
+    for (const row of rows) {
+      if (items.length >= 40) break;
+
+      const rawLegacy = (
+        row.getAttribute?.("data-legacy-thread-id") ||
+        row.querySelector?.("[data-legacy-thread-id]")?.getAttribute?.("data-legacy-thread-id") ||
+        ""
+      ).trim();
+      const rawThreadAttr = (
+        row.getAttribute?.("data-thread-id") ||
+        row.querySelector?.("[data-thread-id]")?.getAttribute?.("data-thread-id") ||
+        ""
+      ).trim();
+      const strippedThreadAttr = rawThreadAttr.replace(/^#?thread-[a-z]:/i, "").trim();
+
+      const legacyHexId =
+        extractHexThreadId(rawLegacy) ||
+        (!/^#?thread-/i.test(rawThreadAttr) ? extractHexThreadId(strippedThreadAttr) : "");
+
+      const threadId = legacyHexId || rawLegacy || strippedThreadAttr || "";
+
+      const emailSpan = row.querySelector?.(".yW span[email], .yX span[email], span[email]");
+      const senderEmail = (emailSpan?.getAttribute?.("email") || "").trim();
+      const senderName = (
+        emailSpan?.getAttribute?.("name") ||
+        readText(emailSpan) ||
+        readText(row.querySelector?.(".yW, .yX"))
+      ).trim();
+      const from =
+        senderName && senderEmail && !senderName.includes(senderEmail)
+          ? `${senderName} <${senderEmail}>`
+          : senderEmail || senderName || "";
+
+      const subject = readText(row.querySelector?.(".bog, .y6 span[id], .y6 span"));
+      const rawSnippet = readText(row.querySelector?.(".y2"));
+      const snippet = rawSnippet.replace(/^[\s\u00a0]*[-–—][\s\u00a0]*/, "").trim();
+
+      const timeNode = row.querySelector?.(".xW.xY span[title], td.xW span[title], .xW span");
+      const receivedAt = (
+        timeNode?.getAttribute?.("title") ||
+        readText(timeNode) ||
+        new Date().toISOString()
+      ).trim();
+
+      const unread = Boolean(row.classList?.contains?.("zE"));
+
+      if (!subject && !from && !snippet) continue;
+
+      const permalink = legacyHexId
+        ? `${basePrefix}#inbox/${legacyHexId}`
+        : `${basePrefix}#search/${encodeURIComponent(subject || from)}`;
+
+      const dedupeKey = threadId || `${subject}::${from}::${receivedAt}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+
+      items.push({
+        threadId: threadId || undefined,
+        from,
+        sender: senderEmail || from,
+        senderName: senderName || undefined,
+        subject,
+        snippet,
+        bodyText: snippet,
+        receivedAt,
+        timestamp: receivedAt,
+        unread,
+        permalink,
+        source: "extension",
+      });
+    }
+
+    return items;
+  }
+
   function findMainThreadContainer() {
     const mains = [...document.querySelectorAll('[role="main"]')];
     return (
@@ -249,10 +341,15 @@
     const msgNodes = [...main.querySelectorAll("[data-legacy-message-id], [data-message-id]")];
     const lastMsg = msgNodes[msgNodes.length - 1];
     const hashMatch = String(window.location?.hash || "").match(/\/([A-Za-z0-9_-]{8,})$/);
+    const legacyThreadId = (
+      subjectEl?.getAttribute?.("data-legacy-thread-id") ||
+      main.querySelector?.("[data-legacy-thread-id]")?.getAttribute?.("data-legacy-thread-id") ||
+      ""
+    ).trim();
     const messageId = (
       lastMsg?.getAttribute("data-legacy-message-id") ||
       lastMsg?.getAttribute("data-message-id") ||
-      subjectEl?.getAttribute("data-legacy-thread-id") ||
+      legacyThreadId ||
       subjectEl?.getAttribute("data-thread-perm-id") ||
       (hashMatch ? hashMatch[1] : "")
     ).trim();
@@ -274,12 +371,121 @@
       sender,
       senderName,
       timestamp,
+      threadId: legacyThreadId || extractHexThreadId(messageId) || undefined,
       messageId,
       bodyText: joinedBodies || fallbackBody,
       permalink: window.location.href,
       attachments,
       capturedAt: new Date().toISOString(),
     };
+  }
+
+  function collectCombinedInboxItems() {
+    const listItems = captureInboxList();
+    const open = captureOpenThread();
+    const hasOpenThread = Boolean(open && (open.subject || open.bodyText));
+    if (!hasOpenThread) {
+      return listItems;
+    }
+
+    const basePrefix = buildGmailBasePrefix();
+    const hashHexMatch = String(window.location?.hash || "").match(/\/([0-9a-f]{15,16})$/i);
+    const legacyHexId =
+      extractHexThreadId(open.threadId) ||
+      extractHexThreadId(open.messageId) ||
+      (hashHexMatch ? hashHexMatch[1] : "");
+
+    const openPermalink = legacyHexId
+      ? `${basePrefix}#inbox/${legacyHexId}`
+      : typeof open.permalink === "string" &&
+          open.permalink.startsWith("https://mail.google.com/") &&
+          open.permalink.includes("#")
+        ? open.permalink
+        : `${basePrefix}#search/${encodeURIComponent(open.subject || open.sender || "")}`;
+
+    const openFrom =
+      open.senderName && open.sender && !open.senderName.includes(open.sender)
+        ? `${open.senderName} <${open.sender}>`
+        : open.sender || open.senderName || "";
+
+    const openItem = {
+      threadId: legacyHexId || open.threadId || open.messageId || undefined,
+      messageId: open.messageId || undefined,
+      from: openFrom,
+      sender: open.sender || openFrom,
+      senderName: open.senderName || undefined,
+      subject: open.subject || "",
+      snippet: String(open.bodyText || "").replace(/\s+/g, " ").trim().slice(0, 240),
+      bodyText: open.bodyText || "",
+      receivedAt: open.timestamp || open.capturedAt,
+      timestamp: open.timestamp || open.capturedAt,
+      unread: false,
+      permalink: openPermalink,
+      attachments: open.attachments || [],
+      source: "extension",
+    };
+
+    const merged = [openItem];
+    for (const rowItem of listItems) {
+      if (merged.length >= 40) break;
+      const sameById =
+        openItem.threadId && rowItem.threadId && openItem.threadId === rowItem.threadId;
+      const sameBySubject =
+        openItem.subject &&
+        rowItem.subject &&
+        openItem.subject === rowItem.subject &&
+        (!open.sender || rowItem.from.includes(open.sender));
+      if (sameById || sameBySubject) {
+        openItem.unread = rowItem.unread;
+        if (!openItem.threadId && rowItem.threadId) openItem.threadId = rowItem.threadId;
+        continue;
+      }
+      merged.push(rowItem);
+    }
+
+    return merged;
+  }
+
+  const AUTO_SYNC_MIN_INTERVAL_MS = 4000;
+  let lastSyncedSignature = "";
+  let lastSyncedAt = 0;
+  let pendingSyncTimer = null;
+
+  function computeInboxSignature(items) {
+    return items
+      .map((it) => `${it.threadId || it.subject}:${it.unread ? 1 : 0}:${(it.bodyText || "").length}`)
+      .join("|");
+  }
+
+  function sendAutoSyncIfChanged(force) {
+    pendingSyncTimer = null;
+    const items = collectCombinedInboxItems();
+    if (items.length === 0) return items;
+    const signature = computeInboxSignature(items);
+    if (!force && signature === lastSyncedSignature) return items;
+    lastSyncedSignature = signature;
+    lastSyncedAt = Date.now();
+    try {
+      const maybePromise = chrome.runtime.sendMessage({ type: "PF_AUTO_SYNC_INBOX", items });
+      if (maybePromise && typeof maybePromise.catch === "function") {
+        maybePromise.catch(() => {});
+      }
+    } catch {
+      // Ignore invalidated extension runtime errors during reload
+    }
+    return items;
+  }
+
+  function scheduleDebouncedInboxSync(minDelayMs) {
+    if (pendingSyncTimer !== null || typeof setTimeout !== "function") return;
+    const elapsed = Date.now() - lastSyncedAt;
+    const waitMs =
+      lastSyncedAt === 0
+        ? minDelayMs
+        : Math.max(minDelayMs, AUTO_SYNC_MIN_INTERVAL_MS - elapsed);
+    pendingSyncTimer = setTimeout(() => {
+      sendAutoSyncIfChanged(false);
+    }, waitMs);
   }
 
   function escapeHtml(text) {
@@ -301,7 +507,7 @@
         for (const attr of [...el.attributes]) {
           const name = attr.name.toLowerCase();
           const val = attr.value.trim().toLowerCase();
-          if (name.startsWith("on") || ( (name === "href" || name === "src") && val.startsWith("javascript:") )) {
+          if (name.startsWith("on") || ((name === "href" || name === "src") && val.startsWith("javascript:"))) {
             el.removeAttribute(attr.name);
           }
         }
@@ -331,8 +537,8 @@
       const tooltip = (el.getAttribute("data-tooltip") || "").trim();
       const text = readText(el);
       return (
-        /^reply\b/i.test(aria) && !/reply to all/i.test(aria) ||
-        /^reply\b/i.test(tooltip) && !/reply to all/i.test(tooltip) ||
+        (/^reply\b/i.test(aria) && !/reply to all/i.test(aria)) ||
+        (/^reply\b/i.test(tooltip) && !/reply to all/i.test(tooltip)) ||
         /^reply$/i.test(text)
       );
     });
@@ -424,7 +630,16 @@
         sendResponse({ ok: false, error: "Open a Gmail conversation thread before capturing." });
         return false;
       }
+      sendAutoSyncIfChanged(false);
       sendResponse({ ok: true, payload });
+      return false;
+    }
+
+    if (message?.type === "PF_CAPTURE_INBOX") {
+      const items = collectCombinedInboxItems();
+      lastSyncedSignature = computeInboxSignature(items);
+      lastSyncedAt = Date.now();
+      sendResponse({ ok: true, payload: { items } });
       return false;
     }
 
@@ -454,9 +669,23 @@
     setTimeout(() => {
       const payload = captureOpenThread();
       if (payload.subject) {
-        chrome.runtime.sendMessage({ type: "PF_GMAIL_THREAD_CHANGED", payload }).catch(() => {});
+        const p = chrome.runtime.sendMessage({ type: "PF_GMAIL_THREAD_CHANGED", payload });
+        if (p && typeof p.catch === "function") p.catch(() => {});
       }
+      sendAutoSyncIfChanged(false);
     }, 350);
   };
   window.addEventListener("hashchange", notifyChange);
+
+  if (typeof MutationObserver === "function" && (document.body || document.documentElement)) {
+    const observer = new MutationObserver(() => {
+      scheduleDebouncedInboxSync(AUTO_SYNC_MIN_INTERVAL_MS);
+    });
+    observer.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  scheduleDebouncedInboxSync(350);
 })();
