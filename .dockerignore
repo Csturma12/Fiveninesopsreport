@@ -6,3 +6,6 @@ dist
 !.env.example
 *.db
 local-data
+# Credential config written by google-github-actions/auth in CI; must never
+# reach the Fly remote builder's context or layer cache.
+gha-creds-*.json
