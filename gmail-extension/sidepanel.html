@@ -2,11 +2,89 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Five Nines Freight Toolkit</title>
     <style>
-      html, body, iframe {
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
         margin: 0;
         padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #0f1217;
+        color: #e5e7eb;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      .shell-root {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+      }
+      .shell-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        height: 30px;
+        padding: 0 8px;
+        background: #11161f;
+        border-bottom: 1px solid #1f2937;
+        flex-shrink: 0;
+        font-size: 11px;
+      }
+      .shell-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        color: #f3f4f6;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .shell-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: #10b981;
+        flex-shrink: 0;
+      }
+      .shell-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .shell-btn,
+      .shell-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 2px 7px;
+        border-radius: 4px;
+        border: 1px solid #374151;
+        background: #1a2230;
+        color: #d1d5db;
+        font-size: 11px;
+        font-weight: 500;
+        line-height: 1.4;
+        text-decoration: none;
+        cursor: pointer;
+      }
+      .shell-btn:hover,
+      .shell-link:hover {
+        background: #243044;
+        color: #ffffff;
+        border-color: #4b5563;
+      }
+      #toolkit-frame {
+        flex: 1;
         width: 100%;
         height: 100%;
         border: 0;
@@ -15,11 +93,35 @@
     </style>
   </head>
   <body>
-    <iframe
-      id="toolkit-frame"
-      src="https://fivenines-ops.fly.dev/gmail-panel"
-      allow="clipboard-read; clipboard-write"
-    ></iframe>
+    <div class="shell-root">
+      <header class="shell-bar">
+        <span class="shell-brand">
+          <span class="shell-dot" aria-hidden="true"></span>
+          <span>FIVE NINES OPS</span>
+        </span>
+        <div class="shell-actions">
+          <button id="btn-reload-frame" class="shell-btn" type="button" title="Reload Operations Panel">
+            &#x21bb; Reload
+          </button>
+          <a
+            id="link-open-dashboard"
+            class="shell-link"
+            href="https://fivenines-ops.fly.dev/"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Open Full Dashboard in a new tab"
+          >
+            Dashboard &#x2197;
+          </a>
+        </div>
+      </header>
+      <iframe
+        id="toolkit-frame"
+        src="https://fivenines-ops.fly.dev/?panel=1"
+        allow="clipboard-read; clipboard-write"
+        title="Five Nines Freight Toolkit"
+      ></iframe>
+    </div>
     <script src="sidepanel.js"></script>
   </body>
 </html>

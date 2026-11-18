@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   TAI_CREATE_PACKAGING_TYPES,
   TAI_CREATE_TRAILER_TYPES,
@@ -20,7 +20,7 @@ import {
 } from "@shared/load-entry";
 import type { CarrierOption, CustomerOption, SavedFacility } from "@shared/tai-webhook-schema";
 import { lookupZipCityState } from "../lib/zip-lookup";
-import { ChevronDown, ChevronRight, FileText, MoreHorizontal, Plus, Rocket, Sparkles, X } from "lucide-react";
+import { AlertTriangle, BookmarkPlus, ChevronDown, ChevronRight, FileText, MoreHorizontal, Plus, Rocket, Sparkles, X } from "lucide-react";
 
 interface CompactLoadBuilderProps {
   compact?: boolean; // true inside the 420px Gmail Panel -> ultra-short zero-bloat layout!
@@ -32,6 +32,10 @@ interface CompactLoadBuilderProps {
   onBooked: (createdIds: string[], msg: string) => void;
   onToast: (msg: string) => void;
   onExtractSampleTender?: () => void;
+  onFacilitySaved?: () => Promise<void> | void;
+  onOpenBolGenerator?: () => void;
+  onOpenQuoteBuilder?: () => void;
+  externalCreateSignal?: number;
 }
 
 const INSTRUCTION_CHIPS = [
@@ -100,6 +104,18 @@ interface StopMapsPanelState {
   candidates: FacilitySearchCandidate[];
 }
 
+interface TaiPreviewModalContext {
+  previewToken: string;
+  customerId: number | string | null;
+  carrierMasterId: number | string | null;
+}
+
+interface DuplicateBookingWarning {
+  duplicateOf: string;
+  matchedOn: string;
+  message: string;
+}
+
 export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   compact = false,
   entry,
@@ -110,8 +126,13 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   onBooked,
   onToast,
   onExtractSampleTender,
+  onFacilitySaved,
+  onOpenBolGenerator,
+  onOpenQuoteBuilder,
+  externalCreateSignal = 0,
 }) => {
   const [expandedStopIdx, setExpandedStopIdx] = useState<number | null>(null);
+  const [savingStopIdx, setSavingStopIdx] = useState<number | null>(null);
   const [mapsPanel, setMapsPanel] = useState<StopMapsPanelState>({
     openStopIdx: null,
     loading: false,
@@ -127,6 +148,10 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
   const [showMoreMenu, setShowMoreMenu] = useState<boolean>(false);
   const [showJsonPreview, setShowJsonPreview] = useState<boolean>(false);
   const [showConfirmModal, setShowConfirmModal] = useState<boolean>(false);
+  const [previewLoading, setPreviewLoading] = useState<boolean>(false);
+  const [previewCtx, setPreviewCtx] = useState<TaiPreviewModalContext | null>(null);
+  const [duplicateWarning, setDuplicateWarning] = useState<DuplicateBookingWarning | null>(null);
+  const [bookingAlert, setBookingAlert] = useState<string | null>(null);
   const [duplicateCount, setDuplicateCount] = useState<number>(1);
   const [submitting, setSubmitting] = useState<boolean>(false);
 
@@ -372,28 +397,171 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
     onChange({ ...entry, accessorials: entry.accessorials.filter((_, i) => i !== idx) });
   };
 
+  const saveStopToAddressBook = async (idx: number) => {
+    const st = entry.stops[idx];
+    if (!st || !st.companyName.trim() || !st.city.trim() || !st.state.trim() || !st.zipCode.trim()) {
+      onToast("Enter stop company, city, state, and 5-digit ZIP before saving to Address Book.");
+      return;
+    }
+    setSavingStopIdx(idx);
+    try {
+      const res = await fetch("/api/facilities/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          companyName: st.companyName.trim(),
+          streetAddress: st.streetAddress.trim(),
+          city: st.city.trim(),
+          state: st.state.trim().toUpperCase(),
+          zipCode: st.zipCode.trim(),
+          contactName: st.contactName.trim(),
+          phone: st.phone.trim(),
+          customerName: entry.customer.name.trim(),
+          customerOrganizationId: entry.customer.taiOrganizationId || undefined,
+          taiOrganizationId: entry.customer.taiOrganizationId || undefined,
+        }),
+      });
+      const out = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string };
+      if (!res.ok || out.ok === false) {
+        onToast(out.message || "Could not save stop to Address Book.");
+        return;
+      }
+      updateStop(idx, { savedFacilityMatched: true });
+      await onFacilitySaved?.();
+      onToast(out.message || `Saved ${st.companyName} (${st.city}, ${st.state}) to Address Book!`);
+    } catch {
+      onToast("Network error saving stop to Address Book.");
+    } finally {
+      setSavingStopIdx(null);
+    }
+  };
+
+  const fetchTaiPreview = async (targetEntry: LoadEntry) => {
+    setPreviewLoading(true);
+    try {
+      const res = await fetch("/api/loads/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ entry: { ...targetEntry, sendToTai: true } }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        previewToken?: string;
+        context?: {
+          customerId?: number | string | null;
+          carrierMasterId?: number | string | null;
+        };
+      };
+      setPreviewCtx({
+        previewToken: String(data.previewToken || ""),
+        customerId: data.context?.customerId ?? (targetEntry.customer.taiOrganizationId || null),
+        carrierMasterId: data.context?.carrierMasterId ?? null,
+      });
+    } catch {
+      setPreviewCtx({
+        previewToken: "",
+        customerId: targetEntry.customer.taiOrganizationId || null,
+        carrierMasterId: null,
+      });
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
   const requestTaiBookingConfirm = () => {
     if (issues.length > 0) {
       onToast(`Complete required TAI field: ${issues[0].message}`);
       return;
     }
+    setDuplicateWarning(null);
+    setBookingAlert(null);
     setShowConfirmModal(true);
+    void fetchTaiPreview(entry);
   };
 
-  const executeTaiBooking = async () => {
+  useEffect(() => {
+    if (externalCreateSignal > 0) {
+      requestTaiBookingConfirm();
+    }
+  }, [externalCreateSignal]);
+
+  const executeTaiBooking = async (confirmDuplicate = false) => {
     setSubmitting(true);
+    setBookingAlert(null);
     try {
       const res = await fetch("/api/loads/book", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ entry, duplicateCount }),
+        credentials: "include",
+        body: JSON.stringify({
+          entry: { ...entry, sendToTai: true },
+          previewToken: previewCtx?.previewToken || undefined,
+          duplicateCount,
+          confirmDuplicate,
+        }),
       });
-      const data = await res.json();
-      if (!data.ok) {
-        onToast(data.message || "TAI validation blocked booking");
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        shipmentId?: string;
+        createdIds?: string[];
+        message?: string;
+        requiresDuplicateConfirmation?: boolean;
+        requiresPreviewRefresh?: boolean;
+        needsHumanReconciliation?: boolean;
+        duplicateOf?: string | { id?: string; po?: string; customer?: string };
+        matchedOn?: string;
+      };
+
+      if (res.status === 409 && data.requiresDuplicateConfirmation) {
+        const dupRef =
+          typeof data.duplicateOf === "string"
+            ? data.duplicateOf
+            : data.duplicateOf?.id
+            ? `#${data.duplicateOf.id}${data.duplicateOf.po ? ` (PO ${data.duplicateOf.po})` : ""}`
+            : "Existing Shipment";
+        setDuplicateWarning({
+          duplicateOf: dupRef,
+          matchedOn: String(data.matchedOn || "customer + PO / lane-date"),
+          message:
+            data.message ||
+            `Matching shipment (${dupRef}) already exists in TAI (${data.matchedOn || "duplicate check"}).`,
+        });
+        return;
+      }
+
+      if (res.status === 409 && data.requiresPreviewRefresh) {
+        await fetchTaiPreview(entry);
+        setBookingAlert(
+          data.message || "Draft changed since preview — refreshed preview token. Please review and confirm.",
+        );
+        return;
+      }
+
+      if (data.needsHumanReconciliation || res.status === 502) {
+        setBookingAlert(
+          data.message ||
+            "TAI returned an ambiguous or unverified response — halted without blind retry. Reconcile in TAI before re-booking.",
+        );
+        return;
+      }
+
+      if (!res.ok || !data.ok) {
+        const errMsg = data.message || "TAI validation blocked booking";
+        setBookingAlert(errMsg);
+        onToast(errMsg);
       } else {
+        const ids =
+          Array.isArray(data.createdIds) && data.createdIds.length > 0
+            ? data.createdIds
+            : data.shipmentId
+            ? [String(data.shipmentId)]
+            : [];
         setShowConfirmModal(false);
-        onBooked(data.createdIds, data.message);
+        setDuplicateWarning(null);
+        setBookingAlert(null);
+        onBooked(ids, data.message || `Created load #${ids.join(", #")} in TAI`);
       }
     } finally {
       setSubmitting(false);
@@ -430,38 +598,42 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
         )}
       </div>
 
-      {/* 2. CUSTOMER (OPTIONAL TAI LINK) + PO / BOL IN ONE COMPACT BLOCK */}
+      {/* 2. CUSTOMER (OPTIONAL TAI LINK) + CONTACT / EMAIL + PO / BOL */}
       <div
-        className="p-2.5 rounded-lg space-y-2"
+        className="p-3 rounded-xl space-y-2"
         style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
       >
-        <div className={`grid ${compact ? "grid-cols-12" : "grid-cols-12"} gap-2 items-end`}>
+        <div className="flex items-center justify-between">
+          <span className="text-[10.5px] font-semibold uppercase tracking-[0.08em]" style={{ color: "var(--pf-text-muted)" }}>
+            CUSTOMER
+          </span>
+          <button
+            type="button"
+            onClick={() =>
+              onChange({
+                ...entry,
+                customer: {
+                  ...entry.customer,
+                  taiOrganizationId: entry.customer.taiOrganizationId ? "" : "698049",
+                },
+              })
+            }
+            className="font-mono text-[10px] px-1.5 py-0.5 rounded"
+            style={{
+              background: entry.customer.taiOrganizationId ? "var(--pf-primary-dim)" : "var(--pf-surface-raised)",
+              color: entry.customer.taiOrganizationId ? "var(--pf-primary)" : "var(--pf-text-muted)",
+            }}
+            title="Toggle TAI Organization ID link (unlinked customers still register in TAI)"
+          >
+            {entry.customer.taiOrganizationId ? `TAI Org #${entry.customer.taiOrganizationId}` : "Unlinked OK"}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-12 gap-2 items-end">
           <div className={compact ? "col-span-7" : "col-span-6"}>
-            <div className="flex items-center justify-between mb-0.5">
-              <label className="text-[11px] font-medium" style={{ color: "var(--pf-text-muted)" }}>
-                Customer (TAI Link Optional)
-              </label>
-              <button
-                type="button"
-                onClick={() =>
-                  onChange({
-                    ...entry,
-                    customer: {
-                      ...entry.customer,
-                      taiOrganizationId: entry.customer.taiOrganizationId ? "" : "698049",
-                    },
-                  })
-                }
-                className="font-mono text-[10px] px-1.5 py-0.2 rounded"
-                style={{
-                  background: entry.customer.taiOrganizationId ? "var(--pf-primary-dim)" : "var(--pf-surface-raised)",
-                  color: entry.customer.taiOrganizationId ? "var(--pf-primary)" : "var(--pf-text-muted)",
-                }}
-                title="Toggle TAI Organization ID link (unlinked customers still register in TAI)"
-              >
-                {entry.customer.taiOrganizationId ? `#${entry.customer.taiOrganizationId}` : "Unlinked OK"}
-              </button>
-            </div>
+            <label className="block text-[11px] mb-0.5" style={{ color: "var(--pf-text-muted)" }}>
+              Company
+            </label>
             <input
               list="pf-customer-list"
               value={entry.customer.name}
@@ -477,7 +649,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                   },
                 });
               }}
-              placeholder="Customer name (optional)"
+              placeholder="Customer company name"
               className="pf-input font-medium"
             />
             <datalist id="pf-customer-list">
@@ -517,6 +689,36 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               />
             </div>
           )}
+        </div>
+
+        <div className="grid grid-cols-12 gap-2">
+          <div className="col-span-5">
+            <label className="block text-[11px] mb-0.5" style={{ color: "var(--pf-text-muted)" }}>
+              Contact
+            </label>
+            <input
+              value={entry.customer.contactName || ""}
+              onChange={(e) =>
+                onChange({ ...entry, customer: { ...entry.customer, contactName: e.target.value } })
+              }
+              placeholder="Contact name"
+              className="pf-input"
+            />
+          </div>
+          <div className="col-span-7">
+            <label className="block text-[11px] mb-0.5" style={{ color: "var(--pf-text-muted)" }}>
+              Email
+            </label>
+            <input
+              type="email"
+              value={entry.customer.email || ""}
+              onChange={(e) =>
+                onChange({ ...entry, customer: { ...entry.customer, email: e.target.value } })
+              }
+              placeholder="shipping@customer.com"
+              className="pf-input"
+            />
+          </div>
         </div>
       </div>
 
@@ -620,6 +822,22 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                     title="Search Google Maps & TAI Verified Facilities"
                   >
                     📍 Maps
+                  </button>
+                  {/* Save to Address Book Button (POST /api/facilities/save) */}
+                  <button
+                    type="button"
+                    disabled={savingStopIdx === idx}
+                    onClick={() => void saveStopToAddressBook(idx)}
+                    className="px-1.5 py-1 rounded text-[11px] font-medium shrink-0 inline-flex items-center gap-0.5"
+                    style={{
+                      background: st.savedFacilityMatched ? "var(--pf-primary-dim)" : "var(--pf-surface)",
+                      color: st.savedFacilityMatched ? "var(--pf-primary)" : "var(--pf-text-muted)",
+                      border: "1px solid var(--pf-border)",
+                    }}
+                    title="Save stop facility to Address Book"
+                  >
+                    <BookmarkPlus size={12} />
+                    {!compact && <span>{savingStopIdx === idx ? "…" : "Save"}</span>}
                   </button>
                   <button
                     type="button"
@@ -904,6 +1122,20 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                         className="pf-input font-mono"
                       />
                     </div>
+                    <button
+                      type="button"
+                      disabled={savingStopIdx === idx}
+                      onClick={() => void saveStopToAddressBook(idx)}
+                      className="w-full py-1 px-2 rounded text-[11px] font-semibold inline-flex items-center justify-center gap-1"
+                      style={{
+                        background: "var(--pf-primary-dim)",
+                        color: "var(--pf-primary)",
+                        border: "1px solid rgba(62,191,130,0.35)",
+                      }}
+                    >
+                      <BookmarkPlus size={11} />
+                      {savingStopIdx === idx ? "Saving to Address Book…" : "Save Stop Facility to Address Book"}
+                    </button>
                   </div>
                 )}
               </div>
@@ -1455,9 +1687,44 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
         )}
       </div>
 
-      {/* 6. STICKY SINGLE-ROW ACTION BAR (Replaces 6 giant stacked buttons!) */}
+      {/* 5B. CLEAN 3-COLUMN RATE SUMMARY CARD (Customer | Carrier | Margin) */}
       <div
-        className="p-2 rounded-lg flex items-center justify-between gap-2 relative"
+        className="p-3 rounded-xl space-y-2"
+        style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+      >
+        <div className="text-[10.5px] font-semibold uppercase tracking-[0.08em]" style={{ color: "var(--pf-text-muted)" }}>
+          RATE
+        </div>
+        <div className="grid grid-cols-3 gap-2 font-mono">
+          <div>
+            <div className="text-[11px] font-sans" style={{ color: "var(--pf-text-muted)" }}>
+              Customer
+            </div>
+            <div className="text-base font-bold mt-0.5">${Math.round(totals.totalSell).toLocaleString()}</div>
+          </div>
+          <div>
+            <div className="text-[11px] font-sans" style={{ color: "var(--pf-text-muted)" }}>
+              Carrier
+            </div>
+            <div className="text-base font-bold mt-0.5">${Math.round(totals.totalBuy).toLocaleString()}</div>
+          </div>
+          <div>
+            <div className="text-[11px] font-sans" style={{ color: "var(--pf-text-muted)" }}>
+              Margin
+            </div>
+            <div
+              className="text-base font-bold mt-0.5"
+              style={{ color: totals.totalMargin >= 0 ? "var(--pf-primary)" : "var(--pf-danger)" }}
+            >
+              {totals.totalMargin >= 0 ? "" : "-"}${Math.abs(Math.round(totals.totalMargin)).toLocaleString()}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 6. STICKY SINGLE-ROW ACTION BAR (Guarded 🚀 Generate Load in TAI) */}
+      <div
+        className="p-2 rounded-xl flex items-center justify-between gap-2 relative"
         style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
       >
         <div className="flex items-center gap-1.5 text-xs">
@@ -1480,17 +1747,21 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
             type="button"
             disabled={submitting}
             onClick={requestTaiBookingConfirm}
-            className="flex-1 max-w-[260px] py-2 px-3 rounded-lg text-xs font-bold inline-flex items-center justify-center gap-1.5 transition-opacity"
-            style={{ background: "var(--pf-action)", color: "#ffffff" }}
+            className="flex-1 max-w-[280px] py-2 px-3 rounded-xl text-xs font-bold inline-flex items-center justify-center gap-1.5 transition-opacity"
+            style={
+              compact
+                ? { background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }
+                : { background: "var(--pf-action)", color: "#ffffff" }
+            }
           >
             <Rocket size={13} />
-            {submitting ? "Booking…" : `Book in TAI${duplicateCount > 1 ? ` (×${duplicateCount})` : ""}`}
+            {submitting ? "Booking…" : `🚀 Generate Load in TAI${duplicateCount > 1 ? ` (×${duplicateCount})` : ""}`}
           </button>
 
           <button
             type="button"
             onClick={() => setShowMoreMenu(!showMoreMenu)}
-            className="px-2.5 py-2 rounded-lg text-xs font-medium inline-flex items-center gap-1"
+            className="px-2.5 py-2 rounded-xl text-xs font-medium inline-flex items-center gap-1"
             style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
             title="BOL Only, Customer Quote, PDF RateCon & TAI API Preview"
           >
@@ -1501,14 +1772,18 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
 
         {showMoreMenu && (
           <div
-            className="absolute right-2 bottom-12 w-56 rounded-lg p-1.5 shadow-xl z-20 space-y-1 text-xs"
+            className="absolute right-2 bottom-12 w-56 rounded-xl p-1.5 shadow-xl z-20 space-y-1 text-xs"
             style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
           >
             <button
               type="button"
               onClick={() => {
                 setShowMoreMenu(false);
-                onToast(`Generated standalone BOL PDF (${entry.items.length} commodity lines) — no TAI booking sent.`);
+                if (onOpenBolGenerator) {
+                  onOpenBolGenerator();
+                } else {
+                  onToast(`Generated standalone BOL PDF (${entry.items.length} commodity lines) — no TAI booking sent.`);
+                }
               }}
               className="w-full text-left px-2.5 py-1.5 rounded hover:opacity-90"
               style={{ background: "var(--pf-surface)" }}
@@ -1519,7 +1794,11 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               type="button"
               onClick={() => {
                 setShowMoreMenu(false);
-                onToast(`Generated Formal Customer Quote ($${totals.totalSell.toLocaleString()}) for ${entry.customer.name || "Customer"}.`);
+                if (onOpenQuoteBuilder) {
+                  onOpenQuoteBuilder();
+                } else {
+                  onToast(`Generated Formal Customer Quote ($${totals.totalSell.toLocaleString()}) for ${entry.customer.name || "Customer"}.`);
+                }
               }}
               className="w-full text-left px-2.5 py-1.5 rounded hover:opacity-90"
               style={{ background: "var(--pf-surface)" }}
@@ -1555,7 +1834,7 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       {showJsonPreview && (
         <pre
           className="p-3 rounded-lg text-[11px] font-mono overflow-x-auto max-h-56 pf-scroll"
-          style={{ background: "#0b0e12", color: "#8ce6b8", border: "1px solid var(--pf-border)" }}
+          style={{ background: "var(--pf-bg)", color: "var(--pf-primary-bright, #66d9a2)", border: "1px solid var(--pf-border)" }}
         >
           {JSON.stringify(taiRequestPreview, null, 2)}
         </pre>
@@ -1564,11 +1843,11 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
       {showConfirmModal && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-3"
-          style={{ background: "rgba(9, 12, 18, 0.78)" }}
+          style={{ background: "rgba(9, 12, 18, 0.82)" }}
           onClick={() => !submitting && setShowConfirmModal(false)}
         >
           <div
-            className="w-full max-w-md rounded-xl p-4 space-y-3 shadow-2xl text-xs"
+            className="w-full max-w-md rounded-2xl p-4 space-y-3 shadow-2xl text-xs max-h-[90vh] overflow-y-auto pf-scroll"
             style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)", color: "var(--pf-text)" }}
             onClick={(e) => e.stopPropagation()}
           >
@@ -1576,8 +1855,8 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               <div>
                 <div className="font-serif font-bold text-sm">Generate this load in TAI?</div>
                 <div className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>
-                  Verify stops, equipment &amp; commodity before sending to TAI
-                  {duplicateCount > 1 ? ` (${duplicateCount} duplicate orders)` : ""}
+                  3-Step Guarded TAI Push (Create Shipment → Sell Charges → Carrier Charges)
+                  {duplicateCount > 1 ? ` · ×${duplicateCount} orders` : ""}
                 </div>
               </div>
               <button
@@ -1591,13 +1870,84 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
               </button>
             </div>
 
+            {/* Resolved TAI IDs & Preview Token Verification Strip */}
+            <div
+              className="p-2.5 rounded-xl space-y-1 font-mono text-[11px]"
+              style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span style={{ color: "var(--pf-text-muted)" }}>Resolved Customer ID:</span>
+                <strong style={{ color: "var(--pf-primary)" }}>
+                  {previewLoading
+                    ? "Resolving…"
+                    : previewCtx?.customerId
+                    ? `#${previewCtx.customerId}`
+                    : "Unlinked Spot OK"}
+                </strong>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span style={{ color: "var(--pf-text-muted)" }}>Resolved Carrier Master ID:</span>
+                <strong style={{ color: previewCtx?.carrierMasterId ? "var(--pf-primary)" : "var(--pf-text-muted)" }}>
+                  {previewLoading
+                    ? "Resolving…"
+                    : previewCtx?.carrierMasterId
+                    ? `#${previewCtx.carrierMasterId}`
+                    : entry.carrier.name || "Unassigned"}
+                </strong>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span style={{ color: "var(--pf-text-muted)" }}>Preview Lock Token:</span>
+                <span style={{ color: previewCtx?.previewToken ? "var(--pf-primary)" : "var(--pf-text-subtle)" }}>
+                  {previewLoading
+                    ? "Computing SHA-256…"
+                    : previewCtx?.previewToken
+                    ? `✓ ${previewCtx.previewToken.slice(0, 14)}…`
+                    : "Sandbox Ready"}
+                </span>
+              </div>
+            </div>
+
+            {/* Explicit HTTP 409 Duplicate Load Warning Banner */}
+            {duplicateWarning && (
+              <div
+                role="alert"
+                className="p-3 rounded-xl space-y-1.5"
+                style={{
+                  background: "var(--pf-warning-dim)",
+                  color: "var(--pf-warning)",
+                  border: "1px solid var(--pf-warning)",
+                }}
+              >
+                <div className="font-bold inline-flex items-center gap-1.5">
+                  <AlertTriangle size={14} /> Duplicate Booking Guard Triggered (409)
+                </div>
+                <div className="text-[11px] leading-snug">{duplicateWarning.message}</div>
+                <div className="font-mono text-[10px]">
+                  Duplicate Of: <strong>{duplicateWarning.duplicateOf}</strong> · Matched On:{" "}
+                  <strong>{duplicateWarning.matchedOn}</strong>
+                </div>
+              </div>
+            )}
+
+            {/* Reconciliation / Validation Error Banner */}
+            {bookingAlert && (
+              <div
+                role="alert"
+                className="p-2.5 rounded-xl text-[11px] font-medium"
+                style={{
+                  background: "var(--pf-danger-dim)",
+                  color: "var(--pf-danger)",
+                  border: "1px solid var(--pf-danger)",
+                }}
+              >
+                ⚠ {bookingAlert}
+              </div>
+            )}
+
             <div className="space-y-1.5 leading-relaxed">
               <div>
                 <strong style={{ color: "var(--pf-text-muted)" }}>Customer:</strong>{" "}
-                <span className="font-semibold">{entry.customer.name || "Unlinked Spot Customer"}</span>{" "}
-                <span className="font-mono text-[11px]" style={{ color: "var(--pf-primary)" }}>
-                  ({entry.customer.taiOrganizationId ? `TAI Org #${entry.customer.taiOrganizationId}` : "Unlinked OK"})
-                </span>
+                <span className="font-semibold">{entry.customer.name || "Unlinked Spot Customer"}</span>
               </div>
 
               {entry.stops.map((st, idx) => {
@@ -1635,12 +1985,15 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                       <button
                         key={eqOption}
                         type="button"
-                        onClick={() =>
-                          onChange({
+                        onClick={() => {
+                          const updated: LoadEntry = {
                             ...entry,
                             equipment: { ...entry.equipment, trailerType: eqOption },
-                          })
-                        }
+                          };
+                          onChange(updated);
+                          setDuplicateWarning(null);
+                          void fetchTaiPreview(updated);
+                        }}
                         className="px-2 py-0.5 rounded text-[10px] font-medium"
                         style={{
                           background: active ? "var(--pf-action)" : "var(--pf-surface-raised)",
@@ -1667,36 +2020,58 @@ export const CompactLoadBuilder: React.FC<CompactLoadBuilderProps> = ({
                 </div>
               )}
 
-              <div>
-                <strong style={{ color: "var(--pf-text-muted)" }}>Customer Rate:</strong>{" "}
-                <span className="font-mono font-bold" style={{ color: totals.totalSell > 0 ? "var(--pf-primary)" : "var(--pf-text-muted)" }}>
-                  {totals.totalSell > 0
-                    ? `$${totals.totalSell.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                    : "Pending / TBD"}
+              <div className="flex items-center justify-between pt-1 font-mono">
+                <span>
+                  <strong style={{ color: "var(--pf-text-muted)" }}>Sell:</strong>{" "}
+                  <strong style={{ color: "var(--pf-primary)" }}>${totals.totalSell.toLocaleString()}</strong>
+                </span>
+                <span>
+                  <strong style={{ color: "var(--pf-text-muted)" }}>Buy:</strong>{" "}
+                  <strong>${totals.totalBuy.toLocaleString()}</strong>
+                </span>
+                <span style={{ color: totals.totalMargin >= 0 ? "var(--pf-primary)" : "var(--pf-danger)" }}>
+                  <strong>Margin: ${totals.totalMargin.toLocaleString()}</strong>
                 </span>
               </div>
             </div>
 
-            <div className="flex items-center justify-end gap-2 pt-2" style={{ borderTop: "1px solid var(--pf-border)" }}>
+            <div className="flex items-center justify-end gap-2 pt-2 flex-wrap" style={{ borderTop: "1px solid var(--pf-border)" }}>
               <button
                 type="button"
                 disabled={submitting}
-                onClick={() => setShowConfirmModal(false)}
-                className="px-3 py-1.5 rounded-lg font-medium"
+                onClick={() => {
+                  setShowConfirmModal(false);
+                  setDuplicateWarning(null);
+                }}
+                className="px-3 py-1.5 rounded-xl font-medium"
                 style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
               >
                 Cancel
               </button>
-              <button
-                type="button"
-                disabled={submitting}
-                onClick={executeTaiBooking}
-                className="px-4 py-1.5 rounded-lg font-bold inline-flex items-center gap-1.5"
-                style={{ background: "var(--pf-action)", color: "#ffffff" }}
-              >
-                <Rocket size={12} />
-                {submitting ? "Sending to TAI…" : "OK · Generate in TAI"}
-              </button>
+
+              {duplicateWarning ? (
+                <button
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => void executeTaiBooking(true)}
+                  className="px-4 py-1.5 rounded-xl font-bold inline-flex items-center gap-1.5"
+                  style={{ background: "var(--pf-danger)", color: "#ffffff" }}
+                >
+                  <AlertTriangle size={12} />
+                  {submitting ? "Booking Duplicate…" : "Confirm & Book Duplicate Anyway"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={submitting || previewLoading}
+                  onClick={() => void executeTaiBooking(false)}
+                  className="px-4 py-1.5 rounded-xl font-bold inline-flex items-center gap-1.5"
+                  style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
+                >
+                  <Rocket size={12} />
+                  {submitting ? "Sending to TAI…" : "OK · Generate in TAI"}
+                </button>
+              )}
             </div>
           </div>
         </div>

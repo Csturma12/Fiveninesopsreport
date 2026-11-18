@@ -1,6 +1,9 @@
 import type { LoadEntryItem, LoadEntryStop } from "./load-entry";
 
-export type DispatchStage = "Needs truck" | "Assigned" | "In transit" | "Delivered";
+export type ShipmentStage = "Needs truck" | "Assigned" | "In transit" | "Delivered" | "Cancelled";
+export type DispatchStage = ShipmentStage;
+
+export type RateconStatus = "Not Sent" | "Drafted" | "Sent" | "Signed";
 
 export interface ContainerEventItem {
   id: string;
@@ -21,8 +24,9 @@ export interface OpsShipment {
   stops: LoadEntryStop[];
   commodities: LoadEntryItem[];
   accessorials: string[];
-  stage: DispatchStage;
+  stage: ShipmentStage;
   rawStatus: string;
+  taiRawStatus?: string;
   carrier: string;
   mc: string;
   po: string;
@@ -33,18 +37,36 @@ export interface OpsShipment {
   containerEvents?: ContainerEventItem[];
   shipDate: string;
   delivDate: string;
+  shipDateIso?: string;
+  delivDateIso?: string;
   equip: string;
   trailerSize: "Full" | "Partial";
   mileage: number;
   sell: number;
   buy: number;
   podCount: number;
+  podStatus?: string;
   emailPodAvailable: boolean;
-  rateconStatus: "Not Sent" | "Drafted" | "Sent";
+  rateconStatus: RateconStatus;
   writebackState: string;
   location: string;
+  currentLocation?: string;
+  driverPhone?: string;
+  trailerNumber?: string;
   mismatchNote?: string;
   invoiceStatus?: string;
+  carrierPayStatus?: string;
+}
+
+export interface ExtractedEmailFields {
+  customerPO?: string;
+  sellRate?: number;
+  buyRate?: number;
+  origin?: string;
+  dest?: string;
+  equipment?: string;
+  readyDate?: string;
+  notes?: string;
 }
 
 export interface CrucialEmailItem {
@@ -62,6 +84,9 @@ export interface CrucialEmailItem {
   body: string;
   fullBody?: string;
   threadId?: string;
+  messageId?: string;
+  unread?: boolean;
+  source?: "extension" | "ap_inbox" | "intake_draft" | "seed";
   permalink?: string;
   containerNumber?: string;
   operationalNote?: string;
@@ -69,6 +94,7 @@ export interface CrucialEmailItem {
   extractedAmount?: number;
   extractedCarrier?: string;
   extractedInvoice?: string;
+  extractedFields?: ExtractedEmailFields;
   attachments?: Array<{ filename?: string; mimeType?: string }>;
   applied?: boolean;
 }
@@ -83,6 +109,7 @@ export interface SavedFacility {
   zipCode: string;
   contactName: string;
   phone: string;
+  email?: string;
 }
 
 export interface CarrierOption {
@@ -92,6 +119,10 @@ export interface CarrierOption {
   scac: string;
   taiMasterId: string;
   insuranceStatus: string;
+  insuranceExpiry?: string;
+  contactName?: string;
+  phone?: string;
+  email?: string;
   laneNote?: string;
   avgBuy?: number;
 }
@@ -101,6 +132,9 @@ export interface CustomerOption {
   taiOrgId: string;
   city: string;
   state: string;
+  contactName?: string;
+  phone?: string;
+  email?: string;
 }
 
 export type CrmLeadStage = "New" | "Researching" | "Contacted" | "Qualified" | "Converted";
@@ -146,9 +180,27 @@ export interface OpsKpis {
 export interface WebhookEventLog {
   id: string;
   timestamp: string;
-  type: "ShipmentDetailUpdateUrl" | "InvoiceCreateWithShipmentUrl" | "CarrierWriteBackPoller" | "SupabaseRealtime";
+  type:
+    | "ShipmentDetailUpdateUrl"
+    | "InvoiceCreateWithShipmentUrl"
+    | "CarrierWriteBackPoller"
+    | "SupabaseRealtime"
+    | "DocumentAttachments";
   shipmentId: string;
   summary: string;
+}
+
+export interface BootstrapCounts {
+  totalShipments: number;
+  uncoveredCommitted: number;
+  coveredCommitted: number;
+  dispatched: number;
+  inTransit: number;
+  delivered: number;
+  cancelled: number;
+  customers: number;
+  carriers: number;
+  facilities: number;
 }
 
 export interface BootstrapPayload {
@@ -160,6 +212,10 @@ export interface BootstrapPayload {
     pollerEnabled: boolean;
     pollerScope: string;
   };
+  supabaseConnected?: boolean;
+  supabaseError?: string | null;
+  lastSyncAt?: string;
+  counts?: BootstrapCounts;
   user?: {
     email: string;
     name: string;
@@ -228,12 +284,71 @@ export interface TaiInvoiceWebhookPayload {
   status?: string;
 }
 
-export function mapTaiStatusToStage(raw?: string): DispatchStage {
-  const s = String(raw || "").toLowerCase();
-  if (s.includes("deliver") || s.includes("complete") || s.includes("invoic")) return "Delivered";
-  if (s.includes("transit") || s.includes("picked") || s.includes("out for")) return "In transit";
-  if (s.includes("dispatch") || s.includes("assign") || s.includes("tender")) return "Assigned";
+/**
+ * Canonical operational stage mapper aligned with `primary-freight-dashboard/shared/load-stages.ts`:
+ * - Cancelled / Canceled loads NEVER fall through to "Needs truck".
+ * - Out for Delivery / At Delivery / Picked Up / In Transit -> "In transit".
+ * - Delivered / Complete / Invoiced / Billed -> "Delivered".
+ * - Dispatched / Covered / Assigned OR Committed/Booked/Ready with an assigned carrier -> "Assigned".
+ * - Uncovered Committed / Quote -> "Needs truck".
+ */
+export function mapTaiStatusToStage(rawStatus?: string, carrierName?: string): ShipmentStage {
+  const raw = String(rawStatus ?? "").trim();
+  if (/cancel/i.test(raw)) return "Cancelled";
+  if (/in\s*transit|picked|loaded|out\s*for\s*delivery|at\s*delivery|en\s*route/i.test(raw)) {
+    return "In transit";
+  }
+  if (/deliver|complete|invoiced|billed/i.test(raw)) return "Delivered";
+  const hasCarrier = Boolean(carrierName && String(carrierName).trim());
+  if (
+    /dispatched|covered|assigned/i.test(raw) ||
+    (hasCarrier && /committed|booked|ready|open|pending/i.test(raw || "Committed"))
+  ) {
+    return "Assigned";
+  }
   return "Needs truck";
+}
+
+const SENT_TAI_STATUSES = new Set([
+  "sent",
+  "dispatched",
+  "in transit",
+  "out for delivery",
+  "delivered",
+  "complete",
+  "completed",
+]);
+
+/**
+ * Derives RateCon status without ever overwriting an explicit `"Not Sent"` just because `carrier` is populated.
+ */
+export function deriveRateconStatus(row: Record<string, unknown> | null | undefined): RateconStatus {
+  if (!row) return "Not Sent";
+  const explicit = String(row.ratecon_status ?? row.rateconStatus ?? "").trim();
+  if (explicit) {
+    if (/^not\s*sent$/i.test(explicit) || /^unsent$/i.test(explicit)) return "Not Sent";
+    if (/^signed$/i.test(explicit)) return "Signed";
+    if (/^drafted$/i.test(explicit)) return "Drafted";
+    if (/^sent$/i.test(explicit)) return "Sent";
+  }
+
+  const taiCarrierConf = String(
+    row.ratecon_tai_carrier_confirmation ?? row.rateconTaiCarrierConfirmation ?? "",
+  ).trim();
+  if (/^true$/i.test(taiCarrierConf)) return "Sent";
+  if (/^false$/i.test(taiCarrierConf)) return "Not Sent";
+
+  const taiRaw = String(row.tai_raw_status ?? row.taiRawStatus ?? "").trim().toLowerCase();
+  if (taiRaw && SENT_TAI_STATUSES.has(taiRaw)) return "Sent";
+  if (taiRaw === "ready" || taiRaw === "committed" || taiRaw === "booked" || taiRaw === "quote" || taiRaw === "quoted") {
+    return "Not Sent";
+  }
+
+  const collapsed = String(row.status ?? row.rawStatus ?? "").trim().toLowerCase();
+  if (collapsed === "dispatched" || collapsed === "in transit" || collapsed === "delivered" || collapsed === "complete") {
+    return "Sent";
+  }
+  return "Not Sent";
 }
 
 export function extractDateShort(iso?: string): string {

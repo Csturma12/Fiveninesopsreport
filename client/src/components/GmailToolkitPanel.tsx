@@ -1,40 +1,113 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import type { LoadEntry } from "@shared/load-entry";
 import type {
   CarrierOption,
+  CrmLeadItem,
   CrucialEmailItem,
   CustomerOption,
+  OpsKpis,
   OpsShipment,
   SavedFacility,
 } from "@shared/tai-webhook-schema";
-import { CompactLoadBuilder } from "./CompactLoadBuilder";
-import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
-import { ClipboardPaste, ExternalLink, Search, Send, Sparkles, Trash2, UserPlus } from "lucide-react";
+import { AllLoadsView } from "./panel/AllLoadsView";
+import { AttentionView } from "./panel/AttentionView";
+import { BolGeneratorView } from "./panel/BolGeneratorView";
+import { DispatchBoardView } from "./panel/DispatchBoardView";
+import { AiAssistantView, ApEmailsView, CheckEmailView } from "./panel/EmailAndAiViews";
+import {
+  captureGmailThread,
+  getPanelPref,
+  setPanelPref,
+  subscribeGmailThreadContext,
+  type CapturedGmailThread,
+} from "./panel/extensionBridge";
+import { HomeLauncherView } from "./panel/HomeLauncherView";
+import { InboxStreamView } from "./panel/InboxStreamView";
+import { LoadBuilderPanelView } from "./panel/LoadBuilderPanelView";
+import { fetchPanelSession, panelFetchJson, type PanelApiContext } from "./panel/panelApi";
+import {
+  clampPanelZoom,
+  isApTaskResolved,
+  normalizeApTaskRecord,
+  parsePanelViewParam,
+  syncPanelUrlView,
+  type ApTaskRecord,
+  type LiveOpsShipment,
+  type PanelKnowledgeRule,
+  type PanelSavedDraft,
+  type PanelSessionInfo,
+  type PanelViewId,
+  type QuoteDraftState,
+} from "./panel/panelTypes";
+import { PanelTopBar } from "./panel/PanelTopBar";
+import { PodFilesView } from "./panel/PodFilesView";
+import { QuoteBuilderView } from "./panel/QuoteBuilderView";
+import { RatesView } from "./panel/RatesView";
+import { SalesPanelView } from "./panel/SalesPanelView";
+import { ToolsView } from "./panel/ToolsView";
 
-interface GmailToolkitPanelProps {
+export interface GmailToolkitPanelProps {
+  fullScreen?: boolean;
   shipments: OpsShipment[];
   crucialEmails: CrucialEmailItem[];
   facilities: SavedFacility[];
   customers: CustomerOption[];
   carriers: CarrierOption[];
+  crmLeads?: CrmLeadItem[];
+  kpis?: OpsKpis | null;
+  bootstrapUser?: { email: string; name: string; mode?: string } | null;
+  isLiveSync?: boolean;
   builderEntry: LoadEntry;
   onBuilderChange: (next: LoadEntry) => void;
   onApplyEmailAction: (email: CrucialEmailItem) => Promise<void>;
   onBooked: (ids: string[], msg: string) => void;
-  onToast: (msg: string) => void;
+  onToast: (msg: string, kind?: "ok" | "error") => void;
   onExtractTender: () => void;
   chatHistory: Array<{ role: "user" | "assistant"; text: string }>;
-  onAskAi: (q: string) => Promise<void>;
+  onAskAi: (q: string, activeEmail?: { subject?: string; from?: string; body?: string } | null) => Promise<void>;
   onDeleteEmail?: (id: string) => Promise<void>;
   onSaveToCrm?: (email: CrucialEmailItem) => Promise<void>;
+  /** Opens the host's file picker; the POD is streamed through the server to TAI (key stays server-side). */
+  onUploadPod?: (shipmentId: string) => void;
+  onRefresh?: () => Promise<void>;
+  onOpenDashboardLoad?: (shipmentId: string) => void;
+}
+
+function createInitialQuoteState(entry: LoadEntry): QuoteDraftState {
+  const pick = entry.stops[0];
+  const drop = entry.stops[entry.stops.length - 1];
+  const validDate = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10);
+  return {
+    customerName: entry.customer.name || "Larkin Refractory Solutions",
+    contactEmail: entry.customer.email || "",
+    origin: pick ? `${pick.city}, ${pick.state} ${pick.zipCode}`.trim() : "Beaver Falls, PA 15010",
+    destination: drop ? `${drop.city}, ${drop.state} ${drop.zipCode}`.trim() : "Lithonia, GA 30058",
+    equipmentType: entry.equipment.trailerType || "48 ft Flatbed | Tarp",
+    estMiles: entry.equipment.mileage || 648,
+    linehaulRate: entry.pricing.linehaulSell || 3050,
+    fuelSurcharge: entry.pricing.fuelSell || 0,
+    accessorials: entry.accessorials.map((a, idx) => ({
+      id: `init-acc-${idx}`,
+      name: a.name,
+      amount: a.sell || 0,
+    })),
+    transitNote: "Next-day / 2-day direct FTL transit",
+    validUntil: validDate,
+    equipmentNotes: entry.specialInstructions || "Includes 8ft tarps | 2 hrs free load/unload",
+  };
 }
 
 export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
+  fullScreen = false,
   shipments,
   crucialEmails,
   facilities,
   customers,
   carriers,
+  crmLeads = [],
+  kpis = null,
+  bootstrapUser = null,
+  isLiveSync = false,
   builderEntry,
   onBuilderChange,
   onApplyEmailAction,
@@ -43,560 +116,514 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
   onExtractTender,
   chatHistory,
   onAskAi,
-  onDeleteEmail,
-  onSaveToCrm,
+  onUploadPod,
+  onRefresh,
+  onOpenDashboardLoad,
 }) => {
-  const [tab, setTab] = useState<"inbox" | "dispatch" | "builder" | "ai">("builder");
-  const [activeEmailIdx, setActiveEmailIdx] = useState<number>(0);
-  const [expandedId, setExpandedId] = useState<string | null>(shipments[0]?.id ?? null);
-  const [aiInput, setAiInput] = useState("");
-  const [liveSubject, setLiveSubject] = useState<string>("");
-  const [showPasteBox, setShowPasteBox] = useState<boolean>(false);
-  const [pasteEmailText, setPasteEmailText] = useState<string>("");
-  const [extracting, setExtracting] = useState<boolean>(false);
-  const [alternateEquip, setAlternateEquip] = useState<string[]>([]);
-  const [panelNotice, setPanelNotice] = useState<string>("");
+  const [view, setView] = useState<PanelViewId>(() => parsePanelViewParam() || (fullScreen ? "home" : "inbox"));
+  const [universalQuery, setUniversalQuery] = useState<string>("");
+  const [expandedLoadId, setExpandedLoadId] = useState<string | null>(shipments[0]?.id ?? null);
+  const [bolTargetId, setBolTargetId] = useState<string | null>(null);
+  const [zoom, setZoom] = useState<number>(100);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
 
-  const notify = (msg: string) => {
-    setPanelNotice(msg);
-    onToast(msg);
-  };
+  const [session, setSession] = useState<PanelSessionInfo | null>(null);
+  const [accountDriftWarning, setAccountDriftWarning] = useState<string | null>(null);
+  const [taiPortalUrl, setTaiPortalUrl] = useState<string>("");
 
-  const extractEmailToBuilder = async (payload: { subject?: string; sender?: string; bodyText: string }) => {
-    setExtracting(true);
-    try {
-      const res = await fetch("/api/extract-email", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const out = await res.json();
-      if (!out.ok || !out.entry) {
-        notify(out.message || "Could not extract load from email");
-        return;
-      }
-      onBuilderChange(out.entry);
-      setAlternateEquip(Array.isArray(out.alternateEquipment) ? out.alternateEquipment : []);
-      setTab("builder");
-      setShowPasteBox(false);
-      notify(out.summary || "Extracted open email into Compact Builder");
-    } finally {
-      setExtracting(false);
-    }
-  };
+  const [liveThread, setLiveThread] = useState<CapturedGmailThread | null>(null);
+  const [panelNotice, setPanelNotice] = useState<{ text: string; kind: "ok" | "error" } | null>(null);
 
+  const [savedDrafts, setSavedDrafts] = useState<PanelSavedDraft[]>([]);
+  const [knowledgeRules, setKnowledgeRules] = useState<PanelKnowledgeRule[]>([]);
+  const [learnedCount, setLearnedCount] = useState<number>(0);
+  const [apTasks, setApTasks] = useState<ApTaskRecord[]>([]);
+  const [quoteDraft, setQuoteDraft] = useState<QuoteDraftState>(() => createInitialQuoteState(builderEntry));
+
+  const notify = useCallback(
+    (msg: string, kind: "ok" | "error" = "ok") => {
+      setPanelNotice({ text: msg, kind });
+      onToast(msg, kind);
+    },
+    [onToast],
+  );
+
+  const navigateView = useCallback(
+    (next: PanelViewId) => {
+      setView(next);
+      syncPanelUrlView(next, fullScreen);
+    },
+    [fullScreen],
+  );
+
+  // Sync browser back/forward ?view= changes
   useEffect(() => {
-    const handler = (event: MessageEvent) => {
-      if (window.parent !== window && event.source !== window.parent) return;
-      const data = event.data;
-      if (!data || typeof data !== "object") return;
-      if (data.type === "FIVENINES_GMAIL_CONTEXT" && data.payload?.subject) {
-        setLiveSubject(String(data.payload.subject));
-      }
-      if (data.type === "FIVENINES_GMAIL_CAPTURED") {
-        if (!data.ok || !data.payload) {
-          setShowPasteBox(true);
-          notify(data.error || "No open Gmail thread detected — paste email text below.");
-          return;
-        }
-        if (data.payload.subject) setLiveSubject(String(data.payload.subject));
-        void extractEmailToBuilder({
-          subject: data.payload.subject,
-          sender: data.payload.sender,
-          bodyText: data.payload.bodyText || "",
-        });
-      }
+    const onPopState = () => {
+      const parsed = parsePanelViewParam();
+      if (parsed) setView(parsed);
     };
-    window.addEventListener("message", handler);
-    return () => window.removeEventListener("message", handler);
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
-  const requestOpenGmailCapture = () => {
-    if (window.parent !== window) {
-      const requestId = `cap-${Date.now()}`;
-      window.parent.postMessage({ type: "FIVENINES_CAPTURE_GMAIL_REQ", requestId }, "*");
-      notify("Reading open Gmail conversation…");
-    } else {
-      setShowPasteBox((v) => !v);
-      notify("Paste Gmail tender text below to extract directly into TAI fields.");
-    }
-  };
+  // Hydrate persisted pf_panel_zoom preference
+  useEffect(() => {
+    let mounted = true;
+    void (async () => {
+      const savedZoom = await getPanelPref("pf_panel_zoom", 100);
+      if (mounted) {
+        setZoom(clampPanelZoom(savedZoom));
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
-  const openEmail = crucialEmails[activeEmailIdx] || crucialEmails[0];
-  const openCount = crucialEmails.filter((e) => !e.applied).length;
+  const applyZoom = useCallback((nextRaw: number) => {
+    const clamped = clampPanelZoom(nextRaw);
+    setZoom(clamped);
+    void setPanelPref("pf_panel_zoom", clamped);
+  }, []);
+
+  // Keyboard shortcuts: Ctrl+Plus, Ctrl+Minus, Ctrl+0
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        applyZoom(zoom + 5);
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        applyZoom(zoom - 5);
+      } else if (e.key === "0") {
+        e.preventDefault();
+        applyZoom(100);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [zoom, applyZoom]);
+
+  const apiCtx = useMemo<PanelApiContext>(
+    () => ({
+      expectedEmail: session?.user?.email || bootstrapUser?.email,
+      csrfToken: session?.csrfToken,
+      onAccountChanged: (msg) => setAccountDriftWarning(msg),
+    }),
+    [session, bootstrapUser],
+  );
+
+  const loadPanelMemoryAndTasks = useCallback(async () => {
+    try {
+      const [sess, draftsRes, knowRes, apRes, taiStatusRes] = await Promise.all([
+        fetchPanelSession(),
+        panelFetchJson<{ ok?: boolean; drafts?: PanelSavedDraft[] }>("/api/panel/drafts", { method: "GET" }, apiCtx),
+        panelFetchJson<{ ok?: boolean; rules?: PanelKnowledgeRule[]; learnedCount?: number }>(
+          "/api/panel/knowledge",
+          { method: "GET" },
+          apiCtx,
+        ),
+        panelFetchJson<{ ok?: boolean; tasks?: Array<Record<string, unknown>> }>(
+          "/api/panel/ap-tasks",
+          { method: "GET" },
+          apiCtx,
+        ),
+        panelFetchJson<{ ok?: boolean; baseUrl?: string }>("/api/tai/booking/status", { method: "GET" }, apiCtx),
+      ]);
+
+      if (sess) {
+        setSession(sess);
+        setAccountDriftWarning(null);
+      }
+      if (draftsRes.ok && Array.isArray(draftsRes.data.drafts)) {
+        setSavedDrafts(draftsRes.data.drafts);
+      }
+      if (knowRes.ok) {
+        const rules = Array.isArray(knowRes.data.rules) ? knowRes.data.rules : [];
+        setKnowledgeRules(rules);
+        setLearnedCount(typeof knowRes.data.learnedCount === "number" ? knowRes.data.learnedCount : rules.length);
+      }
+      if (apRes.ok && Array.isArray(apRes.data.tasks)) {
+        setApTasks(apRes.data.tasks.map((t) => normalizeApTaskRecord(t, shipments)));
+      }
+      if (taiStatusRes.ok && typeof taiStatusRes.data.baseUrl === "string") {
+        setTaiPortalUrl(taiStatusRes.data.baseUrl);
+      }
+    } catch {
+      // Keep graceful local state when offline or warming up
+    }
+  }, [apiCtx, shipments]);
+
+  useEffect(() => {
+    void loadPanelMemoryAndTasks();
+  }, []);
+
+  // Subscribe to passive Gmail thread context notifications from extension wrapper
+  useEffect(() => {
+    return subscribeGmailThreadContext((ctx) => {
+      setLiveThread((prev) => ({
+        subject: ctx.subject ?? prev?.subject ?? "",
+        sender: ctx.sender ?? prev?.sender ?? "",
+        timestamp: ctx.timestamp ?? prev?.timestamp ?? "",
+        bodyText: ctx.bodyText ?? prev?.bodyText ?? "",
+        permalink: ctx.permalink ?? prev?.permalink ?? "",
+        attachments: ctx.attachments ?? prev?.attachments ?? [],
+      }));
+    });
+  }, []);
+
+  const handleRefreshAll = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([onRefresh?.(), loadPanelMemoryAndTasks()]);
+      notify("Refreshed live shipments, exceptions & staff session");
+    } finally {
+      setRefreshing(false);
+    }
+  }, [onRefresh, loadPanelMemoryAndTasks, notify]);
+
+  const handleInspectLoad = useCallback(
+    (shipmentId: string, targetView: "dispatch" | "all-loads" = "dispatch") => {
+      setExpandedLoadId(shipmentId);
+      navigateView(targetView);
+    },
+    [navigateView],
+  );
+
+  const handleQuickCaptureToBuilder = useCallback(async () => {
+    const cap = await captureGmailThread();
+    if (cap.ok && cap.thread) {
+      setLiveThread(cap.thread);
+      const { ok, data } = await panelFetchJson<{ ok?: boolean; entry?: LoadEntry; summary?: string }>(
+        "/api/extract-email",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            subject: cap.thread.subject,
+            sender: cap.thread.sender,
+            bodyText: cap.thread.bodyText,
+          }),
+        },
+        apiCtx,
+      );
+      if (ok && data.entry) {
+        onBuilderChange(data.entry);
+        notify(data.summary || "Extracted open Gmail thread into Load Builder");
+      }
+    }
+    navigateView("build-load");
+  }, [apiCtx, navigateView, notify, onBuilderChange]);
+
+  // Compute live Attention count across all 4 alert sections + AP load checks (excluding Cancelled & covered loads)
+  const attentionCount = useMemo(() => {
+    const uncovered = shipments.filter((raw) => {
+      const s = raw as LiveOpsShipment;
+      const isCancelled = s.stage === "Cancelled" || /cancel/i.test(String(s.rawStatus || ""));
+      if (isCancelled || s.stage === "Delivered") return false;
+      return !s.carrier.trim();
+    }).length;
+    const mismatches = shipments.filter((raw) => {
+      const s = raw as LiveOpsShipment;
+      if (s.stage === "Cancelled") return false;
+      return Boolean(s.mismatchNote) || !s.po.trim();
+    }).length;
+    const missingPods = shipments.filter((s) => s.stage === "Delivered" && s.podCount === 0).length;
+    const containerAlerts = shipments.filter((s) => Boolean(s.operationalNote)).length;
+    const unappliedEmails = crucialEmails.filter((e) => !e.applied).length;
+    const openAp = apTasks.filter((t) => !isApTaskResolved(t.status)).length;
+    return uncovered + mismatches + missingPods + containerAlerts + unappliedEmails + openAp;
+  }, [shipments, crucialEmails, apTasks]);
+
+  const openApCount = useMemo(
+    () => apTasks.filter((t) => !isApTaskResolved(t.status)).length || (kpis?.openApTasks ?? 0),
+    [apTasks, kpis],
+  );
 
   return (
-    <div className="h-full flex flex-col overflow-hidden" style={{ background: "var(--pf-bg)" }}>
-      {/* Masthead */}
-      <div style={{ background: "var(--pf-masthead)", color: "#ffffff", borderBottom: "1px solid var(--pf-border)" }}>
-        <div className="pf-brand-rule">
-          <div style={{ background: "#1D2C5E" }} />
-          <div style={{ background: "#682C87" }} />
-          <div style={{ background: "#D52A3B" }} />
-          <div style={{ background: "#F0641E" }} />
-          <div style={{ background: "#F5B841" }} />
-        </div>
-        <div className="px-3 py-2 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span
-              className="w-5 h-5 rounded flex items-center justify-center font-bold text-[10px]"
-              style={{ background: "#F0641E" }}
-            >
-              PF
-            </span>
-            <span className="font-serif font-bold text-xs">Freight Toolkit · Compact</span>
-          </div>
-          <span
-            className="font-mono text-[10px] px-2 py-0.5 rounded-full"
-            style={{ background: "rgba(62,191,130,0.2)", color: "#3EBF82" }}
-          >
-            ● TAI Sync
-          </span>
-        </div>
+    <div
+      data-theme="dark"
+      className="tk-panel h-full w-full flex flex-col overflow-hidden"
+    >
+      <PanelTopBar
+        fullScreen={fullScreen}
+        view={view}
+        onNavigate={navigateView}
+        shipments={shipments}
+        onInspectLoad={handleInspectLoad}
+        universalQuery={universalQuery}
+        onUniversalQueryChange={setUniversalQuery}
+        zoom={zoom}
+        onZoomStep={(delta) => applyZoom(zoom + delta)}
+        onZoomReset={() => applyZoom(100)}
+        refreshing={refreshing}
+        onRefreshAll={() => void handleRefreshAll()}
+        session={session}
+        fallbackUser={bootstrapUser}
+        attentionCount={attentionCount}
+        inboxCount={crucialEmails.length}
+        openApCount={openApCount}
+        liveThreadSubject={liveThread?.subject || ""}
+        onQuickCaptureThread={() => void handleQuickCaptureToBuilder()}
+      />
 
-        {/* 4 Paper Tabs */}
-        <div className="px-2 pb-1.5 grid grid-cols-4 gap-1 text-[11px]">
-          {(
-            [
-              ["inbox", `Inbox (${openCount})`],
-              ["dispatch", "Dispatch"],
-              ["builder", "+ Builder"],
-              ["ai", "✦ Copilot"],
-            ] as const
-          ).map(([id, label]) => {
-            const active = tab === id;
-            return (
-              <button
-                key={id}
-                type="button"
-                onClick={() => setTab(id)}
-                className="py-1 rounded font-semibold transition-all"
-                style={{
-                  background: active ? "rgba(240,100,30,0.24)" : "transparent",
-                  color: active ? "#ffffff" : "rgba(255,255,255,0.68)",
-                  border: active ? "1px solid rgba(240,100,30,0.55)" : "1px solid transparent",
-                }}
-              >
-                {label}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Body */}
-      {panelNotice && (
+      {/* Cross-Tab Google Workspace Account Drift Warning */}
+      {accountDriftWarning && (
         <div
-          className="px-2.5 py-1.5 text-[11px] flex items-center justify-between gap-2 shrink-0"
-          style={{ background: "#163528", color: "#8ce6b8", borderBottom: "1px solid #255943" }}
+          role="alert"
+          className="px-3 py-2 text-[11px] flex items-center justify-between gap-2 shrink-0"
+          style={{ background: "#3a1a1a", color: "#fca5a5", borderBottom: "1px solid #6b2a2a" }}
         >
-          <span className="truncate">✓ {panelNotice}</span>
-          <button type="button" onClick={() => setPanelNotice("")} className="underline shrink-0">
+          <span className="truncate">⚠ {accountDriftWarning}</span>
+          <a href="/auth/google" className="underline font-bold shrink-0">
+            Reconnect
+          </a>
+        </div>
+      )}
+
+      {/* Subtle Toast Strip inside Standalone Panel */}
+      {fullScreen && panelNotice && (
+        <div
+          className="px-3 py-2 text-xs flex items-center justify-between gap-2 shrink-0"
+          style={
+            panelNotice.kind === "error"
+              ? { background: "#2d1619", color: "#fca5a5", borderBottom: "1px solid #5c2429" }
+              : { background: "#122b20", color: "#8ce6b8", borderBottom: "1px solid #21523b" }
+          }
+        >
+          <span className="truncate">
+            {panelNotice.kind === "error" ? "✕" : "✓"} {panelNotice.text}
+          </span>
+          <button type="button" onClick={() => setPanelNotice(null)} className="opacity-75 hover:opacity-100">
             ×
           </button>
         </div>
       )}
-      <div className="flex-1 overflow-y-auto pf-scroll p-2.5 space-y-2.5">
-        {tab === "inbox" && (
-          <>
-            {/* Open Gmail Thread Context Card */}
-            {openEmail && (
-              <div
-                className="p-3 rounded-xl space-y-2"
-                style={{ background: "var(--pf-surface)", border: "2px solid var(--pf-action)" }}
-              >
-                <div className="flex items-center justify-between text-[11px] gap-2">
-                  <span className="font-bold uppercase tracking-wider" style={{ color: "var(--pf-action)" }}>
-                    Selected Email &amp; Load
-                  </span>
-                  <div className="flex items-center gap-2">
-                    {openEmail.containerNumber && (
-                      <a
-                        href={buildGmailContainerSearchUrl(openEmail.containerNumber, openEmail.loadId)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 hover:underline font-mono"
-                        style={{ color: "var(--pf-info)" }}
-                        title="Search all emails mentioning this container #"
-                      >
-                        <Search size={10} /> {openEmail.containerNumber}
-                      </a>
-                    )}
-                    <a
-                      href={
-                        openEmail.permalink ||
-                        `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(
-                          openEmail.loadId !== "NEW" ? openEmail.loadId : openEmail.subject,
-                        )}`
-                      }
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 hover:underline"
-                      style={{ color: "var(--pf-primary)" }}
-                    >
-                      <ExternalLink size={11} /> Gmail
-                    </a>
-                    <span className="font-mono" style={{ color: "var(--pf-text-muted)" }}>
-                      {openEmail.loadId === "NEW" ? "New Tender" : `#${openEmail.loadId}`}
-                    </span>
-                    {onDeleteEmail && (
-                      <button
-                        type="button"
-                        onClick={() => onDeleteEmail(openEmail.id)}
-                        className="p-1 rounded"
-                        style={{ background: "var(--pf-danger-dim)", color: "var(--pf-danger)" }}
-                        title="Delete email tile"
-                      >
-                        <Trash2 size={11} />
-                      </button>
-                    )}
-                  </div>
-                </div>
 
-                <div className="text-xs font-semibold leading-snug">{openEmail.subject}</div>
-                <div className="text-[11px]" style={{ color: "var(--pf-text-subtle)" }}>
-                  {openEmail.senderName || openEmail.from} · {openEmail.received}
-                </div>
+      {/* Zoom-Scaled Scrollable Workspace (reflows cleanly with zero horizontal overflow) */}
+      <div
+        className="flex-1 overflow-y-auto overflow-x-hidden pf-scroll px-3.5 py-3.5"
+        style={{ zoom: zoom / 100 }}
+      >
+        <div className={fullScreen ? "max-w-2xl mx-auto w-full" : "w-full"}>
+          {view === "home" && (
+            <HomeLauncherView
+              onNavigate={navigateView}
+              attentionCount={attentionCount}
+              inboxCount={crucialEmails.length}
+              shipments={shipments}
+              customers={customers}
+              facilities={facilities}
+              kpis={kpis}
+              taiPortalUrl={taiPortalUrl}
+            />
+          )}
 
-                {openEmail.operationalNote && (
-                  <div
-                    className="p-2 rounded text-[11px] font-semibold"
-                    style={{ background: "var(--pf-warning-dim)", color: "var(--pf-warning)" }}
-                  >
-                    {openEmail.operationalNote}
-                  </div>
-                )}
+          {view === "inbox" && (
+            <InboxStreamView
+              crucialEmails={crucialEmails}
+              shipments={shipments}
+              onBuilderChange={onBuilderChange}
+              onThreadSelected={setLiveThread}
+              onInspectLoad={handleInspectLoad}
+              onNavigate={navigateView}
+              onRefreshBootstrap={async () => {
+                await onRefresh?.();
+              }}
+              apiCtx={apiCtx}
+              onToast={notify}
+            />
+          )}
 
-                <div
-                  className="p-2 rounded text-[11px] leading-relaxed whitespace-pre-wrap max-h-36 overflow-y-auto pf-scroll"
-                  style={{ background: "var(--pf-bg)", border: "1px solid var(--pf-border)", color: "var(--pf-text-muted)" }}
-                >
-                  {openEmail.fullBody || openEmail.body}
-                </div>
+          {view === "attention" && (
+            <AttentionView
+              shipments={shipments}
+              crucialEmails={crucialEmails}
+              apTasks={apTasks}
+              onInspectLoad={handleInspectLoad}
+              onApplyEmailAction={onApplyEmailAction}
+              onUploadPod={onUploadPod}
+              onExtractTenderToBuilder={onExtractTender}
+              onNavigate={navigateView}
+            />
+          )}
 
-                <div
-                  className="p-2 rounded text-[11px] flex items-center justify-between gap-2"
-                  style={{ background: "var(--pf-surface-raised)" }}
-                >
-                  <span className="truncate">{openEmail.diffLabel}</span>
-                  <strong className="font-mono shrink-0" style={{ color: "var(--pf-primary)" }}>
-                    {openEmail.diffValue}
-                  </strong>
-                </div>
+          {view === "dispatch" && (
+            <DispatchBoardView
+              shipments={shipments}
+              carriers={carriers}
+              expandedId={expandedLoadId}
+              onExpandChange={setExpandedLoadId}
+              apiCtx={apiCtx}
+              onRefresh={async () => {
+                await onRefresh?.();
+              }}
+              onToast={notify}
+              onUploadPod={onUploadPod}
+              onOpenBol={(shipmentId) => {
+                setBolTargetId(shipmentId);
+                navigateView("tools-bol");
+              }}
+              onOpenDashboardLoad={onOpenDashboardLoad}
+              isLiveSync={isLiveSync}
+            />
+          )}
 
-                <div className="flex gap-1.5 flex-wrap">
-                  {openEmail.loadId !== "NEW" && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setExpandedId(openEmail.loadId);
-                        setTab("dispatch");
-                      }}
-                      className="px-2 py-2 rounded-lg text-[11px] font-semibold shrink-0"
-                      style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
-                    >
-                      View Load #{openEmail.loadId}
-                    </button>
-                  )}
-                  {onSaveToCrm && (
-                    <button
-                      type="button"
-                      onClick={() => onSaveToCrm(openEmail)}
-                      className="px-2 py-2 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 shrink-0"
-                      style={{ background: "var(--pf-primary-dim)", color: "var(--pf-primary)" }}
-                      title="Add sender to SalesOps CRM"
-                    >
-                      <UserPlus size={11} /> + CRM
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      if (openEmail.diffType === "new_tender") {
-                        onExtractTender();
-                        setTab("builder");
-                      } else {
-                        await onApplyEmailAction(openEmail);
-                      }
-                    }}
-                    className="flex-1 py-2 px-2.5 rounded-lg text-xs font-bold truncate"
-                    style={{ background: "var(--pf-action)", color: "#ffffff" }}
-                  >
-                    {openEmail.applied ? "✓ Synced" : openEmail.ctaLabel}
-                  </button>
-                </div>
-              </div>
-            )}
+          {view === "all-loads" && (
+            <AllLoadsView
+              shipments={shipments}
+              universalQuery={universalQuery}
+              expandedId={expandedLoadId}
+              onExpandChange={setExpandedLoadId}
+              apiCtx={apiCtx}
+              onRefresh={async () => {
+                await onRefresh?.();
+              }}
+              onToast={notify}
+              onUploadPod={onUploadPod}
+              onOpenBol={(shipmentId) => {
+                setBolTargetId(shipmentId);
+                navigateView("tools-bol");
+              }}
+              onCopyToBuilder={onBuilderChange}
+              onNavigate={navigateView}
+            />
+          )}
 
-            {/* Crucial Action Queue ONLY */}
-            <div className="text-[11px] font-semibold uppercase tracking-wider pt-1" style={{ color: "var(--pf-text-muted)" }}>
-              Crucial Action Emails Only ({crucialEmails.length})
-            </div>
-            <div className="space-y-1.5">
-              {crucialEmails.map((em, i) => (
-                <div
-                  key={em.id}
-                  onClick={() => setActiveEmailIdx(i)}
-                  className="cursor-pointer w-full text-left p-2.5 rounded-lg space-y-0.5"
-                  style={{
-                    background: i === activeEmailIdx ? "var(--pf-surface-raised)" : "var(--pf-surface)",
-                    border: `1px solid ${i === activeEmailIdx ? "var(--pf-primary)" : "var(--pf-border)"}`,
-                  }}
-                >
-                  <div className="flex items-center justify-between text-[11px] gap-2">
-                    <span className="font-mono font-bold" style={{ color: "var(--pf-action)" }}>
-                      {em.loadId === "NEW" ? "TENDER" : `#${em.loadId}`}
-                    </span>
-                    <div className="flex items-center gap-1.5">
-                      <span style={{ color: "var(--pf-text-subtle)" }}>{em.received}</span>
-                      {onDeleteEmail && (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onDeleteEmail(em.id);
-                          }}
-                          className="p-0.5 rounded hover:opacity-80"
-                          style={{ background: "var(--pf-danger-dim)", color: "var(--pf-danger)" }}
-                          title="Delete email tile"
-                        >
-                          <Trash2 size={10} />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  <div className="text-xs font-medium truncate">{em.subject}</div>
-                  <div className="text-[11px]" style={{ color: em.applied ? "var(--pf-primary)" : "var(--pf-warning)" }}>
-                    {em.applied ? "✓ Applied" : em.diffLabel}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </>
-        )}
+          {view === "rates" && (
+            <RatesView
+              shipments={shipments}
+              builderEntry={builderEntry}
+              onBuilderChange={onBuilderChange}
+              onSendToQuote={(patch) => setQuoteDraft((prev) => ({ ...prev, ...patch }))}
+              onNavigate={navigateView}
+              apiCtx={apiCtx}
+              onToast={notify}
+            />
+          )}
 
-        {tab === "dispatch" && (
-          <div className="space-y-2">
-            {shipments.map((s) => {
-              const exp = expandedId === s.id;
-              const totWt = s.commodities.reduce((a, c) => a + c.weightTotal, 0);
-              return (
-                <div
-                  key={s.id}
-                  className="rounded-lg overflow-hidden"
-                  style={{
-                    background: "var(--pf-surface)",
-                    border: `1px solid ${exp ? "var(--pf-action)" : "var(--pf-border)"}`,
-                  }}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setExpandedId(exp ? null : s.id)}
-                    className="w-full text-left p-2.5 space-y-1"
-                  >
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-mono font-bold" style={{ color: "var(--pf-action)" }}>
-                        {exp ? "▼" : "▶"} #{s.id}
-                      </span>
-                      <span className="font-mono font-semibold">${s.sell.toLocaleString()}</span>
-                    </div>
-                    <div className="text-xs font-semibold truncate">
-                      {s.origin} → {s.dest}
-                    </div>
-                    <div className="text-[11px]" style={{ color: "var(--pf-text-muted)" }}>
-                      {s.containerNumber ? `📦 ${s.containerNumber} · ` : ""}{s.stage} · {s.carrier || "Needs carrier"} · {totWt.toLocaleString()} lbs
-                    </div>
-                  </button>
-                  {exp && (
-                    <div
-                      className="p-2.5 space-y-1.5 text-[11px]"
-                      style={{ background: "var(--pf-surface-raised)", borderTop: "1px solid var(--pf-border)" }}
-                    >
-                      {s.operationalNote && (
-                        <div className="p-1.5 rounded font-semibold" style={{ background: "var(--pf-warning-dim)", color: "var(--pf-warning)" }}>
-                          {s.operationalNote}
-                        </div>
-                      )}
-                      {s.stops.map((st, idx) => (
-                        <div key={idx}>
-                          <strong>{st.stopType}:</strong> {st.companyName} ({st.city}, {st.state}{" "}
-                          <span className="font-mono">{st.zipCode}</span>)
-                        </div>
-                      ))}
-                      <div>
-                        <strong>Items:</strong>{" "}
-                        {s.commodities.map((c) => `${c.piecesTotal} ${c.packagingType} ${c.description}`).join("; ")}
-                      </div>
-                      <div className="font-mono" style={{ color: "var(--pf-primary)" }}>
-                        {s.writebackState}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        )}
+          {view === "tools" && (
+            <ToolsView
+              builderEntry={builderEntry}
+              onBuilderChange={onBuilderChange}
+              onNavigate={navigateView}
+              onToast={notify}
+            />
+          )}
 
-        {tab === "builder" && (
-          <div className="space-y-2">
-            {/* Live Gmail Thread Capture & Quick Email Paste */}
-            <div
-              className="p-2 rounded-lg space-y-1.5"
-              style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
-            >
-              <div className="flex items-center gap-1.5">
-                <button
-                  type="button"
-                  disabled={extracting}
-                  onClick={requestOpenGmailCapture}
-                  className="flex-1 py-1.5 px-2.5 rounded text-[11px] font-bold inline-flex items-center justify-center gap-1"
-                  style={{ background: "var(--pf-action)", color: "#ffffff" }}
-                >
-                  <Sparkles size={11} /> {extracting ? "Extracting…" : "Capture Open Gmail"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowPasteBox((v) => !v)}
-                  className="py-1.5 px-2.5 rounded text-[11px] font-medium inline-flex items-center gap-1"
-                  style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)" }}
-                  title="Paste email or tender text manually"
-                >
-                  <ClipboardPaste size={11} /> Paste
-                </button>
-              </div>
-              {liveSubject && (
-                <div className="text-[10px] truncate" style={{ color: "var(--pf-primary)" }}>
-                  📧 Open Thread: {liveSubject}
-                </div>
-              )}
-              {alternateEquip.length > 0 && (
-                <div className="flex items-center gap-1 flex-wrap pt-0.5">
-                  <span className="text-[10px]" style={{ color: "var(--pf-text-muted)" }}>
-                    Alt Equip:
-                  </span>
-                  {alternateEquip.slice(0, 3).map((eq) => (
-                    <button
-                      key={eq}
-                      type="button"
-                      onClick={() =>
-                        onBuilderChange({
-                          ...builderEntry,
-                          equipment: { ...builderEntry.equipment, trailerType: eq },
-                        })
-                      }
-                      className="px-1.5 py-0.5 rounded text-[10px]"
-                      style={{
-                        background:
-                          builderEntry.equipment.trailerType === eq ? "var(--pf-primary-dim)" : "var(--pf-surface-raised)",
-                        color: builderEntry.equipment.trailerType === eq ? "var(--pf-primary)" : "var(--pf-text-muted)",
-                        border: "1px solid var(--pf-border)",
-                      }}
-                    >
-                      {eq}
-                    </button>
-                  ))}
-                </div>
-              )}
-              {showPasteBox && (
-                <div className="space-y-1.5 pt-1">
-                  <textarea
-                    rows={3}
-                    value={pasteEmailText}
-                    onChange={(e) => setPasteEmailText(e.target.value)}
-                    placeholder="Paste Gmail tender email here (pickup, delivery, weight, tarps/conestoga)…"
-                    className="pf-input w-full text-[11px]"
-                  />
-                  <button
-                    type="button"
-                    disabled={extracting || !pasteEmailText.trim()}
-                    onClick={() => extractEmailToBuilder({ subject: liveSubject, bodyText: pasteEmailText })}
-                    className="w-full py-1.5 rounded text-[11px] font-bold"
-                    style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
-                  >
-                    Extract Pasted Email → Compact Builder
-                  </button>
-                </div>
-              )}
-            </div>
+          {view === "sales" && (
+            <SalesPanelView
+              leads={crmLeads}
+              customers={customers}
+              shipments={shipments}
+              builderEntry={builderEntry}
+              onBuilderChange={onBuilderChange}
+              apiCtx={apiCtx}
+              onRefresh={async () => {
+                await onRefresh?.();
+              }}
+              onToast={notify}
+              onNavigate={navigateView}
+            />
+          )}
 
-            <CompactLoadBuilder
-              compact={true}
+          {view === "build-load" && (
+            <LoadBuilderPanelView
+              compact={!fullScreen}
               entry={builderEntry}
               onChange={onBuilderChange}
               facilities={facilities}
               customers={customers}
               carriers={carriers}
+              savedDrafts={savedDrafts}
+              knowledgeRules={knowledgeRules}
+              learnedCount={learnedCount}
+              onRefreshMemory={loadPanelMemoryAndTasks}
+              onRefreshBootstrap={async () => {
+                await onRefresh?.();
+              }}
               onBooked={(ids, msg) => {
-                notify(msg);
+                notify(msg, "ok");
                 onBooked(ids, msg);
-                setTab("dispatch");
-                if (ids[0]) setExpandedId(ids[0]);
+                if (ids[0]) setExpandedLoadId(ids[0]);
+                navigateView("dispatch");
               }}
               onToast={notify}
               onExtractSampleTender={onExtractTender}
+              onNavigate={navigateView}
+              liveThread={liveThread}
+              onThreadCaptured={setLiveThread}
+              apiCtx={apiCtx}
             />
-          </div>
-        )}
+          )}
 
-        {tab === "ai" && (
-          <div className="space-y-2.5">
-            <div className="flex flex-wrap gap-1">
-              {["PA→GA lane runners", "TAI webhook health", "Status 132738007"].map((chip) => (
-                <button
-                  key={chip}
-                  type="button"
-                  onClick={() => onAskAi(chip)}
-                  className="px-2 py-1 rounded-full text-[11px]"
-                  style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
-                >
-                  {chip}
-                </button>
-              ))}
-            </div>
-            <div className="space-y-2">
-              {chatHistory.map((m, i) => (
-                <div
-                  key={i}
-                  className="p-2.5 rounded-lg text-xs"
-                  style={{
-                    background: m.role === "user" ? "var(--pf-surface-raised)" : "var(--pf-surface)",
-                    border: "1px solid var(--pf-border)",
-                  }}
-                >
-                  {m.text}
-                </div>
-              ))}
-            </div>
-            <div className="flex gap-1.5">
-              <input
-                value={aiInput}
-                onChange={(e) => setAiInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && aiInput.trim()) {
-                    onAskAi(aiInput);
-                    setAiInput("");
-                  }
-                }}
-                placeholder="Ask carrier MC, load #, margin…"
-                className="pf-input flex-1"
-              />
-              <button
-                type="button"
-                onClick={() => {
-                  if (aiInput.trim()) {
-                    onAskAi(aiInput);
-                    setAiInput("");
-                  }
-                }}
-                className="px-3 py-1.5 rounded-lg text-xs font-semibold"
-                style={{ background: "var(--pf-primary)", color: "var(--pf-primary-fg)" }}
-              >
-                <Send size={13} />
-              </button>
-            </div>
-          </div>
-        )}
+          {view === "tools-bol" && (
+            <BolGeneratorView
+              shipments={shipments}
+              builderEntry={builderEntry}
+              initialShipmentId={bolTargetId}
+              apiCtx={apiCtx}
+              onToast={notify}
+            />
+          )}
+
+          {view === "quote-builder" && (
+            <QuoteBuilderView
+              quote={quoteDraft}
+              onQuoteChange={setQuoteDraft}
+              builderEntry={builderEntry}
+              onBuilderChange={onBuilderChange}
+              onNavigate={navigateView}
+              onToast={notify}
+            />
+          )}
+
+          {view === "pod" && (
+            <PodFilesView
+              shipments={shipments}
+              onUploadPod={onUploadPod}
+              onRefresh={async () => {
+                await onRefresh?.();
+              }}
+              onToast={notify}
+              onInspectLoad={(id) => handleInspectLoad(id, "dispatch")}
+            />
+          )}
+
+          {view === "check-email" && (
+            <CheckEmailView
+              shipments={shipments}
+              crucialEmails={crucialEmails}
+              liveThread={liveThread}
+              onThreadCaptured={setLiveThread}
+              onInspectLoad={handleInspectLoad}
+              onNavigate={navigateView}
+              apiCtx={apiCtx}
+              onToast={notify}
+            />
+          )}
+
+          {view === "ai-assistant" && (
+            <AiAssistantView
+              chatHistory={chatHistory}
+              onAskAi={onAskAi}
+              liveThread={liveThread}
+              crucialEmails={crucialEmails}
+              onThreadCaptured={setLiveThread}
+              onToast={notify}
+            />
+          )}
+
+          {view === "ap-tasks" && (
+            <ApEmailsView
+              tasks={apTasks}
+              onRefreshTasks={loadPanelMemoryAndTasks}
+              onInspectLoad={handleInspectLoad}
+              apiCtx={apiCtx}
+              onToast={notify}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
