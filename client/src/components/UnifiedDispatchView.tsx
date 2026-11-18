@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import type { CarrierOption, OpsShipment } from "@shared/tai-webhook-schema";
+import { isHiddenCustomer, type CarrierOption, type OpsShipment } from "@shared/tai-webhook-schema";
 import {
   ArrowUpDown,
   ArrowUpRight,
@@ -7,6 +7,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ExternalLink,
+  FileText,
   Pencil,
   Printer,
   RefreshCw,
@@ -336,6 +337,45 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
     setStatusFeedback({ msg, kind });
   };
 
+  const [syncingInvoices, setSyncingInvoices] = useState<boolean>(false);
+
+  const handleSyncTaiInvoices = async () => {
+    setSyncingInvoices(true);
+    try {
+      const pageShipmentIds = (rowsToRender || []).map((r) => r.id).filter((id) => /^\d+$/.test(id));
+      const res = await fetch("/api/tai/invoices/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          shipmentIds: pageShipmentIds.length > 0 ? pageShipmentIds : undefined,
+          limit: 30,
+        }),
+      });
+      const data = (await res.json()) as { ok?: boolean; message?: string; synced?: number };
+      notify(data.message || "Synced live invoices from TAI Accounting API.", data.ok ? "ok" : "error");
+      await Promise.all([fetchServerLoads(), onRefreshBootstrap?.()]);
+    } catch {
+      notify("Failed to sync TAI invoices.", "error");
+    } finally {
+      setSyncingInvoices(false);
+    }
+  };
+
+  const handleSyncSingleInvoice = async (shipmentId: string) => {
+    try {
+      const res = await fetch(`/api/loads/${shipmentId}/sync-invoice`, {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = await res.json();
+      notify(data.message || `Synced invoice for #${shipmentId}`, data.ok ? "ok" : "error");
+      await Promise.all([fetchServerLoads(), onRefreshBootstrap?.()]);
+    } catch {
+      notify(`Failed to sync invoice for #${shipmentId}`, "error");
+    }
+  };
+
   useEffect(() => {
     fetch("/api/tai/booking/status", { credentials: "include" })
       .then((r) => (r.ok ? r.json() : null))
@@ -382,13 +422,14 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
       };
       const items = data.items || data.shipments;
       if (data.ok !== false && Array.isArray(items)) {
+        const nonHidden = items.filter((r) => !isHiddenCustomer(r.customer));
         // Defensive guard: never allow covered or cancelled loads under "Needs Truck"
         const guarded =
           activeTab === "Needs Truck"
-            ? items.filter((r) => !isRowCancelled(r) && !isRowCovered(r))
+            ? nonHidden.filter((r) => !isRowCancelled(r) && !isRowCovered(r))
             : activeTab === "Committed (Covered)"
-            ? items.filter((r) => !isRowCancelled(r) && isRowCovered(r))
-            : items;
+            ? nonHidden.filter((r) => !isRowCancelled(r) && isRowCovered(r))
+            : nonHidden;
         setServerRows(guarded);
         setServerTotal(typeof data.total === "number" ? data.total : guarded.length);
         const countsObj = data.statusCounts || data.counts;
@@ -415,6 +456,7 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
   // Fallback client-side filtering & sorting while server page loads or in offline mode
   const fallbackRows = useMemo(() => {
     const base = (shipments as LiveOpsShipment[]).filter((s) => {
+      if (isHiddenCustomer(s.customer)) return false;
       if (!matchesClientTab(s, activeTab, viewMode)) return false;
       if (!effectiveSearch) return true;
       const q = effectiveSearch.toLowerCase();
@@ -795,6 +837,22 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
             <RefreshCw size={12} className={loadingPage ? "animate-spin" : ""} /> Refresh
           </button>
 
+          <button
+            type="button"
+            onClick={() => void handleSyncTaiInvoices()}
+            disabled={syncingInvoices}
+            className="px-2.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 transition-opacity hover:opacity-90 disabled:opacity-50"
+            style={{
+              background: "var(--pf-surface)",
+              border: "1px solid var(--pf-border)",
+              color: "var(--pf-primary)",
+            }}
+            title="Sync live invoice statuses, payment statuses, and line items from TAI Accounting API"
+          >
+            <FileText size={12} className={syncingInvoices ? "animate-spin" : ""} />
+            {syncingInvoices ? "Syncing TAI Invoices…" : "Sync TAI Invoices"}
+          </button>
+
           <div
             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono"
             style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)", color: "var(--pf-text)" }}
@@ -1119,22 +1177,37 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                         ${buy.toLocaleString()}
                       </td>
 
-                      {/* 11. Margin */}
-                      <td
-                        className="py-3 px-2 text-right font-mono font-bold whitespace-nowrap"
-                        style={{
-                          color:
-                            margin < 0
-                              ? "var(--pf-danger)"
-                              : covered && margin > 0
-                              ? "var(--pf-primary)"
-                              : "var(--pf-text)",
-                        }}
-                      >
-                        {margin < 0 ? `-$${Math.abs(margin).toLocaleString()}` : `$${margin.toLocaleString()}`}
+                      {/* 11. Margin & Invoice Status */}
+                      <td className="py-3 px-2 text-right whitespace-nowrap">
+                        <div
+                          className="font-mono font-bold"
+                          style={{
+                            color:
+                              margin < 0
+                                ? "var(--pf-danger)"
+                                : covered && margin > 0
+                                ? "var(--pf-primary)"
+                                : "var(--pf-text)",
+                          }}
+                        >
+                          {margin < 0 ? `-$${Math.abs(margin).toLocaleString()}` : `$${margin.toLocaleString()}`}
+                        </div>
+                        {s.invoiceStatus && (
+                          <div
+                            className="text-[9.5px] font-mono font-medium truncate max-w-[125px] ml-auto"
+                            style={{
+                              color: /paid/i.test(s.invoiceStatus)
+                                ? "var(--pf-primary)"
+                                : "var(--pf-warning, #f59e0b)",
+                            }}
+                            title={`TAI Invoice: ${s.invoiceStatus}`}
+                          >
+                            {s.invoiceStatus}
+                          </div>
+                        )}
                       </td>
 
-                      {/* 12. 3 Right-Hand Action Icons: Send RC (↗) · Edit (✎) · Delete (🗑) */}
+                      {/* 12. Right-Hand Action Icons: Send RC (↗) · Edit (✎) · Sync Inv · Delete (🗑) */}
                       <td className="py-3 pl-2 pr-3.5 whitespace-nowrap text-right">
                         <div className="inline-flex items-center justify-end gap-1.5">
                           <button
@@ -1165,6 +1238,21 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
                             aria-label={`Edit Shipment #${s.id}`}
                           >
                             <Pencil size={13} />
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => void handleSyncSingleInvoice(s.id)}
+                            className="p-1.5 rounded-lg transition-opacity hover:opacity-85"
+                            style={{
+                              background: "var(--pf-surface-raised)",
+                              color: /paid/i.test(s.invoiceStatus || "") ? "var(--pf-primary)" : "var(--pf-text)",
+                              border: "1px solid var(--pf-border)",
+                            }}
+                            title={`Sync TAI Invoice for #${s.id}`}
+                            aria-label={`Sync TAI Invoice for #${s.id}`}
+                          >
+                            <FileText size={13} />
                           </button>
 
                           <button

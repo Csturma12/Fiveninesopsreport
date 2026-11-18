@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from "react";
 import type { LoadEntry } from "@shared/load-entry";
-import type { OpsShipment } from "@shared/tai-webhook-schema";
+import { isHiddenCustomer, type OpsShipment } from "@shared/tai-webhook-schema";
 import { ArrowUpRight, ChevronDown, ChevronRight, Copy, FileText, MapPin, Save, Search, Upload } from "lucide-react";
 import { insertGmailReply } from "./extensionBridge";
 import { panelFetchJson, type PanelApiContext } from "./panelApi";
@@ -45,6 +45,7 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
 
   const filtered = useMemo(() => {
     return (shipments as LiveOpsShipment[]).filter((s) => {
+      if (isHiddenCustomer(s.customer)) return false;
       const isCancelled = s.stage === "Cancelled" || /cancel/i.test(String(s.rawStatus || ""));
       if (stageFilter === "Cancelled") return isCancelled;
       if (stageFilter === "Needs truck" && (isCancelled || Boolean(s.carrier && s.carrier.trim()) || s.stage !== "Needs truck")) {
@@ -137,6 +138,43 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
     await onRefresh();
   };
 
+  const [syncingInvoices, setSyncingInvoices] = useState<boolean>(false);
+
+  const handleSyncAllInvoices = async () => {
+    setSyncingInvoices(true);
+    try {
+      const sids = filtered.map((s) => s.id).filter((id) => /^\d+$/.test(id)).slice(0, 25);
+      const { ok, data } = await panelFetchJson<{ ok?: boolean; message?: string; synced?: number }>(
+        "/api/tai/invoices/sync",
+        {
+          method: "POST",
+          body: JSON.stringify({ shipmentIds: sids.length > 0 ? sids : undefined, limit: 25 }),
+        },
+        apiCtx,
+      );
+      onToast(data.message || "Synced invoices from TAI Accounting", ok ? "ok" : "error");
+      await onRefresh();
+    } catch {
+      onToast("Failed to sync TAI invoices", "error");
+    } finally {
+      setSyncingInvoices(false);
+    }
+  };
+
+  const handleSyncSingleInvoice = async (shipmentId: string) => {
+    try {
+      const { ok, data } = await panelFetchJson<{ ok?: boolean; message?: string }>(
+        `/api/loads/${encodeURIComponent(shipmentId)}/sync-invoice`,
+        { method: "POST" },
+        apiCtx,
+      );
+      onToast(data.message || `Synced invoice for #${shipmentId}`, ok ? "ok" : "error");
+      await onRefresh();
+    } catch {
+      onToast(`Failed to sync invoice for #${shipmentId}`, "error");
+    }
+  };
+
   return (
     <div className="space-y-2.5">
       {/* Directory Filter Controls */}
@@ -174,8 +212,19 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
         </div>
       </div>
 
-      <div className="text-[10px] font-mono px-0.5" style={{ color: "var(--pf-text-muted)" }}>
-        Showing {filtered.length} of {shipments.length} shipments
+      <div className="flex items-center justify-between px-0.5 text-[10px] font-mono" style={{ color: "var(--pf-text-muted)" }}>
+        <span>Showing {filtered.length} of {shipments.length} shipments</span>
+        <button
+          type="button"
+          onClick={() => void handleSyncAllInvoices()}
+          disabled={syncingInvoices}
+          className="px-2 py-0.5 rounded text-[10px] font-bold inline-flex items-center gap-1 transition-opacity hover:opacity-85 disabled:opacity-50"
+          style={{ background: "var(--pf-surface-raised)", border: "1px solid var(--pf-border)", color: "var(--pf-primary)" }}
+          title="Sync live invoices from TAI Accounting API"
+        >
+          <FileText size={10} className={syncingInvoices ? "animate-spin" : ""} />
+          {syncingInvoices ? "Syncing TAI…" : "Sync TAI Invoices"}
+        </button>
       </div>
 
       {/* Expandable Full Load Directory */}
@@ -321,21 +370,23 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
                   </div>
 
                   {/* Quick Document & Navigation Actions */}
-                  <div className="grid grid-cols-4 gap-1.5">
+                  <div className="grid grid-cols-5 gap-1">
                     <button
                       type="button"
                       onClick={() => void handleSendRateCon(s)}
-                      className="py-1.5 px-1.5 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
+                      className="py-1.5 px-1 rounded text-[9.5px] font-semibold inline-flex items-center justify-center gap-0.5 truncate"
                       style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                      title="Send Rate Confirmation"
                     >
-                      <ArrowUpRight size={10} /> Send RC
+                      <ArrowUpRight size={10} /> RC
                     </button>
 
                     <button
                       type="button"
                       onClick={() => onOpenBol(s.id)}
-                      className="py-1.5 px-1.5 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
+                      className="py-1.5 px-1 rounded text-[9.5px] font-semibold inline-flex items-center justify-center gap-0.5 truncate"
                       style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                      title="Generate BOL"
                     >
                       <FileText size={10} /> BOL
                     </button>
@@ -344,8 +395,9 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
                       <button
                         type="button"
                         onClick={() => onUploadPod(s.id)}
-                        className="py-1.5 px-1.5 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
+                        className="py-1.5 px-1 rounded text-[9.5px] font-semibold inline-flex items-center justify-center gap-0.5 truncate"
                         style={{ background: "var(--pf-surface)", border: "1px solid var(--pf-border)" }}
+                        title="Upload POD"
                       >
                         <Upload size={10} /> POD ({s.podCount})
                       </button>
@@ -353,12 +405,27 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
 
                     <button
                       type="button"
+                      onClick={() => void handleSyncSingleInvoice(s.id)}
+                      className="py-1.5 px-1 rounded text-[9.5px] font-semibold inline-flex items-center justify-center gap-0.5 truncate"
+                      style={{
+                        background: "var(--pf-surface)",
+                        border: "1px solid var(--pf-border)",
+                        color: /paid/i.test(s.invoiceStatus || "") ? "var(--pf-primary)" : "var(--pf-text)",
+                      }}
+                      title="Sync live invoice from TAI Accounting"
+                    >
+                      <FileText size={10} /> Inv
+                    </button>
+
+                    <button
+                      type="button"
                       onClick={() => {
                         onCopyToBuilder(shipmentToLoadEntry(s));
                         onNavigate("build-load");
                       }}
-                      className="py-1.5 px-1.5 rounded text-[10px] font-semibold inline-flex items-center justify-center gap-1"
+                      className="py-1.5 px-1 rounded text-[9.5px] font-semibold inline-flex items-center justify-center gap-0.5 truncate"
                       style={{ background: "var(--pf-primary-dim)", color: "var(--pf-primary)" }}
+                      title="Clone load to Compact Builder"
                     >
                       <Copy size={10} /> Clone
                     </button>

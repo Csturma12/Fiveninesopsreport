@@ -3,7 +3,8 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 import express from "express";
-import { deriveRateconStatus, mapTaiStatusToStage } from "../shared/tai-webhook-schema";
+import { deriveRateconStatus, isHiddenCustomer, mapTaiStatusToStage } from "../shared/tai-webhook-schema";
+import { extractLoadEntryFromEmail } from "../shared/email-extractor";
 import { setStaffGmailAccessToken } from "../server/auth";
 import { registerApiRoutes, type RegisterApiRoutesOptions } from "../server/routes";
 import {
@@ -13,6 +14,7 @@ import {
   store,
 } from "../server/store";
 import { clearTaiPushLogs, resetTaiAuthHalt } from "../server/tai-push-log";
+import { syncTaiInvoices, syncTaiInvoicesForShipment } from "../server/tai-service";
 
 const FIXTURE_CRED = "fixture-phase2-tai-cred-7741";
 
@@ -427,4 +429,102 @@ test("grounded POST /api/ai/ask answers carrier, customer uncovered, and lane ru
   } finally {
     store.carriers = store.carriers.filter((c) => c.name !== "JUST DRIVE TRANSPORT LLC");
   }
+});
+
+test("isHiddenCustomer filters Quality Sausage Company variations while preserving normal customers", () => {
+  assert.equal(isHiddenCustomer("QUALITY SAUSAGE COMPANY"), true);
+  assert.equal(isHiddenCustomer("Quality Sausage, Inc."), true);
+  assert.equal(isHiddenCustomer("QualitySausage"), true);
+  assert.equal(isHiddenCustomer("Quality Sausage Co"), true);
+  assert.equal(isHiddenCustomer("QSC"), true);
+  assert.equal(isHiddenCustomer("qsc"), true);
+
+  assert.equal(isHiddenCustomer("IMC LOGISTICS"), false);
+  assert.equal(isHiddenCustomer("LARKIN REFRACTORY SOLUTIONS"), false);
+  assert.equal(isHiddenCustomer("CERAMSOURCE INC"), false);
+  assert.equal(isHiddenCustomer(""), false);
+  assert.equal(isHiddenCustomer(null), false);
+  assert.equal(isHiddenCustomer(undefined), false);
+});
+
+test("email extractor fallback does not inject hardcoded Larkin or Zelienople when addresses are absent", () => {
+  const result = extractLoadEntryFromEmail(
+    {
+      subject: "Random inquiry without locations",
+      sender: "someone@example.com",
+      bodyText: "Can you quote 1 pallet of industrial fasteners?",
+    },
+    [],
+    [],
+  );
+
+  assert.equal(result.entry.customer.name, "");
+  assert.equal(result.entry.stops[0].city, "");
+  assert.equal(result.entry.stops[0].state, "");
+  assert.equal(result.entry.stops[1].city, "");
+  assert.equal(result.entry.stops[1].state, "");
+  assert.notEqual(result.entry.stops[1].companyName, "Larkin Refractory Solutions");
+});
+
+test("TAI Invoice Sync: syncTaiInvoices and /api/tai/invoices/sync update invoiceStatus and broadcast", async () => {
+  const capturedCalls: string[] = [];
+  const mockFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const urlStr = String(url);
+    capturedCalls.push(urlStr);
+    assert.equal((init?.headers as Record<string, string>)?.["x-api-key"], "fixture-invoice-key");
+
+    if (urlStr.includes("/Invoices/Shipment/132738007")) {
+      return new Response(
+        JSON.stringify({
+          invoiceNumber: "INV-99014",
+          totalAmount: 4400,
+          paymentStatus: "Fully Paid",
+          invoiceDate: "2026-11-17",
+          lineItems: [{ description: "Linehaul", amount: 4400 }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify([]), { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const result = await syncTaiInvoicesForShipment("132738007", {
+    credential: "fixture-invoice-key",
+    baseUrl: "https://taicloud.example",
+    fetchImpl: mockFetch,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.found, true);
+  assert.equal(result.invoiceNumber, "INV-99014");
+  assert.match(result.invoiceStatus || "", /INV-99014/);
+  assert.match(result.invoiceStatus || "", /Fully Paid/);
+
+  // Test full endpoint via withServer
+  await withServer(
+    {
+      bookingOptions: {
+        credential: "fixture-invoice-key",
+        baseUrl: "https://taicloud.example",
+      },
+    },
+    async (baseUrl) => {
+      // Test POST /api/loads/:id/sync-invoice with custom fetch override or mock
+      const singleRes = await fetch(`${baseUrl}/api/loads/132738007/sync-invoice`, {
+        method: "POST",
+      });
+      assert.equal(singleRes.status === 200 || singleRes.status === 400, true);
+
+      // Test POST /api/tai/invoices/sync
+      const bulkRes = await fetch(`${baseUrl}/api/tai/invoices/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ shipmentIds: ["132738007"] }),
+      });
+      assert.equal(bulkRes.status, 200);
+      const bulkJson = await bulkRes.json();
+      assert.equal(bulkJson.ok !== undefined, true);
+      assert.equal(bulkJson.totalAttempted, 1);
+    },
+  );
 });

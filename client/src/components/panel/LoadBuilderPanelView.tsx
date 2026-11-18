@@ -321,7 +321,7 @@ export const LoadBuilderPanelView: React.FC<LoadBuilderPanelViewProps> = ({
       const transcript =
         data.transcript ||
         params.rawText ||
-        `Tender File: ${params.filename}\nCustomer: ${entry.customer.name || "Larkin Refractory Solutions"}\nPickup: Beaver Falls, PA 15010 -> Delivery: Lithonia, GA 30058\nWeight: 38,644 lbs (22 Pallets) | 48 ft Flatbed | Tarp`;
+        `Tender File: ${params.filename}\nCustomer: ${entry.customer.name || "Customer"}\nPickup: ${entry.stops[0]?.city || "Origin"}, ${entry.stops[0]?.state || ""} -> Delivery: ${entry.stops[entry.stops.length - 1]?.city || "Destination"}, ${entry.stops[entry.stops.length - 1]?.state || ""}`;
 
       setTranscriptFilename(params.filename);
       setPendingTranscript(transcript);

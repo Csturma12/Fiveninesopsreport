@@ -14,6 +14,7 @@ import {
 import {
   deriveRateconStatus,
   extractDateShort,
+  isHiddenCustomer,
   mapTaiStatusToStage,
   type CarrierOption,
   type CustomerOption,
@@ -2530,6 +2531,244 @@ export function handleTaiInvoiceWebhook(
     paymentStatus,
     lineItems,
     observedAccessorials: getObservedInvoiceAccessorials(),
+  };
+}
+
+export interface TaiInvoiceSyncOptions {
+  credential?: string;
+  baseUrl?: string;
+  fetchImpl?: typeof fetch;
+  actor?: string;
+  supabaseClient?: unknown;
+}
+
+export interface TaiInvoiceSyncResult {
+  shipmentId: string;
+  ok: boolean;
+  found: boolean;
+  invoiceNumber?: string;
+  invoiceStatus?: string;
+  paymentStatus?: string | null;
+  totalAmount?: number;
+  message?: string;
+}
+
+export async function syncTaiInvoicesForShipment(
+  shipmentId: string,
+  options: TaiInvoiceSyncOptions = {},
+): Promise<TaiInvoiceSyncResult> {
+  const sid = String(shipmentId || "").trim();
+  if (!sid || !isNumericTaiShipmentId(sid)) {
+    return {
+      shipmentId: sid,
+      ok: false,
+      found: false,
+      message: `Invalid numeric shipment ID: "${sid}"`,
+    };
+  }
+
+  const cred = options.credential !== undefined ? taiApiKey(options.credential) : taiApiKey();
+  if (!cred) {
+    return {
+      shipmentId: sid,
+      ok: false,
+      found: false,
+      message: "TAI API key is not configured.",
+    };
+  }
+  if (isTaiAuthHalted(cred)) {
+    return {
+      shipmentId: sid,
+      ok: false,
+      found: false,
+      message: "TAI requests are halted due to a previous authentication failure.",
+    };
+  }
+
+  const taiBase = resolveTaiBaseUrl(options.baseUrl);
+  const doFetch = options.fetchImpl ?? fetch;
+  const endpoint = `/PublicApi/Accounting/v2/Invoices/Shipment/${encodeURIComponent(sid)}`;
+  const headers = {
+    "x-api-key": cred,
+    Accept: "application/json",
+  };
+
+  try {
+    const res = await doFetch(`${taiBase}${endpoint}`, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(20_000),
+    });
+
+    if (isTaiAuthFailureStatus(res.status)) {
+      haltTaiOnAuthFailure(cred, `TAI HTTP ${res.status} on GET /PublicApi/Accounting/v2/Invoices/Shipment/${sid}`);
+      return {
+        shipmentId: sid,
+        ok: false,
+        found: false,
+        message: `TAI authentication failure (${res.status})`,
+      };
+    }
+
+    if (res.status === 404) {
+      return {
+        shipmentId: sid,
+        ok: true,
+        found: false,
+        message: `No invoices found in TAI for shipment #${sid}`,
+      };
+    }
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      return {
+        shipmentId: sid,
+        ok: false,
+        found: false,
+        message: `TAI returned HTTP ${res.status}: ${errText.slice(0, 100)}`,
+      };
+    }
+
+    const data = (await res.json().catch(() => null)) as unknown;
+    if (!data) {
+      return {
+        shipmentId: sid,
+        ok: true,
+        found: false,
+        message: `Empty invoice response from TAI for shipment #${sid}`,
+      };
+    }
+
+    const invArray = Array.isArray(data) ? data : [data];
+    if (invArray.length === 0) {
+      return {
+        shipmentId: sid,
+        ok: true,
+        found: false,
+        message: `No invoices listed in TAI for shipment #${sid}`,
+      };
+    }
+
+    const inv = invArray[0] as Record<string, unknown>;
+    const invNum = String(inv.invoiceNumber || inv.number || inv.id || `INV-${sid}`);
+    const totalAmount = Number(inv.totalAmount ?? inv.total ?? inv.amount) || 0;
+    const paymentStatus = normalizeTaiInvoicePaymentStatus(inv.paymentStatus ?? inv.status);
+    const lineItemsRaw = Array.isArray(inv.lineItems) ? inv.lineItems : [];
+    const invDate = String(inv.invoiceDate || inv.date || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const isPaid = /paid/i.test(String(paymentStatus || ""));
+    const invPaidDate = isPaid ? String(inv.paidDate || inv.date || new Date().toISOString().slice(0, 10)) : null;
+
+    handleTaiInvoiceWebhook({
+      shipmentId: sid,
+      invoiceNumber: invNum,
+      invoiceType: String(inv.invoiceType || "AR"),
+      totalAmount,
+      paymentStatus: paymentStatus || undefined,
+      lineItems: lineItemsRaw as TaiInvoiceLineItemInput[],
+    });
+
+    const target = store.shipments.find((s) => s.id === sid);
+    const invoiceStatus = target?.invoiceStatus || `AR Invoice ${invNum} ($${totalAmount.toLocaleString()})`;
+
+    const sb = (options.supabaseClient !== undefined ? options.supabaseClient : store.getSupabase()) as {
+      from: (tbl: string) => {
+        update: (vals: Record<string, unknown>) => {
+          eq: (col: string, val: string) => Promise<{ error: unknown }>;
+        };
+      };
+    } | null;
+
+    if (sb) {
+      try {
+        await sb.from("shipments").update({
+          invoice_status: invoiceStatus,
+          invoice_date: invDate,
+          invoice_paid_date: invPaidDate,
+          updated_at: new Date().toISOString(),
+        }).eq("shipment_id", sid);
+      } catch {
+        // non-fatal mirror update
+      }
+    }
+
+    return {
+      shipmentId: sid,
+      ok: true,
+      found: true,
+      invoiceNumber: invNum,
+      invoiceStatus,
+      paymentStatus,
+      totalAmount,
+      message: `Successfully synced ${invoiceStatus}`,
+    };
+  } catch (err) {
+    return {
+      shipmentId: sid,
+      ok: false,
+      found: false,
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function syncTaiInvoices(
+  shipmentIds?: string[],
+  options: TaiInvoiceSyncOptions & { limit?: number } = {},
+): Promise<{
+  ok: boolean;
+  totalAttempted: number;
+  synced: number;
+  notFound: number;
+  errors: number;
+  results: TaiInvoiceSyncResult[];
+  message: string;
+}> {
+  let targetIds = (shipmentIds || []).filter((id) => isNumericTaiShipmentId(id));
+  if (targetIds.length === 0) {
+    const candidates = store.shipments.filter(
+      (s) =>
+        isNumericTaiShipmentId(s.id) &&
+        !isHiddenCustomer(s.customer) &&
+        (s.stage === "Delivered" || s.stage === "In transit" || s.stage === "Assigned" || /dispatched/i.test(s.rawStatus)),
+    );
+    const limit = Math.max(1, Math.min(50, options.limit || 20));
+    targetIds = candidates.slice(0, limit).map((s) => s.id);
+  }
+
+  if (targetIds.length === 0) {
+    return {
+      ok: true,
+      totalAttempted: 0,
+      synced: 0,
+      notFound: 0,
+      errors: 0,
+      results: [],
+      message: "No eligible shipments found to sync invoices.",
+    };
+  }
+
+  const results: TaiInvoiceSyncResult[] = [];
+  let synced = 0;
+  let notFound = 0;
+  let errors = 0;
+
+  for (const sid of targetIds) {
+    const res = await syncTaiInvoicesForShipment(sid, options);
+    results.push(res);
+    if (res.ok && res.found) synced += 1;
+    else if (res.ok && !res.found) notFound += 1;
+    else errors += 1;
+  }
+
+  const message = `TAI Invoice Sync: ${synced} synced, ${notFound} unbilled/not found, ${errors} error(s) out of ${targetIds.length} checked.`;
+  return {
+    ok: errors === 0 || synced > 0,
+    totalAttempted: targetIds.length,
+    synced,
+    notFound,
+    errors,
+    results,
+    message,
   };
 }
 

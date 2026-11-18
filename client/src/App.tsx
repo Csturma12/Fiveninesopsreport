@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import type { LoadEntry } from "@shared/load-entry";
-import type { BootstrapPayload, CrmLeadItem, CrucialEmailItem, OpsShipment } from "@shared/tai-webhook-schema";
+import { isHiddenCustomer, type BootstrapPayload, type CrmLeadItem, type CrucialEmailItem, type OpsShipment } from "@shared/tai-webhook-schema";
 import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
 import { POD_FILE_ACCEPT, podMimeTypeForFile } from "./lib/pod-file";
 import { CompactLoadBuilder } from "./components/CompactLoadBuilder";
@@ -36,87 +36,89 @@ import {
 } from "lucide-react";
 
 function createDefaultBuilderEntry(): LoadEntry {
+  const today = new Date().toISOString().slice(0, 10);
+  const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
   return {
     shipmentType: "Truckload",
     status: "Committed",
     customer: {
-      name: "LARKIN REFRACTORY SOLUTIONS",
-      taiOrganizationId: "698049",
+      name: "",
+      taiOrganizationId: "",
     },
     references: {
-      customerPO: "42705",
-      bolNumber: "42705",
-      invoiceRef: "42705",
+      customerPO: "",
+      bolNumber: "",
+      invoiceRef: "",
       carrierProNumber: "",
       pickupNumber: "",
     },
     stops: [
       {
         stopType: "First Pickup",
-        companyName: "CeramSource, Inc.",
-        streetAddress: "400 Enterprise Drive",
-        city: "Beaver Falls",
-        state: "PA",
-        zipCode: "15010",
+        companyName: "",
+        streetAddress: "",
+        city: "",
+        state: "",
+        zipCode: "",
         country: "USA",
-        contactName: "Dock",
-        phone: "(732) 257-5002",
+        contactName: "",
+        phone: "",
         instructions: "",
-        readyDate: "2026-11-16",
+        readyDate: today,
         timeOpen: "08:00",
-        timeClose: "14:00",
+        timeClose: "15:00",
         appointmentRequired: false,
-        savedFacilityMatched: true,
+        savedFacilityMatched: false,
       },
       {
         stopType: "Last Drop",
-        companyName: "Larkin Refractory Solutions",
-        streetAddress: "2331 Varkel Way",
-        city: "Lithonia",
-        state: "GA",
-        zipCode: "30058",
+        companyName: "",
+        streetAddress: "",
+        city: "",
+        state: "",
+        zipCode: "",
         country: "USA",
-        contactName: "Receiving",
-        phone: "(678) 336-7090",
+        contactName: "",
+        phone: "",
         instructions: "",
-        readyDate: "2026-11-17",
-        timeOpen: "07:00",
-        timeClose: "10:00",
-        appointmentRequired: true,
-        savedFacilityMatched: true,
+        readyDate: tomorrow,
+        timeOpen: "09:00",
+        timeClose: "16:00",
+        appointmentRequired: false,
+        savedFacilityMatched: false,
       },
     ],
     items: [
       {
-        description: "Refractory Ceramic Fiber Blankets & Castables",
+        description: "General Freight",
         packagingType: "Pallet",
-        handlingQuantity: 22,
-        piecesTotal: 22,
-        weightTotal: 38644,
+        handlingQuantity: 1,
+        piecesTotal: 1,
+        weightTotal: 0,
         hazardousMaterial: false,
         freightClass: "No Class",
-        referenceNumber: "PO 42705",
+        referenceNumber: "",
       },
     ],
-    accessorials: [{ scope: "pickup", code: "TARP", name: "Tarp Fee", sell: 150, buy: 100 }],
+    accessorials: [],
     equipment: {
       trailerSize: "Full",
-      trailerType: "48 ft Flatbed | Tarp",
-      equipmentLength: "48",
-      mileage: 648,
+      trailerType: "53 ft Van | Dry",
+      equipmentLength: "53",
+      mileage: 0,
       stackable: false,
     },
     pricing: {
-      linehaulSell: 3050,
+      linehaulSell: 0,
       fuelSell: 0,
-      linehaulBuy: 2450,
+      linehaulBuy: 0,
       fuelBuy: 0,
     },
     carrier: {
       name: "",
       serviceLevel: "Normal",
     },
-    specialInstructions: "8ft Tarps Required | Call 1 hr Prior | MacroPoint Tracking",
+    specialInstructions: "",
     sendToTai: true,
   };
 }
@@ -127,7 +129,7 @@ export const App: React.FC = () => {
   const [dockToolkit, setDockToolkit] = useState<boolean>(true);
   const [data, setData] = useState<BootstrapPayload | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [expandedLoadId, setExpandedLoadId] = useState<string | null>("132738007");
+  const [expandedLoadId, setExpandedLoadId] = useState<string | null>(null);
   const [inboxFilter, setInboxFilter] = useState<string>("all");
   const [toast, setToast] = useState<string | null>(null);
   const [toastKind, setToastKind] = useState<"ok" | "error">("ok");
@@ -184,6 +186,12 @@ export const App: React.FC = () => {
     }
     setAuthGateUrl(null);
     const json = (await res.json()) as BootstrapPayload;
+    if (json && Array.isArray(json.shipments)) {
+      json.shipments = json.shipments.filter((s) => !isHiddenCustomer(s.customer));
+    }
+    if (json && Array.isArray(json.customers)) {
+      json.customers = json.customers.filter((c) => !isHiddenCustomer(c.name));
+    }
     setData(json);
   }, []);
 
@@ -645,9 +653,23 @@ export const App: React.FC = () => {
         return;
       }
 
-      extractMultiStopTender();
+      const fallbackEntry = createDefaultBuilderEntry();
+      setBuilderEntry({
+        ...fallbackEntry,
+        references: {
+          ...fallbackEntry.references,
+          customerPO: reviewPoDraft.trim() || em.extractedPo || "",
+        },
+        pricing: {
+          ...fallbackEntry.pricing,
+          linehaulSell: Number(reviewSellDraft) || em.extractedAmount || 0,
+          linehaulBuy: Number(reviewBuyDraft) || 0,
+        },
+        specialInstructions: reviewNoteDraft.trim() || em.operationalNote || em.body || "",
+      });
       setReviewEmail(null);
       setLocation("/load-builder");
+      showToast(`Extracted email details into Compact Load Builder.`);
     },
     [
       data?.shipments,

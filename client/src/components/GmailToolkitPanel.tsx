@@ -9,6 +9,7 @@ import type {
   OpsShipment,
   SavedFacility,
 } from "@shared/tai-webhook-schema";
+import { isHiddenCustomer } from "@shared/tai-webhook-schema";
 import { AllLoadsView } from "./panel/AllLoadsView";
 import { AttentionView } from "./panel/AttentionView";
 import { BolGeneratorView } from "./panel/BolGeneratorView";
@@ -78,22 +79,22 @@ function createInitialQuoteState(entry: LoadEntry): QuoteDraftState {
   const drop = entry.stops[entry.stops.length - 1];
   const validDate = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10);
   return {
-    customerName: entry.customer.name || "Larkin Refractory Solutions",
+    customerName: entry.customer.name || "",
     contactEmail: entry.customer.email || "",
-    origin: pick ? `${pick.city}, ${pick.state} ${pick.zipCode}`.trim() : "Beaver Falls, PA 15010",
-    destination: drop ? `${drop.city}, ${drop.state} ${drop.zipCode}`.trim() : "Lithonia, GA 30058",
-    equipmentType: entry.equipment.trailerType || "48 ft Flatbed | Tarp",
-    estMiles: entry.equipment.mileage || 648,
-    linehaulRate: entry.pricing.linehaulSell || 3050,
+    origin: pick && pick.city ? `${pick.city}, ${pick.state}${pick.zipCode ? ` ${pick.zipCode}` : ""}`.trim() : "",
+    destination: drop && drop.city ? `${drop.city}, ${drop.state}${drop.zipCode ? ` ${drop.zipCode}` : ""}`.trim() : "",
+    equipmentType: entry.equipment.trailerType || "53 ft Van | Dry",
+    estMiles: entry.equipment.mileage || 0,
+    linehaulRate: entry.pricing.linehaulSell || 0,
     fuelSurcharge: entry.pricing.fuelSell || 0,
     accessorials: entry.accessorials.map((a, idx) => ({
       id: `init-acc-${idx}`,
       name: a.name,
       amount: a.sell || 0,
     })),
-    transitNote: "Next-day / 2-day direct FTL transit",
+    transitNote: "Direct FTL transit",
     validUntil: validDate,
-    equipmentNotes: entry.specialInstructions || "Includes 8ft tarps | 2 hrs free load/unload",
+    equipmentNotes: entry.specialInstructions || "",
   };
 }
 
@@ -120,9 +121,12 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
   onRefresh,
   onOpenDashboardLoad,
 }) => {
+  const safeShipments = useMemo(() => shipments.filter((s) => !isHiddenCustomer(s.customer)), [shipments]);
+  const safeCustomers = useMemo(() => customers.filter((c) => !isHiddenCustomer(c.name)), [customers]);
+
   const [view, setView] = useState<PanelViewId>(() => parsePanelViewParam() || (fullScreen ? "home" : "inbox"));
   const [universalQuery, setUniversalQuery] = useState<string>("");
-  const [expandedLoadId, setExpandedLoadId] = useState<string | null>(shipments[0]?.id ?? null);
+  const [expandedLoadId, setExpandedLoadId] = useState<string | null>(() => shipments.find((s) => !isHiddenCustomer(s.customer))?.id ?? null);
   const [bolTargetId, setBolTargetId] = useState<string | null>(null);
   const [zoom, setZoom] = useState<number>(100);
   const [refreshing, setRefreshing] = useState<boolean>(false);
@@ -349,7 +353,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
         fullScreen={fullScreen}
         view={view}
         onNavigate={navigateView}
-        shipments={shipments}
+        shipments={safeShipments}
         onInspectLoad={handleInspectLoad}
         universalQuery={universalQuery}
         onUniversalQueryChange={setUniversalQuery}
@@ -411,8 +415,8 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
               onNavigate={navigateView}
               attentionCount={attentionCount}
               inboxCount={crucialEmails.length}
-              shipments={shipments}
-              customers={customers}
+              shipments={safeShipments}
+              customers={safeCustomers}
               facilities={facilities}
               kpis={kpis}
               taiPortalUrl={taiPortalUrl}
@@ -422,7 +426,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
           {view === "inbox" && (
             <InboxStreamView
               crucialEmails={crucialEmails}
-              shipments={shipments}
+              shipments={safeShipments}
               onBuilderChange={onBuilderChange}
               onThreadSelected={setLiveThread}
               onInspectLoad={handleInspectLoad}
@@ -437,7 +441,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
 
           {view === "attention" && (
             <AttentionView
-              shipments={shipments}
+              shipments={safeShipments}
               crucialEmails={crucialEmails}
               apTasks={apTasks}
               onInspectLoad={handleInspectLoad}
@@ -450,7 +454,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
 
           {view === "dispatch" && (
             <DispatchBoardView
-              shipments={shipments}
+              shipments={safeShipments}
               carriers={carriers}
               expandedId={expandedLoadId}
               onExpandChange={setExpandedLoadId}
@@ -471,7 +475,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
 
           {view === "all-loads" && (
             <AllLoadsView
-              shipments={shipments}
+              shipments={safeShipments}
               universalQuery={universalQuery}
               expandedId={expandedLoadId}
               onExpandChange={setExpandedLoadId}
@@ -492,7 +496,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
 
           {view === "rates" && (
             <RatesView
-              shipments={shipments}
+              shipments={safeShipments}
               builderEntry={builderEntry}
               onBuilderChange={onBuilderChange}
               onSendToQuote={(patch) => setQuoteDraft((prev) => ({ ...prev, ...patch }))}
@@ -514,8 +518,8 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
           {view === "sales" && (
             <SalesPanelView
               leads={crmLeads}
-              customers={customers}
-              shipments={shipments}
+              customers={safeCustomers}
+              shipments={safeShipments}
               builderEntry={builderEntry}
               onBuilderChange={onBuilderChange}
               apiCtx={apiCtx}
@@ -533,7 +537,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
               entry={builderEntry}
               onChange={onBuilderChange}
               facilities={facilities}
-              customers={customers}
+              customers={safeCustomers}
               carriers={carriers}
               savedDrafts={savedDrafts}
               knowledgeRules={knowledgeRules}
@@ -559,7 +563,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
 
           {view === "tools-bol" && (
             <BolGeneratorView
-              shipments={shipments}
+              shipments={safeShipments}
               builderEntry={builderEntry}
               initialShipmentId={bolTargetId}
               apiCtx={apiCtx}
@@ -580,7 +584,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
 
           {view === "pod" && (
             <PodFilesView
-              shipments={shipments}
+              shipments={safeShipments}
               onUploadPod={onUploadPod}
               onRefresh={async () => {
                 await onRefresh?.();
@@ -592,7 +596,7 @@ export const GmailToolkitPanel: React.FC<GmailToolkitPanelProps> = ({
 
           {view === "check-email" && (
             <CheckEmailView
-              shipments={shipments}
+              shipments={safeShipments}
               crucialEmails={crucialEmails}
               liveThread={liveThread}
               onThreadCaptured={setLiveThread}

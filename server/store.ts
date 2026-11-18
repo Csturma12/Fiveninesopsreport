@@ -23,7 +23,7 @@ import type {
   SavedFacility,
   WebhookEventLog,
 } from "../shared/tai-webhook-schema";
-import { deriveRateconStatus, extractDateShort, mapTaiStatusToStage } from "../shared/tai-webhook-schema";
+import { deriveRateconStatus, extractDateShort, isHiddenCustomer, mapTaiStatusToStage } from "../shared/tai-webhook-schema";
 import { broadcastOpsEvent } from "./events";
 import { pollerConfigStatus } from "./tai-writeback-poller";
 
@@ -716,59 +716,6 @@ const SEEDED_EMAILS: CrucialEmailItem[] = [
       buyRate: 250,
       notes:
         "⚠ TONU PAID · DID NOT PICK UP: Forklift went down at facility — paid TONU and waiting for forklift to be repaired before rescheduling pickup.",
-    },
-  },
-  {
-    id: "em-tender-42705",
-    category: "tenders",
-    source: "seed",
-    subject: "NEW 2-PICK TENDER: Beaver Falls PA + Monongahela PA → Lithonia GA (#42705)",
-    from: "shipping@larkinrefractory.com",
-    senderName: "Larkin Dispatch",
-    received: "12m ago",
-    loadId: "NEW",
-    diffType: "new_tender",
-    diffLabel: "Unbooked Multi-Stop Tender · 22 Pallets · 38,644 lbs",
-    diffValue: "PA (2 Picks) → Lithonia, GA 30058",
-    ctaLabel: "Extract to Compact Builder",
-    extractedPo: "42705",
-    extractedAmount: 3050,
-    permalink: "https://mail.google.com/mail/u/0/#search/42705",
-    body: "Please book PO #42705: Pick 1 CeramSource, 400 Enterprise Dr, Beaver Falls PA 15010 (6 pallets, 6,644 lbs ceramic fiber blankets) + Pick 2 Management & Consulting, 626 Riverview Rd, Monongahela PA 15063 (16 pallets, 32,000 lbs alumina castables) → Drop Larkin Refractory, 2331 Varkel Way, Lithonia GA 30058. 48 ft Flatbed | Tarp, 8ft tarps required, MacroPoint.",
-    fullBody:
-      "Team,\n\nPlease book PO #42705 in TAI (2-stop pickup → Lithonia GA):\n\nStop 1 (First Pickup): CeramSource, Inc., 400 Enterprise Drive, Beaver Falls, PA 15010\n  - 6 pallets · 6,644 lbs Ceramic Fiber Refractory Blankets\n  - Open 08:00–14:00 (2026-11-16)\n\nStop 2 (Pick): Management & Consulting, 626 Riverview Rd., Monongahela, PA 15063\n  - 16 pallets · 32,000 lbs High-Alumina Refractory Castables\n  - Open 10:00–15:00 (2026-11-16)\n\nStop 3 (Last Drop): Larkin Refractory Solutions, 2331 Varkel Way, Lithonia, GA 30058\n  - Appt 07:00–10:00 (2026-11-17)\n\nEquipment: 48 ft Flatbed | Tarp (8ft tarps required, call 1 hr prior, MacroPoint tracking).",
-    extractedFields: {
-      customerPO: "42705",
-      sellRate: 3050,
-      origin: "Beaver Falls, PA 15010",
-      dest: "Lithonia, GA 30058",
-      equipment: "48 ft Flatbed | Tarp",
-      readyDate: "2026-11-16",
-      notes: "8ft tarps required, call 1 hr prior, MacroPoint tracking",
-    },
-  },
-  {
-    id: "em-po-132742212",
-    category: "diffs",
-    source: "seed",
-    subject: "RE: Larkin Refractory — Lithonia pickup PO #LR-88412",
-    from: "ops@larkinrefractory.com",
-    senderName: "Larkin Ops",
-    received: "24m ago",
-    loadId: "132742212",
-    diffType: "missing_po",
-    diffLabel: "Load #132742212 missing Customer PO in TAI",
-    diffValue: "→ PO: LR-88412",
-    ctaLabel: "Write PO to TAI References",
-    extractedPo: "LR-88412",
-    permalink: "https://mail.google.com/mail/u/0/#search/132742212",
-    body: "Team — please add Customer PO #LR-88412 to Load #132742212 (Lithonia, GA 30058 → West Monroe, LA 71292).",
-    fullBody:
-      "Team — please add Customer PO #LR-88412 to Load #132742212 (Lithonia, GA 30058 → West Monroe, LA 71292) so it matches our BOL at pickup.",
-    extractedFields: {
-      customerPO: "LR-88412",
-      origin: "Lithonia, GA 30058",
-      dest: "West Monroe, LA 71292",
     },
   },
   {
@@ -1543,7 +1490,9 @@ class OpsStore {
   }
 
   recomputeOfflineCounts(): void {
-    const active = this.shipments.filter((s) => !this.deletedShipmentIds.has(s.id));
+    const active = this.shipments.filter(
+      (s) => !this.deletedShipmentIds.has(s.id) && !isHiddenCustomer(s.customer),
+    );
     const uncoveredCommitted = active.filter(
       (s) => s.stage === "Needs truck" && /committed/i.test(s.rawStatus || "Committed") && !s.carrier.trim(),
     ).length;
@@ -1563,7 +1512,7 @@ class OpsStore {
       inTransit,
       delivered,
       cancelled,
-      customers: this.customers.length,
+      customers: this.customers.filter((c) => !isHiddenCustomer(c.name)).length,
       carriers: this.carriers.length,
       facilities: this.facilities.length,
     };
@@ -1616,12 +1565,14 @@ class OpsStore {
           if (custErr) throw new Error(`customers: ${custErr.message}`);
           if (!custRows || custRows.length === 0) break;
           for (const c of custRows as Record<string, unknown>[]) {
+            const custName = String(c.name || "");
+            if (isHiddenCustomer(custName)) continue;
             const addr = (c.tai_address && typeof c.tai_address === "object" ? c.tai_address : {}) as Record<
               string,
               unknown
             >;
             liveCustomers.push({
-              name: String(c.name || ""),
+              name: custName,
               taiOrgId: c.tai_organization_id ? String(c.tai_organization_id) : "",
               city: String(addr.city || addr.City || ""),
               state: String(addr.state || addr.State || ""),
@@ -1690,8 +1641,11 @@ class OpsStore {
         for (const r of [...(activeRes.data || []), ...(recentArchiveRes.data || [])] as Record<string, unknown>[]) {
           const id = String(r.shipment_id || "").trim();
           if (!id || seenIds.has(id) || this.deletedShipmentIds.has(id)) continue;
+          if (isHiddenCustomer(String(r.customer_name || ""))) continue;
+          const mapped = mapSupabaseShipmentRow(r, prevById.get(id), liveFacilities);
+          if (isHiddenCustomer(mapped.customer)) continue;
           seenIds.add(id);
-          liveShipments.push(mapSupabaseShipmentRow(r, prevById.get(id), liveFacilities));
+          liveShipments.push(mapped);
         }
 
         // 5. Exact live status counts + real 30-day revenue/buy/load KPIs + distinct shipment customer names
@@ -1751,14 +1705,18 @@ class OpsStore {
         this.shipments = liveShipments;
 
         for (const s of liveShipments) {
-          if (s.customer) this.knownShipmentCustomerNames.add(s.customer);
+          if (s.customer && !isHiddenCustomer(s.customer)) this.knownShipmentCustomerNames.add(s.customer);
         }
         for (const r of (recent30Res.data || []) as Record<string, unknown>[]) {
-          if (r.customer_name) this.knownShipmentCustomerNames.add(String(r.customer_name));
+          if (r.customer_name && !isHiddenCustomer(String(r.customer_name))) {
+            this.knownShipmentCustomerNames.add(String(r.customer_name));
+          }
         }
 
-        // Compute exact active stage counts directly from the complete active set
-        const activeRows = (activeRes.data || []) as Record<string, unknown>[];
+        // Compute exact active stage counts directly from the complete non-hidden active set
+        const activeRows = ((activeRes.data || []) as Record<string, unknown>[]).filter(
+          (r) => !isHiddenCustomer(String(r.customer_name || "")),
+        );
         const uncoveredCommitted = activeRows.filter(
           (r) => /^committed$/i.test(String(r.status || "").trim()) && !String(r.carrier_name || "").trim(),
         ).length;
@@ -1831,7 +1789,9 @@ class OpsStore {
           const subject = String(e.subject || "Operations Email").trim();
           if (
             /notifications@github\.com|noreply@github\.com/i.test(senderEmail) ||
-            subject.includes("[Csturma12/")
+            subject.includes("[Csturma12/") ||
+            isHiddenCustomer(subject) ||
+            isHiddenCustomer(senderEmail)
           ) {
             continue;
           }
@@ -2228,7 +2188,11 @@ class OpsStore {
 
     const sb = this.getSupabase();
     if (sb && this.supabaseConnected) {
-      let q = sb.from("shipments").select(SHIPMENT_SELECT_COLS, { count: "exact" });
+      let q = sb
+        .from("shipments")
+        .select(SHIPMENT_SELECT_COLS, { count: "exact" })
+        .not("customer_name", "ilike", "%quality sausage%")
+        .not("customer_name", "ilike", "%qualitysausage%");
 
       if (view === "active") {
         q = q.in("status", ["Committed", "Dispatched", "In Transit", "Quote"]);
@@ -2299,8 +2263,13 @@ class OpsStore {
       if (!error && Array.isArray(data)) {
         const byId = new Map(this.shipments.map((s) => [s.id, s]));
         const items = (data as Record<string, unknown>[])
-          .filter((r) => !this.deletedShipmentIds.has(String(r.shipment_id || "")))
-          .map((r) => mapSupabaseShipmentRow(r, byId.get(String(r.shipment_id || "")), this.facilities));
+          .filter(
+            (r) =>
+              !this.deletedShipmentIds.has(String(r.shipment_id || "")) &&
+              !isHiddenCustomer(String(r.customer_name || "")),
+          )
+          .map((r) => mapSupabaseShipmentRow(r, byId.get(String(r.shipment_id || "")), this.facilities))
+          .filter((s) => !isHiddenCustomer(s.customer));
 
         const c = this.liveCounts;
         const statusCounts: Record<string, number> = {
@@ -2331,7 +2300,9 @@ class OpsStore {
     }
 
     // In-memory pagination (offline / unit tests)
-    const allRows = this.shipments.filter((s) => !this.deletedShipmentIds.has(s.id));
+    const allRows = this.shipments.filter(
+      (s) => !this.deletedShipmentIds.has(s.id) && !isHiddenCustomer(s.customer),
+    );
     const statusCounts: Record<string, number> = {
       all: allRows.length,
       active: allRows.filter((s) => s.stage !== "Delivered" && s.stage !== "Cancelled").length,
@@ -2630,7 +2601,10 @@ class OpsStore {
       await this.initSupabaseSyncAndRealtime();
     }
 
-    this.shipments = this.shipments.filter((s) => !this.deletedShipmentIds.has(s.id));
+    this.shipments = this.shipments.filter(
+      (s) => !this.deletedShipmentIds.has(s.id) && !isHiddenCustomer(s.customer),
+    );
+    this.customers = this.customers.filter((c) => !isHiddenCustomer(c.name));
     this.rebuildMergedInbox();
     this.correlateContainerEventsAndNotes();
     this.filterCrmLeadsAgainstCustomers();

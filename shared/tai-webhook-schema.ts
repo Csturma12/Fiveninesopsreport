@@ -5,6 +5,15 @@ export type DispatchStage = ShipmentStage;
 
 export type RateconStatus = "Not Sent" | "Drafted" | "Sent" | "Signed";
 
+/**
+ * Customers explicitly hidden from operational dashboards, panel, and search (e.g. Quality Sausage).
+ */
+export function isHiddenCustomer(name: string | null | undefined): boolean {
+  if (!name) return false;
+  const n = String(name).toLowerCase().replace(/[^a-z0-9]/g, "");
+  return n.includes("qualitysausage") || n.includes("qualitysaus") || n === "qsc";
+}
+
 export interface ContainerEventItem {
   id: string;
   timestamp: string;

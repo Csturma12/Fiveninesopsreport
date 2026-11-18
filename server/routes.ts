@@ -34,6 +34,8 @@ import {
   saveFacilityRecord,
   updateShipmentFull,
   updateShipmentRateconStatus,
+  syncTaiInvoices,
+  syncTaiInvoicesForShipment,
   verifyWebhookSecretIfConfigured,
   type BookTaiLoadsOptions,
   type DirectTaiHelperOptions,
@@ -1196,6 +1198,38 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
     }
     broadcastOpsEvent("shipment_updated", { deletedId: id });
     res.json({ ok: true, id, message: `Deleted load #${id}` });
+  });
+
+  // Live TAI Invoice Sync Endpoints
+  app.post("/api/tai/invoices/sync", async (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    const shipmentIds = Array.isArray(req.body?.shipmentIds)
+      ? (req.body.shipmentIds as unknown[]).map((x) => String(x || "").trim()).filter(Boolean)
+      : undefined;
+    const limit = typeof req.body?.limit === "number" ? req.body.limit : undefined;
+    const result = await syncTaiInvoices(shipmentIds, {
+      limit,
+      actor: req.staffUser?.email,
+    });
+    res.json(result);
+  });
+
+  app.post("/api/loads/:id/sync-invoice", async (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    const sid = String(req.params.id || "").trim();
+    const result = await syncTaiInvoicesForShipment(sid, {
+      actor: req.staffUser?.email,
+    });
+    res.status(result.ok ? 200 : 400).json(result);
+  });
+
+  app.get("/api/tai/invoices/:id", async (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+    const sid = String(req.params.id || "").trim();
+    const result = await syncTaiInvoicesForShipment(sid, {
+      actor: req.staffUser?.email,
+    });
+    res.status(result.ok ? 200 : 400).json(result);
   });
 
   // Live Gmail Inbox Stream & Extension Auto-Ingest Endpoints
