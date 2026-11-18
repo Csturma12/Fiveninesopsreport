@@ -48,6 +48,45 @@
   --pf-sidebar: #16234b;
 }
 
+/* Redesigned Gmail Freight Panel — Calm Dark Slate + Emerald Palette */
+.tk-panel {
+  --pf-bg: #0b0e13;
+  --pf-surface: #131820;
+  --pf-surface-raised: #171d27;
+  --pf-surface-hover: #1d2532;
+  --pf-border: #222936;
+  --pf-text: #f3f5f8;
+  --pf-text-muted: #8b95a5;
+  --pf-text-subtle: #6e7787;
+  --pf-primary: #38c976;
+  --pf-primary-fg: #07130c;
+  --pf-primary-dim: rgba(56, 201, 118, 0.14);
+  --pf-action: #38c976;
+  --pf-danger: #dc4446;
+  --pf-danger-dim: rgba(220, 68, 70, 0.15);
+  --pf-warning: #d89b3c;
+  --pf-warning-dim: rgba(216, 155, 60, 0.16);
+  --pf-info: #6ca0dc;
+  --pf-info-dim: rgba(108, 160, 220, 0.16);
+  --pf-masthead: #0b0e13;
+  background-color: #0b0e13;
+  color: #f3f5f8;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+.tk-panel .pf-input {
+  background: #151b24;
+  border: 1px solid #242c3a;
+  color: #f3f5f8;
+  border-radius: 0.6rem;
+  padding: 0.42rem 0.6rem;
+}
+
+.tk-panel .pf-input:focus {
+  border-color: #38c976;
+}
+
 .pf-app {
   background-color: var(--pf-bg);
   color: var(--pf-text);

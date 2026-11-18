@@ -8,6 +8,8 @@
 #        GOOGLE_CLIENT_ID="..." \
 #        GOOGLE_CLIENT_SECRET="..." \
 #        SESSION_SECRET="..." \
+#        OPS_GATEWAY_TOKEN="..." \
+#        PFD_BASE_URL="http://primary-freight-dashboard.internal:5000" \
 #        ALLOW_LIVE_TAI_WRITES="true" \
 #        TAI_WRITEBACK_POLLER_ENABLED="true"
 #      (fivenines-ops claims & processes its own queued writes immediately on save
@@ -24,6 +26,9 @@ primary_region = "dfw"
 [env]
   APP_BASE_URL = "https://fivenines-ops.fly.dev"
   GMAIL_FREIGHT_TOOLKIT_OAUTH_CLIENT_IDS = "1093823548746-u96k7b3qro0a2vs6g5m1b9hfbn3441be.apps.googleusercontent.com,413556084944-jp47ckqu854t3cpccu318eqmn8c5ck50.apps.googleusercontent.com"
+  TAI_WRITEBACK_ENABLED = "true"
+  BILLING_TAI_WRITE_ENABLED = "true"
+  TAI_ADDRESS_BOOK_SAVE_ENABLED = "false"
   TAI_WRITEBACK_POLLER_ENABLED = "true"
   TAI_WRITEBACK_POLLER_SCOPE = "own"
 

@@ -21,8 +21,11 @@ async function startServer() {
     if (origin.startsWith("chrome-extension://") || origin.startsWith("https://mail.google.com")) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Access-Control-Allow-Credentials", "true");
-      res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, x-csrf-token, x-gmail-panel-expected-email",
+      );
     }
     if (req.method === "OPTIONS") {
       res.status(204).end();

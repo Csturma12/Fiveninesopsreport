@@ -7,6 +7,7 @@ import { POD_FILE_ACCEPT, podMimeTypeForFile } from "./lib/pod-file";
 import { CompactLoadBuilder } from "./components/CompactLoadBuilder";
 import { UnifiedDispatchView } from "./components/UnifiedDispatchView";
 import { GmailToolkitPanel } from "./components/GmailToolkitPanel";
+import { isStandalonePanelLocation } from "./components/panel/panelTypes";
 import { SalesOpsCrmView } from "./components/SalesOpsCrmView";
 import {
   Activity,
@@ -148,7 +149,8 @@ export const App: React.FC = () => {
     const res = await fetch("/api/bootstrap", { credentials: "include" });
     if (res.status === 401) {
       const errJson = (await res.json().catch(() => ({}))) as { loginUrl?: string };
-      setAuthGateUrl(errJson.loginUrl || `/auth/google?returnTo=${encodeURIComponent(window.location.pathname)}`);
+      const returnPath = `${window.location.pathname}${window.location.search}`;
+      setAuthGateUrl(errJson.loginUrl || `/auth/google?returnTo=${encodeURIComponent(returnPath)}`);
       return;
     }
     setAuthGateUrl(null);
@@ -158,6 +160,11 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     refreshBootstrap();
+    const params = new URLSearchParams(window.location.search);
+    const targetLoad = params.get("load");
+    if (targetLoad) {
+      setExpandedLoadId(targetLoad);
+    }
   }, [refreshBootstrap]);
 
   // Live SSE listener for Supabase Realtime & Inbound TAI Webhooks
@@ -594,23 +601,28 @@ export const App: React.FC = () => {
     </div>
   ) : null;
 
-  // Standalone Chrome Extension Side-Panel Route (/gmail-panel)
-  if (location.startsWith("/gmail-panel")) {
+  // Standalone Chrome Extension Side-Panel Route (/?panel=1 or /gmail-panel)
+  if (isStandalonePanelLocation(location)) {
     return (
-      <div data-theme={theme} className="pf-app h-screen w-full overflow-hidden flex flex-col">
+      <div data-theme="dark" className="tk-panel h-screen w-full overflow-hidden flex flex-col">
         {podFileInput}
-        {toastBanner}
         <div className="flex-1 min-h-0">
           <GmailToolkitPanel
+            fullScreen
             shipments={data.shipments}
             crucialEmails={data.crucialEmails}
             facilities={data.facilities}
             customers={data.customers}
             carriers={data.carriers}
+            crmLeads={data.crmLeads}
+            kpis={data.kpis}
+            bootstrapUser={data.user}
+            isLiveSync={!data.mode.safeSandbox}
             builderEntry={builderEntry}
             onBuilderChange={setBuilderEntry}
             onApplyEmailAction={handleApplyEmailAction}
             onUploadPod={promptPodUpload}
+            onRefresh={refreshBootstrap}
             onBooked={async (_ids, msg) => {
               showToast(msg);
               await refreshBootstrap();
@@ -1611,10 +1623,16 @@ export const App: React.FC = () => {
               facilities={data.facilities}
               customers={data.customers}
               carriers={data.carriers}
+              crmLeads={data.crmLeads}
+              kpis={data.kpis}
+              bootstrapUser={data.user}
+              isLiveSync={!data.mode.safeSandbox}
               builderEntry={builderEntry}
               onBuilderChange={setBuilderEntry}
               onApplyEmailAction={handleApplyEmailAction}
               onUploadPod={promptPodUpload}
+              onRefresh={refreshBootstrap}
+              onOpenDashboardLoad={openLoadInDispatch}
               onBooked={async (_ids, msg) => {
                 showToast(msg);
                 await refreshBootstrap();

@@ -40,7 +40,10 @@ $optionalKeysToSync = @(
   "GOOGLE_MAPS_API_KEY",
   "CRM_WEBHOOK_SECRET",
   "CRM_VERCEL_BYPASS_SECRET",
-  "CRM_LEADS_WEBHOOK_URL"
+  "CRM_LEADS_WEBHOOK_URL",
+  "OPS_GATEWAY_TOKEN",
+  "PFD_GATEWAY_TOKEN",
+  "PFD_BASE_URL"
 )
 
 $secretPairs = New-Object System.Collections.Generic.List[string]
