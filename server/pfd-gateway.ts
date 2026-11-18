@@ -1,6 +1,6 @@
 import { Readable } from "node:stream";
 import type { Express, Request, Response } from "express";
-import { PFD_API_PREFIXES } from "../shared/pfd-endpoints";
+import { PFD_ALLOWED_PATH_PREFIXES, PFD_API_PREFIXES } from "../shared/pfd-endpoints";
 
 /**
  * Primary Freight Dashboard gateway.
@@ -12,9 +12,10 @@ import { PFD_API_PREFIXES } from "../shared/pfd-endpoints";
  *
  * Trust model: this app has already verified the staff Google identity (the
  * auth middleware sets req.staffUser and 401s unauthenticated /api/* calls).
- * The gateway sends a shared secret (`PFD_GATEWAY_TOKEN`, the same value set on
- * both Fly apps) plus the acting staff email. The browser's cookies and
- * Authorization header are never forwarded.
+ * The gateway sends a shared secret (`PFD_GATEWAY_TOKEN`, or `OPS_GATEWAY_TOKEN`
+ * when `PFD_GATEWAY_TOKEN` is unset — the same value set on both Fly apps)
+ * plus the acting staff email and URI-encoded display name. The browser's
+ * cookies and Authorization header are never forwarded.
  */
 
 export const PFD_GATEWAY_MOUNT = "/api/pfd";
@@ -23,8 +24,17 @@ export const PFD_ACTING_USER_HEADER = "x-ops-acting-user";
 export const PFD_ACTING_NAME_HEADER = "x-ops-acting-name";
 export const MIN_GATEWAY_TOKEN_LENGTH = 32;
 
+export const PFD_BLOCKED_PATH_PREFIXES = ["/api/auth", "/api/portal", "/api/webhooks"] as const;
+
 /** Request headers copied to the dashboard. Everything else is dropped. */
-const FORWARDED_REQUEST_HEADERS = ["accept", "accept-language", "content-type", "if-none-match", "last-event-id"];
+const FORWARDED_REQUEST_HEADERS = [
+  "accept",
+  "accept-language",
+  "content-type",
+  "if-none-match",
+  "last-event-id",
+  "x-gmail-panel-expected-email",
+];
 /** Response headers copied back to the browser. Cache-Control is not copied: staff data stays no-store. */
 const FORWARDED_RESPONSE_HEADERS = [
   "content-type",
@@ -46,7 +56,10 @@ export type PfdGatewayConfigResult =
 
 export function readPfdGatewayConfig(env: NodeJS.ProcessEnv = process.env): PfdGatewayConfigResult {
   const baseUrl = String(env.PFD_BASE_URL || "").trim().replace(/\/+$/, "");
-  const token = String(env.PFD_GATEWAY_TOKEN || "").trim();
+  const primaryToken = String(env.PFD_GATEWAY_TOKEN || "").trim();
+  const aliasToken = String(env.OPS_GATEWAY_TOKEN || "").trim();
+  const token = primaryToken || aliasToken;
+  const tokenVarName = primaryToken ? "PFD_GATEWAY_TOKEN" : aliasToken ? "OPS_GATEWAY_TOKEN" : "PFD_GATEWAY_TOKEN";
   const missing: string[] = [];
   const problems: string[] = [];
   if (!baseUrl) missing.push("PFD_BASE_URL");
@@ -68,7 +81,7 @@ export function readPfdGatewayConfig(env: NodeJS.ProcessEnv = process.env): PfdG
     }
   }
   if (token && token.length < MIN_GATEWAY_TOKEN_LENGTH) {
-    problems.push(`PFD_GATEWAY_TOKEN must be at least ${MIN_GATEWAY_TOKEN_LENGTH} characters`);
+    problems.push(`${tokenVarName} must be at least ${MIN_GATEWAY_TOKEN_LENGTH} characters`);
   }
   if (missing.length || problems.length) return { ok: false, missing, problems };
   const configuredTimeoutMs = Number(env.PFD_GATEWAY_TIMEOUT_MS);
@@ -77,6 +90,10 @@ export function readPfdGatewayConfig(env: NodeJS.ProcessEnv = process.env): PfdG
       ? Math.min(configuredTimeoutMs, 2_147_483_647)
       : 60_000;
   return { ok: true, config: { baseUrl, token, timeoutMs } };
+}
+
+export function isPfdGatewayConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return readPfdGatewayConfig(env).ok;
 }
 
 /**
@@ -92,8 +109,24 @@ export function upstreamApiPath(rest: string): string | null {
   return `/api/${rest}`;
 }
 
+/**
+ * Explicit safety blocklist enforced regardless of PFD_ALLOWED_PATH_PREFIXES.
+ * Blocks `/api/auth/*`, `/api/portal/*`, `/api/webhooks/*`, and `/api/outlook/auth-*`.
+ */
+export function isBlockedPfdApiPath(apiPath: string): boolean {
+  const lower = apiPath.toLowerCase();
+  if (PFD_BLOCKED_PATH_PREFIXES.some((blocked) => lower === blocked || lower.startsWith(`${blocked}/`))) {
+    return true;
+  }
+  if (lower.startsWith("/api/outlook/auth-")) {
+    return true;
+  }
+  return false;
+}
+
 export function isKnownPfdApiPath(apiPath: string): boolean {
-  return PFD_API_PREFIXES.some((prefix) => apiPath === prefix || apiPath.startsWith(`${prefix}/`));
+  if (isBlockedPfdApiPath(apiPath)) return false;
+  return PFD_ALLOWED_PATH_PREFIXES.some((prefix) => apiPath === prefix || apiPath.startsWith(`${prefix}/`));
 }
 
 function forwardableIdentity(req: Request): { email: string; name: string } | null {
@@ -161,6 +194,10 @@ export function registerPfdGateway(app: Express, options: RegisterPfdGatewayOpti
     const apiPath = upstreamApiPath(rawRest);
     if (!apiPath) {
       res.status(400).json({ ok: false, message: "Invalid dashboard path." });
+      return;
+    }
+    if (isBlockedPfdApiPath(apiPath)) {
+      res.status(404).json({ ok: false, blocked: true, message: `Path ${apiPath} is blocked on the dashboard gateway.` });
       return;
     }
     if (!isKnownPfdApiPath(apiPath)) {

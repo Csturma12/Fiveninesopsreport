@@ -1,7 +1,16 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { broadcastOpsEvent } from "./events";
+import {
+  haltTaiOnAuthFailure,
+  isTaiAuthFailureStatus,
+  isTaiAuthHalted,
+  onTaiAuthHalt,
+  recordTaiPush,
+  taiApiKey,
+  type SupabaseInsertLike,
+} from "./tai-push-log";
 
-interface AssignmentRow {
+export interface AssignmentRow {
   id: number;
   shipment_id: string;
   carrier_master_id: number | null;
@@ -33,6 +42,33 @@ export const READ_BACK_PENDING_SAVE_MESSAGE =
 
 let timer: NodeJS.Timeout | null = null;
 let ticking = false;
+let pollerHalted = false;
+let pollerHaltReason: string | null = null;
+
+export function stopTaiWritebackPoller(reason?: string): void {
+  if (reason) {
+    pollerHalted = true;
+    pollerHaltReason = reason;
+    console.error(`[tai-writeback-poller] HALTED: ${reason}`);
+  }
+  if (timer) {
+    clearTimeout(timer);
+    timer = null;
+  }
+}
+
+export function isWritebackPollerHalted(): { halted: boolean; reason: string | null } {
+  return { halted: pollerHalted, reason: pollerHaltReason };
+}
+
+export function resetWritebackPollerHalt(): void {
+  pollerHalted = false;
+  pollerHaltReason = null;
+}
+
+onTaiAuthHalt((reason) => {
+  stopTaiWritebackPoller(reason);
+});
 
 export function isPendingReadBack(body: unknown): PendingReadBack | null {
   if (!body || typeof body !== "object") return null;
@@ -44,10 +80,6 @@ export function isPendingReadBack(body: unknown): PendingReadBack | null {
     writeSentAt: obj.writeSentAt,
     readBackRounds: Number(obj.readBackRounds) || 0,
   };
-}
-
-function getTaiCred(): string {
-  return String(process.env[["TAI", "API", "KEY"].join("_")] || "").trim();
 }
 
 async function logAuditEvent(
@@ -81,18 +113,42 @@ function buildCarrierChargesPayload(row: AssignmentRow) {
   };
 }
 
+export function isNumericTaiShipmentId(shipmentId: unknown): boolean {
+  return /^\d+$/.test(String(shipmentId ?? "").trim());
+}
+
 async function verifyCarrierReadBack(
   row: AssignmentRow,
   taiBase: string,
   taiKey: string,
-): Promise<{ verified: boolean; taiBuy: number; status: number }> {
-  let last = { verified: false, taiBuy: 0, status: 0 };
-  for (const waitMs of READ_BACK_WAITS_MS) {
+  doFetch: typeof fetch = fetch,
+  waitsMs: readonly number[] = READ_BACK_WAITS_MS,
+): Promise<{ verified: boolean; taiBuy: number; status: number; authFailed?: boolean }> {
+  if (!isNumericTaiShipmentId(row.shipment_id)) {
+    return { verified: false, taiBuy: 0, status: 0 };
+  }
+  const cleanShipmentId = String(row.shipment_id).trim();
+  let last: { verified: boolean; taiBuy: number; status: number; authFailed?: boolean } = {
+    verified: false,
+    taiBuy: 0,
+    status: 0,
+  };
+  for (const waitMs of waitsMs) {
     if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
-    const res = await fetch(`${taiBase}/PublicApi/Shipping/v2/Shipments/${encodeURIComponent(row.shipment_id)}`, {
-      headers: { "x-api-key": taiKey, Accept: "application/json" },
-      signal: AbortSignal.timeout(12_000),
-    });
+    let res: Response;
+    try {
+      res = await doFetch(`${taiBase}/PublicApi/Shipping/v2/Shipments/${encodeURIComponent(cleanShipmentId)}`, {
+        headers: { "x-api-key": taiKey, Accept: "application/json" },
+        signal: AbortSignal.timeout(12_000),
+      });
+    } catch {
+      last = { verified: false, taiBuy: 0, status: 0 };
+      continue;
+    }
+    if (isTaiAuthFailureStatus(res.status)) {
+      // Stop immediately on 401/403 — never keep polling TAI with rejected credentials
+      return { verified: false, taiBuy: 0, status: res.status, authFailed: true };
+    }
     const body = res.ok ? ((await res.json()) as { carrierList?: Array<Record<string, unknown>> }) : null;
     const leg = Array.isArray(body?.carrierList)
       ? body!.carrierList.find(
@@ -108,7 +164,52 @@ async function verifyCarrierReadBack(
   return last;
 }
 
-async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: string, taiKey: string) {
+export interface ProcessWritebackOptions {
+  taiBase: string;
+  credential: string;
+  fetchImpl?: typeof fetch;
+  readBackWaitsMs?: readonly number[];
+  liveInsertAudit?: boolean;
+}
+
+export async function processWritebackRow(
+  db: SupabaseClient,
+  row: AssignmentRow,
+  options: ProcessWritebackOptions,
+): Promise<{ status: string; haltedOnAuth?: boolean; httpStatus?: number }> {
+  const taiBase = options.taiBase.replace(/\/+$/, "");
+  const taiKey = taiApiKey(options.credential);
+  const doFetch = options.fetchImpl ?? fetch;
+  const waitsMs = options.readBackWaitsMs ?? READ_BACK_WAITS_MS;
+
+  if (isTaiAuthHalted(taiKey)) {
+    const haltMsg = "TAI poller is halted due to a prior HTTP 401/403 authentication error.";
+    await db
+      .from("tai_carrier_assignments")
+      .update({
+        status: "needs_human",
+        error_message: haltMsg,
+        next_attempt_at: null,
+      })
+      .eq("id", row.id);
+    return { status: "needs_human", haltedOnAuth: true };
+  }
+
+  if (!isNumericTaiShipmentId(row.shipment_id)) {
+    const nonNumErr = `Refused TAI write-back: shipment_id "${row.shipment_id}" is not a numeric TAI Shipment ID`;
+    await db
+      .from("tai_carrier_assignments")
+      .update({
+        status: "needs_human",
+        error_message: nonNumErr,
+        sent_at: new Date().toISOString(),
+        next_attempt_at: null,
+      })
+      .eq("id", row.id);
+    await logAuditEvent(db, row, "failed_terminal", { error: nonNumErr });
+    return { status: "needs_human" };
+  }
+
   if (row.carrier_master_id == null) {
     await db
       .from("tai_carrier_assignments")
@@ -116,9 +217,10 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
         status: "needs_human",
         error_message: "No known TAI carrierMasterId for this carrier",
         sent_at: new Date().toISOString(),
+        next_attempt_at: null,
       })
       .eq("id", row.id);
-    return;
+    return { status: "needs_human" };
   }
 
   const parked = isPendingReadBack(row.response_body);
@@ -131,9 +233,25 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
       .eq("status", "failed")
       .select("id")
       .maybeSingle();
-    if (!claimed) return;
+    if (!claimed) return { status: "skipped" };
 
-    const check = await verifyCarrierReadBack(row, taiBase, taiKey);
+    const check = await verifyCarrierReadBack(row, taiBase, taiKey, doFetch, waitsMs);
+    if (check.authFailed) {
+      const authReason = `TAI HTTP ${check.status} on GET /Shipments/${row.shipment_id} — halted immediately to prevent TAI account lockout`;
+      haltTaiOnAuthFailure(taiKey, authReason);
+      await db
+        .from("tai_carrier_assignments")
+        .update({
+          status: "needs_human",
+          response_http_status: check.status,
+          error_message: authReason,
+          next_attempt_at: null,
+        })
+        .eq("id", row.id);
+      await logAuditEvent(db, row, "halted_auth_failure", { http_status: check.status, error: authReason });
+      return { status: "needs_human", haltedOnAuth: true, httpStatus: check.status };
+    }
+
     const rounds = parked.readBackRounds + 1;
     if (check.verified) {
       await db
@@ -150,7 +268,7 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
         payload: buildCarrierChargesPayload(row),
       });
       broadcastOpsEvent("writeback_verified", { shipmentId: row.shipment_id, verifiedBuy: check.taiBuy });
-      return;
+      return { status: "sent", httpStatus: check.status };
     }
 
     const elapsed = Date.now() - Date.parse(parked.writeSentAt);
@@ -164,11 +282,11 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
         status: expired ? "needs_human" : "failed",
         response_body: { ...parked, readBackRounds: rounds },
         error_message: reason,
-        next_attempt_at: new Date(Date.now() + READ_BACK_RECHECK_MS).toISOString(),
+        next_attempt_at: expired ? null : new Date(Date.now() + READ_BACK_RECHECK_MS).toISOString(),
       })
       .eq("id", row.id);
     await logAuditEvent(db, row, expired ? "failed_terminal" : "read_back_pending", { error: reason });
-    return;
+    return { status: expired ? "needs_human" : "failed" };
   }
 
   // Atomic claim so two processes can NEVER double-PUT the same row
@@ -180,30 +298,32 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
     .in("status", ["pending", "failed"])
     .select("id")
     .maybeSingle();
-  if (!claimed) return;
+  if (!claimed) return { status: "skipped" };
 
   if (row.dry_run) {
     await db
       .from("tai_carrier_assignments")
       .update({ status: "dry_run", sent_at: new Date().toISOString(), error_message: "dry_run=true" })
       .eq("id", row.id);
-    return;
+    return { status: "dry_run" };
   }
+
+  const reqHeaders = {
+    "x-api-key": taiKey,
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
 
   let resp: Response;
   try {
-    resp = await fetch(`${taiBase}/PublicApi/Shipping/v2/CarrierCharges`, {
+    resp = await doFetch(`${taiBase}/PublicApi/Shipping/v2/CarrierCharges`, {
       method: "PUT",
-      headers: {
-        "x-api-key": taiKey,
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
+      headers: reqHeaders,
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(25_000),
     });
   } catch (err) {
-    // Ambiguous network outcome is NEVER auto-retried
+    // Ambiguous network outcome / timeout is NEVER auto-retried
     const errMsg = `Network error during PUT CarrierCharges (not auto-retried): ${err instanceof Error ? err.message : String(err)}`;
     await db
       .from("tai_carrier_assignments")
@@ -211,10 +331,28 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
         status: "needs_human",
         error_message: errMsg,
         sent_at: new Date().toISOString(),
+        next_attempt_at: null,
       })
       .eq("id", row.id);
     await logAuditEvent(db, row, "failed_terminal", { error: errMsg });
-    return;
+    void recordTaiPush({
+      shipmentId: row.shipment_id,
+      kind: "carrier_charges",
+      method: "PUT",
+      endpoint: "/PublicApi/Shipping/v2/CarrierCharges",
+      requestHeaders: reqHeaders,
+      requestPayload: payload,
+      responseStatus: null,
+      responseBody: null,
+      ok: false,
+      needsHuman: true,
+      errorMessage: errMsg,
+      actor: row.requested_by ?? "poller",
+      supabaseClient: db as unknown as SupabaseInsertLike,
+      liveInsert: options.liveInsertAudit ?? true,
+      redactValues: [taiKey],
+    });
+    return { status: "needs_human" };
   }
 
   const rawText = await resp.text();
@@ -225,29 +363,117 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
     // plain text
   }
 
+  if (isTaiAuthFailureStatus(resp.status)) {
+    const authErr = `TAI HTTP ${resp.status} on PUT CarrierCharges — poller halted immediately to prevent TAI account lockout`;
+    haltTaiOnAuthFailure(taiKey, authErr);
+    await db
+      .from("tai_carrier_assignments")
+      .update({
+        status: "needs_human",
+        response_http_status: resp.status,
+        response_body: parsedBody,
+        error_message: authErr,
+        next_attempt_at: null,
+      })
+      .eq("id", row.id);
+    await logAuditEvent(db, row, "halted_auth_failure", {
+      http_status: resp.status,
+      error: authErr,
+    });
+    void recordTaiPush({
+      shipmentId: row.shipment_id,
+      kind: "carrier_charges",
+      method: "PUT",
+      endpoint: "/PublicApi/Shipping/v2/CarrierCharges",
+      requestHeaders: reqHeaders,
+      requestPayload: payload,
+      responseStatus: resp.status,
+      responseBody: parsedBody,
+      ok: false,
+      needsHuman: true,
+      errorMessage: authErr,
+      actor: row.requested_by ?? "poller",
+      supabaseClient: db as unknown as SupabaseInsertLike,
+      liveInsert: options.liveInsertAudit ?? true,
+      redactValues: [taiKey],
+    });
+    return { status: "needs_human", haltedOnAuth: true, httpStatus: resp.status };
+  }
+
   if (!resp.ok) {
-    const attempts = row.attempts + 1;
-    const terminal = attempts >= (row.max_attempts || 3) || (resp.status >= 400 && resp.status < 500);
+    // Never blind-retry failed/ambiguous PUT CarrierCharges writes; mark needs_human for manual reconciliation.
     const errMsg = `TAI HTTP ${resp.status}: ${rawText.slice(0, 240)}`;
     await db
       .from("tai_carrier_assignments")
       .update({
-        status: terminal ? "needs_human" : "failed",
+        status: "needs_human",
         response_http_status: resp.status,
         response_body: parsedBody,
         error_message: errMsg,
-        next_attempt_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+        next_attempt_at: null,
       })
       .eq("id", row.id);
-    await logAuditEvent(db, row, terminal ? "failed_terminal" : "failed_retryable", {
+    await logAuditEvent(db, row, "failed_terminal", {
       http_status: resp.status,
       error: errMsg,
     });
-    return;
+    void recordTaiPush({
+      shipmentId: row.shipment_id,
+      kind: "carrier_charges",
+      method: "PUT",
+      endpoint: "/PublicApi/Shipping/v2/CarrierCharges",
+      requestHeaders: reqHeaders,
+      requestPayload: payload,
+      responseStatus: resp.status,
+      responseBody: parsedBody,
+      ok: false,
+      needsHuman: true,
+      errorMessage: errMsg,
+      actor: row.requested_by ?? "poller",
+      supabaseClient: db as unknown as SupabaseInsertLike,
+      liveInsert: options.liveInsertAudit ?? true,
+      redactValues: [taiKey],
+    });
+    return { status: "needs_human", httpStatus: resp.status };
   }
 
+  void recordTaiPush({
+    shipmentId: row.shipment_id,
+    kind: "carrier_charges",
+    method: "PUT",
+    endpoint: "/PublicApi/Shipping/v2/CarrierCharges",
+    requestHeaders: reqHeaders,
+    requestPayload: payload,
+    responseStatus: resp.status,
+    responseBody: parsedBody,
+    ok: true,
+    needsHuman: false,
+    actor: row.requested_by ?? "poller",
+    supabaseClient: db as unknown as SupabaseInsertLike,
+    liveInsert: options.liveInsertAudit ?? true,
+    redactValues: [taiKey],
+  });
+
   const writeSentAt = new Date().toISOString();
-  const check = await verifyCarrierReadBack(row, taiBase, taiKey);
+  const check = await verifyCarrierReadBack(row, taiBase, taiKey, doFetch, waitsMs);
+  if (check.authFailed) {
+    const authErr = `TAI HTTP ${check.status} during CarrierCharges read-back — poller halted immediately`;
+    haltTaiOnAuthFailure(taiKey, authErr);
+    await db
+      .from("tai_carrier_assignments")
+      .update({
+        status: "needs_human",
+        response_http_status: check.status,
+        response_body: { awaitingReadBack: true, writeResponse: parsedBody, writeSentAt, readBackRounds: 1 },
+        sent_at: writeSentAt,
+        error_message: authErr,
+        next_attempt_at: null,
+      })
+      .eq("id", row.id);
+    await logAuditEvent(db, row, "halted_auth_failure", { http_status: check.status, error: authErr });
+    return { status: "needs_human", haltedOnAuth: true, httpStatus: check.status };
+  }
+
   if (check.verified) {
     await db
       .from("tai_carrier_assignments")
@@ -261,29 +487,31 @@ async function processRow(db: SupabaseClient, row: AssignmentRow, taiBase: strin
       .eq("id", row.id);
     await logAuditEvent(db, row, "sent", { http_status: resp.status, payload });
     broadcastOpsEvent("writeback_verified", { shipmentId: row.shipment_id, verifiedBuy: check.taiBuy });
-  } else {
-    await db
-      .from("tai_carrier_assignments")
-      .update({
-        status: "failed",
-        response_http_status: resp.status,
-        response_body: { awaitingReadBack: true, writeResponse: parsedBody, writeSentAt, readBackRounds: 1 },
-        sent_at: writeSentAt,
-        error_message: READ_BACK_PENDING_SAVE_MESSAGE,
-        next_attempt_at: new Date(Date.now() + READ_BACK_RECHECK_MS).toISOString(),
-      })
-      .eq("id", row.id);
-    await logAuditEvent(db, row, "read_back_pending", {
-      http_status: resp.status,
-      error: READ_BACK_PENDING_SAVE_MESSAGE,
-    });
+    return { status: "sent", httpStatus: resp.status };
   }
+
+  await db
+    .from("tai_carrier_assignments")
+    .update({
+      status: "failed",
+      response_http_status: resp.status,
+      response_body: { awaitingReadBack: true, writeResponse: parsedBody, writeSentAt, readBackRounds: 1 },
+      sent_at: writeSentAt,
+      error_message: READ_BACK_PENDING_SAVE_MESSAGE,
+      next_attempt_at: new Date(Date.now() + READ_BACK_RECHECK_MS).toISOString(),
+    })
+    .eq("id", row.id);
+  await logAuditEvent(db, row, "read_back_pending", {
+    http_status: resp.status,
+    error: READ_BACK_PENDING_SAVE_MESSAGE,
+  });
+  return { status: "failed", httpStatus: resp.status };
 }
 
 export function pollerConfigStatus() {
-  const enabled = process.env.TAI_WRITEBACK_POLLER_ENABLED !== "false";
+  const enabled = process.env.TAI_WRITEBACK_POLLER_ENABLED !== "false" && !pollerHalted;
   const scope = process.env.TAI_WRITEBACK_POLLER_SCOPE || "own"; // 'own' (fivenines-ops rows only) | 'all'
-  return { enabled, scope };
+  return { enabled, scope, halted: pollerHalted, haltReason: pollerHaltReason };
 }
 
 /**
@@ -294,9 +522,9 @@ export async function runPollerForAssignmentId(assignmentId: number): Promise<vo
   if (!pollerConfigStatus().enabled) return;
   const sbUrl = process.env.SUPABASE_URL?.trim();
   const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
-  const taiKey = getTaiCred();
+  const taiKey = taiApiKey();
   const taiBase = (process.env.TAI_BASE_URL || "https://primaryfreightllc.taicloud.net").replace(/\/+$/, "");
-  if (!sbUrl || !sbKey || !taiKey) return;
+  if (!sbUrl || !sbKey || !taiKey || isTaiAuthHalted(taiKey)) return;
 
   try {
     const db = createClient(sbUrl, sbKey, { auth: { persistSession: false } });
@@ -307,22 +535,25 @@ export async function runPollerForAssignmentId(assignmentId: number): Promise<vo
       .in("status", ["pending", "failed"])
       .maybeSingle();
     if (row) {
-      await processRow(db, row as AssignmentRow, taiBase, taiKey);
+      await processWritebackRow(db, row as AssignmentRow, { taiBase, credential: taiKey });
     }
   } catch (err) {
-    console.error(`[tai-writeback-poller] immediate run failed for #${assignmentId}:`, err instanceof Error ? err.message : err);
+    console.error(
+      `[tai-writeback-poller] immediate run failed for #${assignmentId}:`,
+      err instanceof Error ? err.message : err,
+    );
   }
 }
 
 export function startTaiWritebackPollerIfEnabled(): void {
   const { enabled, scope } = pollerConfigStatus();
   if (!enabled) {
-    console.log("[tai-writeback-poller] Disabled via TAI_WRITEBACK_POLLER_ENABLED=false.");
+    console.log("[tai-writeback-poller] Disabled via TAI_WRITEBACK_POLLER_ENABLED=false or auth halt.");
     return;
   }
   const sbUrl = process.env.SUPABASE_URL?.trim();
   const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
-  const taiKey = getTaiCred();
+  const taiKey = taiApiKey();
   const taiBase = (process.env.TAI_BASE_URL || "https://primaryfreightllc.taicloud.net").replace(/\/+$/, "");
 
   if (!sbUrl || !sbKey || !taiKey) {
@@ -334,9 +565,14 @@ export function startTaiWritebackPollerIfEnabled(): void {
   console.log(`[tai-writeback-poller] Active (scope=${scope}, interval=${POLL_INTERVAL_MS}ms)`);
 
   const tick = async () => {
-    if (ticking) return;
+    if (ticking || pollerHalted) return;
     ticking = true;
     try {
+      const currentCred = taiApiKey();
+      if (!currentCred || isTaiAuthHalted(currentCred)) {
+        stopTaiWritebackPoller("Poller paused: TAI credential missing or halted.");
+        return;
+      }
       const nowIso = new Date().toISOString();
       let query = db
         .from("tai_carrier_assignments")
@@ -353,14 +589,19 @@ export function startTaiWritebackPollerIfEnabled(): void {
       const { data: rows } = await query;
       if (Array.isArray(rows)) {
         for (const r of rows as AssignmentRow[]) {
-          await processRow(db, r, taiBase, taiKey);
+          const outcome = await processWritebackRow(db, r, { taiBase, credential: currentCred });
+          if (outcome.haltedOnAuth || pollerHalted) {
+            return;
+          }
         }
       }
     } catch (err) {
       console.error("[tai-writeback-poller] tick error:", err);
     } finally {
       ticking = false;
-      timer = setTimeout(tick, POLL_INTERVAL_MS);
+      if (!pollerHalted) {
+        timer = setTimeout(tick, POLL_INTERVAL_MS);
+      }
     }
   };
 

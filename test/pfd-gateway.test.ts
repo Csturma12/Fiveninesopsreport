@@ -5,13 +5,16 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import type { StaffUser } from "../server/auth";
 import {
+  PFD_ACTING_NAME_HEADER,
   PFD_ACTING_USER_HEADER,
   PFD_TOKEN_HEADER,
+  isBlockedPfdApiPath,
+  isKnownPfdApiPath,
   readPfdGatewayConfig,
   registerPfdGateway,
   upstreamApiPath,
 } from "../server/pfd-gateway";
-import { PFD_API_PREFIXES } from "../shared/pfd-endpoints";
+import { PFD_ALLOWED_PATH_PREFIXES, PFD_API_PREFIXES } from "../shared/pfd-endpoints";
 
 const TOKEN = "t".repeat(48);
 
@@ -262,5 +265,77 @@ test("status endpoint reports config and upstream health", async () => {
     assert.equal(res.status, 200);
     assert.equal(body.ok, true);
     assert.equal(body.upstreamStatus, 200);
+  });
+});
+
+test("OPS_GATEWAY_TOKEN works as a fallback alias when PFD_GATEWAY_TOKEN is unset and enforces >=32 chars", async () => {
+  const opsToken = "o".repeat(40);
+  const cfg = readPfdGatewayConfig({
+    PFD_BASE_URL: "https://primary-freight-dashboard.fly.dev/",
+    OPS_GATEWAY_TOKEN: opsToken,
+  });
+  assert.ok(cfg.ok);
+  assert.equal(cfg.config.token, opsToken);
+  assert.equal(cfg.config.baseUrl, "https://primary-freight-dashboard.fly.dev");
+
+  const shortAlias = readPfdGatewayConfig({
+    PFD_BASE_URL: "https://primary-freight-dashboard.fly.dev",
+    OPS_GATEWAY_TOKEN: "too-short",
+  });
+  assert.equal(shortAlias.ok, false);
+  if (!shortAlias.ok) {
+    assert.match(shortAlias.problems.join(" "), /OPS_GATEWAY_TOKEN must be at least 32 characters/);
+  }
+
+  await withHarness(
+    {
+      user: { email: "Chriss@PrimaryCompanies.com", name: "Chris Sturma", mode: "google_oauth" },
+      env: { PFD_GATEWAY_TOKEN: "", OPS_GATEWAY_TOKEN: opsToken },
+    },
+    async ({ base, seen }) => {
+      const res = await fetch(`${base}/api/pfd/loads/preview`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sendToTai: true }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].url, "/api/loads/preview");
+      assert.equal(seen[0].headers[PFD_TOKEN_HEADER], opsToken);
+      assert.equal(seen[0].headers[PFD_ACTING_USER_HEADER], "chriss@primarycompanies.com");
+      assert.equal(seen[0].headers[PFD_ACTING_NAME_HEADER], "Chris%20Sturma");
+    },
+  );
+});
+
+test("allows /api/loads and /api/outlook data routes while explicitly blocking /api/outlook/auth-*", async () => {
+  assert.ok((PFD_ALLOWED_PATH_PREFIXES as readonly string[]).includes("/api/loads"));
+  assert.equal(isKnownPfdApiPath("/api/loads"), true);
+  assert.equal(isKnownPfdApiPath("/api/loads/preview"), true);
+  assert.equal(isKnownPfdApiPath("/api/outlook/messages"), true);
+
+  for (const blocked of [
+    "/api/auth/google",
+    "/api/portal/shipments",
+    "/api/webhooks/tai",
+    "/api/outlook/auth-url",
+    "/api/outlook/auth-callback",
+    "/api/outlook/auth-status",
+  ]) {
+    assert.equal(isBlockedPfdApiPath(blocked), true, blocked);
+    assert.equal(isKnownPfdApiPath(blocked), false, blocked);
+  }
+
+  await withHarness({}, async ({ base, seen }) => {
+    const blockedAuthUrl = await fetch(`${base}/api/pfd/outlook/auth-url`);
+    assert.equal(blockedAuthUrl.status, 404);
+    const blockedCallback = await fetch(`${base}/api/pfd/outlook/auth-callback?code=abc`);
+    assert.equal(blockedCallback.status, 404);
+    assert.equal(seen.length, 0);
+
+    const allowedOutlook = await fetch(`${base}/api/pfd/outlook/messages`);
+    assert.equal(allowedOutlook.status, 200);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].url, "/api/outlook/messages");
   });
 });
