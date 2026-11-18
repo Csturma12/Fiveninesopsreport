@@ -14,7 +14,7 @@ import {
   store,
 } from "../server/store";
 import { clearTaiPushLogs, resetTaiAuthHalt } from "../server/tai-push-log";
-import { syncTaiInvoices, syncTaiInvoicesForShipment } from "../server/tai-service";
+import { harvestStopsToKnowledgeBase, syncTaiInvoices, syncTaiInvoicesForShipment } from "../server/tai-service";
 
 const FIXTURE_CRED = "fixture-phase2-tai-cred-7741";
 
@@ -527,4 +527,87 @@ test("TAI Invoice Sync: syncTaiInvoices and /api/tai/invoices/sync update invoic
       assert.equal(bulkJson.totalAttempted, 1);
     },
   );
+});
+
+test("harvestStopsToKnowledgeBase enriches store.facilities and POST /api/agent/activity ingests bot updates", async () => {
+  const initialFacCount = store.facilities.length;
+
+  const harvested = await harvestStopsToKnowledgeBase([
+    {
+      stopType: "First Pickup",
+      companyName: "Acme Industrial Logistics",
+      streetAddress: "123 Industrial Pkwy",
+      city: "Birmingham",
+      state: "AL",
+      zipCode: "35203",
+      country: "USA",
+      contactName: "Shipping Desk",
+      phone: "205-555-0100",
+      instructions: "Dock 4-6",
+      readyDate: "2026-11-20",
+      timeOpen: "08:00",
+      timeClose: "16:00",
+      appointmentRequired: false,
+    },
+    {
+      stopType: "Last Drop",
+      companyName: "Consignee", // Generic, should be skipped
+      streetAddress: "",
+      city: "Atlanta",
+      state: "GA",
+      zipCode: "30301",
+      country: "USA",
+      contactName: "",
+      phone: "",
+      instructions: "",
+      readyDate: "2026-11-21",
+      timeOpen: "09:00",
+      timeClose: "17:00",
+      appointmentRequired: false,
+    },
+  ]);
+
+  assert.equal(harvested, 1);
+  assert.equal(store.facilities.length, initialFacCount + 1);
+  const found = store.facilities.find((f) => f.companyName === "Acme Industrial Logistics");
+  assert.ok(found);
+  assert.equal(found?.city, "Birmingham");
+  assert.equal(found?.state, "AL");
+  assert.equal(found?.zipCode, "35203");
+  assert.equal(found?.streetAddress, "123 Industrial Pkwy");
+
+  // Test POST /api/agent/activity endpoint
+  await withServer({}, async (baseUrl) => {
+    // 1. Missing required fields
+    const badRes = await fetch(`${baseUrl}/api/agent/activity`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: "test" }),
+    });
+    assert.equal(badRes.status, 400);
+
+    // 2. Successful Grok Bot tracking ping
+    const res = await fetch(`${baseUrl}/api/agent/activity`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agent: "grok",
+        shipmentId: "132738007",
+        action: "tracking_ping",
+        location: "Pilot Travel Center, I-40 Exit 152, TN",
+        note: "Driver confirmed moving westbound.",
+      }),
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.ok, true);
+    assert.equal(json.agent, "grok");
+    assert.match(json.message, /🤖 Grok/);
+
+    const targetShipment = store.shipments.find((s) => s.id === "132738007");
+    assert.ok(targetShipment);
+    assert.match(targetShipment?.operationalNote || "", /🤖 Grok/);
+    assert.match(targetShipment?.operationalNote || "", /Pilot Travel Center/);
+    assert.equal(targetShipment?.lastAgentAction?.agent, "grok");
+  });
 });

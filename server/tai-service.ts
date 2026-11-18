@@ -1499,6 +1499,9 @@ export async function bookTaiLoads(
       }
     }
 
+    // Auto-enhance Supabase Knowledge Base: harvest stop facilities permanently
+    void harvestStopsToKnowledgeBase(hydratedEntry.stops, sb).catch(() => {});
+
     targetShipments.unshift(newShipment);
     createdShipments.push(newShipment);
     shipmentChargeBreakdowns.set(assignedId, {
@@ -1874,6 +1877,83 @@ export async function pushShipmentReferences(
     taiSynced,
     message: `Updated references on #${s.id}`,
   };
+}
+
+/**
+ * Auto-harvests verified facility details from booked load stops into the
+ * in-memory cache and Supabase `facilities` table to permanently enhance the Knowledge Base.
+ */
+export async function harvestStopsToKnowledgeBase(
+  stops: LoadEntryStop[],
+  sbClient?: any,
+): Promise<number> {
+  if (!Array.isArray(stops) || stops.length === 0) return 0;
+  let count = 0;
+  for (const stop of stops) {
+    const companyName = String(stop.companyName || "").trim();
+    const city = String(stop.city || "").trim();
+    const state = String(stop.state || "").trim().toUpperCase();
+    const zipCode = String(stop.zipCode || "").trim().slice(0, 5);
+    const streetAddress = String(stop.streetAddress || "").trim();
+    const contactName = String(stop.contactName || "").trim();
+    const phone = String(stop.phone || "").trim();
+
+    if (!companyName || !city || !state || /^(consignee|customer|shipper|receiver|delivery)$/i.test(companyName)) {
+      continue;
+    }
+
+    const label = `${companyName} — ${city}, ${state}${zipCode ? ` ${zipCode}` : ""}`;
+    const normCompany = normalizeNameKey(companyName);
+    const normCity = normalizeNameKey(city);
+
+    const existingIdx = store.facilities.findIndex(
+      (f) =>
+        normalizeNameKey(f.companyName) === normCompany &&
+        normalizeNameKey(f.city) === normCity &&
+        f.state.trim().toUpperCase() === state,
+    );
+
+    const facilityData: SavedFacility = {
+      id: existingIdx >= 0 ? store.facilities[existingIdx].id : `fac-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      label,
+      companyName,
+      streetAddress: streetAddress || (existingIdx >= 0 ? store.facilities[existingIdx].streetAddress : ""),
+      city,
+      state,
+      zipCode: zipCode || (existingIdx >= 0 ? store.facilities[existingIdx].zipCode : ""),
+      contactName: contactName || (existingIdx >= 0 ? store.facilities[existingIdx].contactName : ""),
+      phone: phone || (existingIdx >= 0 ? store.facilities[existingIdx].phone : ""),
+    };
+
+    if (existingIdx >= 0) {
+      store.facilities[existingIdx] = facilityData;
+    } else {
+      store.facilities.unshift(facilityData);
+      store.kpis.facilitiesCount = store.facilities.length;
+    }
+    count++;
+
+    const sb = sbClient !== undefined ? sbClient : (!store.isSafeSandbox ? store.getSupabase() : null);
+    if (sb) {
+      try {
+        await sb.from("facilities").upsert(
+          {
+            company_name: companyName,
+            street_address: facilityData.streetAddress,
+            city,
+            state,
+            zip_code: facilityData.zipCode,
+            contact_name: facilityData.contactName,
+            phone: facilityData.phone,
+          },
+          { onConflict: "company_name,city,state" },
+        );
+      } catch {
+        // non-fatal mirror difference
+      }
+    }
+  }
+  return count;
 }
 
 export async function saveFacilityRecord(

@@ -1049,6 +1049,80 @@ export function registerApiRoutes(app: Express, options: RegisterApiRoutesOption
     res.status(result.status).json(result);
   });
 
+  // Dedicated Ingestion Endpoint for Google Agents, Grok bots, and external automations
+  app.post("/api/agent/activity", async (req: Request, res: Response) => {
+    const {
+      agent,
+      shipmentId,
+      action = "tracking_ping",
+      note,
+      location,
+      eta,
+      data,
+    } = req.body || {};
+
+    if (!shipmentId || !agent) {
+      res.status(400).json({ ok: false, message: "Missing required fields: agent and shipmentId." });
+      return;
+    }
+
+    const sid = String(shipmentId).trim();
+    const rawAgent = String(agent).trim();
+    const agentTag = rawAgent.toLowerCase().includes("grok")
+      ? "🤖 Grok"
+      : rawAgent.toLowerCase().includes("google")
+      ? "🧠 Google Agent"
+      : `🤖 ${rawAgent}`;
+    const timestampStr = new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+
+    const summary = String(note || location || action).trim();
+    const newNoteLine = `[${agentTag} ${timestampStr}] ${location ? `GPS: ${location}. ` : ""}${note ? note : action}`;
+
+    const existing = store.shipments.find((s) => s.id === sid);
+    if (existing) {
+      const existingNote = existing.operationalNote ? `${existing.operationalNote}\n` : "";
+      existing.operationalNote = `${existingNote}${newNoteLine}`;
+      if (location) {
+        existing.location = location;
+        existing.currentLocation = location;
+      }
+      existing.lastAgentAction = {
+        agent: rawAgent,
+        action: String(action),
+        at: new Date().toISOString(),
+        summary: summary.slice(0, 100),
+      };
+    }
+
+    const sb = !store.isSafeSandbox ? store.getSupabase() : null;
+    if (sb) {
+      try {
+        const updatePayload: Record<string, unknown> = {
+          notes: existing?.operationalNote || newNoteLine,
+        };
+        if (location) updatePayload.current_location = location;
+        await sb.from("shipments").update(updatePayload).eq("shipment_id", sid);
+      } catch {
+        // non-fatal Supabase mirror update
+      }
+    }
+
+    broadcastOpsEvent("shipment_updated", {
+      shipmentId: sid,
+      operationalNote: existing?.operationalNote || newNoteLine,
+      lastAgentAction: existing?.lastAgentAction,
+    });
+
+    res.json({
+      ok: true,
+      shipmentId: sid,
+      agent: rawAgent,
+      action,
+      summary,
+      message: `Recorded ${agentTag} update for shipment #${sid}. Broadcast live to dashboard.`,
+    });
+  });
+
   // Hydrated Bill of Lading & Carrier Rate Confirmation Document Generators
   app.get("/api/loads/:id/bol", (req: Request, res: Response) => {
     const id = String(req.params.id || "").trim();

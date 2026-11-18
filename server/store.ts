@@ -1089,6 +1089,15 @@ export function mapSupabaseShipmentRow(
     ...(r.trailer_number ? { trailerNumber: String(r.trailer_number) } : existing?.trailerNumber ? { trailerNumber: existing.trailerNumber } : {}),
     invoiceStatus: r.invoice_status ? String(r.invoice_status) : existing?.invoiceStatus,
     carrierPayStatus: r.carrier_pay_status ? String(r.carrier_pay_status) : existing?.carrierPayStatus,
+    lastAgentAction:
+      r.last_agent_action && typeof r.last_agent_action === "object"
+        ? (r.last_agent_action as OpsShipment["lastAgentAction"])
+        : existing?.lastAgentAction ||
+          (dbNotes.includes("🤖 Grok")
+            ? { agent: "Grok", action: "update", at: "", summary: (dbNotes.match(/\[🤖\s*Grok[^\]]*\]\s*([^\n]+)/)?.[1] || "Grok update").slice(0, 80) }
+            : dbNotes.includes("🧠 Google")
+            ? { agent: "Google Agent", action: "update", at: "", summary: (dbNotes.match(/\[🧠\s*Google[^\]]*\]\s*([^\n]+)/)?.[1] || "Google Agent update").slice(0, 80) }
+            : undefined),
     ...(buyVal > sellVal && sellVal > 0
       ? { mismatchNote: `Buy ($${buyVal.toLocaleString()}) exceeds Sell ($${sellVal.toLocaleString()})` }
       : {}),

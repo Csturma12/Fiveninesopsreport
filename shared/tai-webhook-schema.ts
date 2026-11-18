@@ -65,6 +65,12 @@ export interface OpsShipment {
   mismatchNote?: string;
   invoiceStatus?: string;
   carrierPayStatus?: string;
+  lastAgentAction?: {
+    agent: string;
+    action: string;
+    at: string;
+    summary: string;
+  };
 }
 
 export interface ExtractedEmailFields {

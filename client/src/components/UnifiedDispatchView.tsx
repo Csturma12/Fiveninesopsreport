@@ -1112,16 +1112,37 @@ export const UnifiedDispatchView: React.FC<UnifiedDispatchViewProps> = ({
 
                       {/* 6. Shipment ID (Load # ↗) */}
                       <td className="py-3 px-2 whitespace-nowrap font-mono">
-                        <button
-                          type="button"
-                          onClick={() => handleShipmentIdClick(s)}
-                          className="inline-flex items-center gap-1 hover:underline font-bold"
-                          style={{ color: "var(--pf-action)" }}
-                          title={`Open Load #${s.id}`}
-                        >
-                          <span>{s.id}</span>
-                          <ExternalLink size={11} className="opacity-85" />
-                        </button>
+                        <div className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleShipmentIdClick(s)}
+                            className="inline-flex items-center gap-1 hover:underline font-bold"
+                            style={{ color: "var(--pf-action)" }}
+                            title={`Open Load #${s.id}`}
+                          >
+                            <span>{s.id}</span>
+                            <ExternalLink size={11} className="opacity-85" />
+                          </button>
+                          {s.lastAgentAction && (
+                            <span
+                              className="px-1.5 py-0.5 rounded text-[9.5px] font-mono font-bold inline-flex items-center gap-0.5"
+                              style={{
+                                background: s.lastAgentAction.agent.toLowerCase().includes("grok")
+                                  ? "rgba(168, 85, 247, 0.15)"
+                                  : "rgba(59, 130, 246, 0.15)",
+                                color: s.lastAgentAction.agent.toLowerCase().includes("grok") ? "#c084fc" : "#60a5fa",
+                                border: `1px solid ${
+                                  s.lastAgentAction.agent.toLowerCase().includes("grok")
+                                    ? "rgba(168, 85, 247, 0.4)"
+                                    : "rgba(59, 130, 246, 0.4)"
+                                }`,
+                              }}
+                              title={`${s.lastAgentAction.agent}: ${s.lastAgentAction.summary || s.lastAgentAction.action} (${s.lastAgentAction.at || "live"})`}
+                            >
+                              {s.lastAgentAction.agent.toLowerCase().includes("grok") ? "🤖 Grok" : "🧠 Google"}
+                            </span>
+                          )}
+                        </div>
                       </td>
 
                       {/* 7. Carrier / Match carriers */}

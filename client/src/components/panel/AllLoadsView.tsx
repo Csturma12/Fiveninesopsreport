@@ -249,9 +249,30 @@ export const AllLoadsView: React.FC<AllLoadsViewProps> = ({
                 className="w-full text-left p-2.5 space-y-0.5 hover:opacity-95"
               >
                 <div className="flex items-center justify-between gap-2 text-xs">
-                  <span className="font-mono font-bold inline-flex items-center gap-0.5" style={{ color: "var(--pf-action)" }}>
-                    {isExp ? <ChevronDown size={13} /> : <ChevronRight size={13} />}#{s.id}
-                  </span>
+                  <div className="inline-flex items-center gap-1.5 font-mono font-bold" style={{ color: "var(--pf-action)" }}>
+                    <span className="inline-flex items-center gap-0.5">
+                      {isExp ? <ChevronDown size={13} /> : <ChevronRight size={13} />}#{s.id}
+                    </span>
+                    {s.lastAgentAction && (
+                      <span
+                        className="px-1 py-0.2 rounded text-[9px] font-mono font-bold"
+                        style={{
+                          background: s.lastAgentAction.agent.toLowerCase().includes("grok")
+                            ? "rgba(168, 85, 247, 0.15)"
+                            : "rgba(59, 130, 246, 0.15)",
+                          color: s.lastAgentAction.agent.toLowerCase().includes("grok") ? "#c084fc" : "#60a5fa",
+                          border: `1px solid ${
+                            s.lastAgentAction.agent.toLowerCase().includes("grok")
+                              ? "rgba(168, 85, 247, 0.4)"
+                              : "rgba(59, 130, 246, 0.4)"
+                          }`,
+                        }}
+                        title={`${s.lastAgentAction.agent}: ${s.lastAgentAction.summary || s.lastAgentAction.action}`}
+                      >
+                        {s.lastAgentAction.agent.toLowerCase().includes("grok") ? "🤖 Grok" : "🧠 Google"}
+                      </span>
+                    )}
+                  </div>
                   <span
                     className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold"
                     style={{ background: "var(--pf-surface-raised)", color: "var(--pf-info)" }}

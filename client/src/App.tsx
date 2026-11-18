@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import type { LoadEntry } from "@shared/load-entry";
+import { extractLoadEntryFromEmail } from "@shared/email-extractor";
 import { isHiddenCustomer, type BootstrapPayload, type CrmLeadItem, type CrucialEmailItem, type OpsShipment } from "@shared/tai-webhook-schema";
 import { buildGmailContainerSearchUrl } from "@shared/container-extractor";
 import { POD_FILE_ACCEPT, podMimeTypeForFile } from "./lib/pod-file";
@@ -271,86 +272,29 @@ export const App: React.FC = () => {
   }, [authGateUrl, refreshBootstrap, refreshInboxStream]);
 
   const extractMultiStopTender = useCallback(() => {
-    setBuilderEntry({
-      ...createDefaultBuilderEntry(),
-      stops: [
-        {
-          stopType: "First Pickup",
-          companyName: "CeramSource, Inc.",
-          streetAddress: "400 Enterprise Drive",
-          city: "Beaver Falls",
-          state: "PA",
-          zipCode: "15010",
-          country: "USA",
-          contactName: "Dock",
-          phone: "(732) 257-5002",
-          instructions: "",
-          readyDate: "2026-11-16",
-          timeOpen: "08:00",
-          timeClose: "14:00",
-          appointmentRequired: false,
-          savedFacilityMatched: true,
-        },
-        {
-          stopType: "Pick",
-          companyName: "Management & Consulting",
-          streetAddress: "626 Riverview Rd.",
-          city: "Monongahela",
-          state: "PA",
-          zipCode: "15063",
-          country: "USA",
-          contactName: "Dean Smith",
-          phone: "(724) 258-5500",
-          instructions: "",
-          readyDate: "2026-11-16",
-          timeOpen: "10:00",
-          timeClose: "15:00",
-          appointmentRequired: false,
-          savedFacilityMatched: true,
-        },
-        {
-          stopType: "Last Drop",
-          companyName: "Larkin Refractory Solutions",
-          streetAddress: "2331 Varkel Way",
-          city: "Lithonia",
-          state: "GA",
-          zipCode: "30058",
-          country: "USA",
-          contactName: "Receiving",
-          phone: "(678) 336-7090",
-          instructions: "",
-          readyDate: "2026-11-17",
-          timeOpen: "07:00",
-          timeClose: "10:00",
-          appointmentRequired: true,
-          savedFacilityMatched: true,
-        },
-      ],
-      items: [
-        {
-          description: "Ceramic Fiber Refractory Blankets",
-          packagingType: "Pallet",
-          handlingQuantity: 6,
-          piecesTotal: 6,
-          weightTotal: 6644,
-          hazardousMaterial: false,
-          freightClass: "No Class",
-          referenceNumber: "Stop 1",
-        },
-        {
-          description: "High-Alumina Refractory Castables",
-          packagingType: "Pallet",
-          handlingQuantity: 16,
-          piecesTotal: 16,
-          weightTotal: 32000,
-          hazardousMaterial: false,
-          freightClass: "No Class",
-          referenceNumber: "Stop 2",
-        },
-      ],
-    });
-    showToast("Extracted 2-Pickup + 1-Drop Tender (#42705) with ZIPs & 2 Commodity Lines into Compact Builder.");
-  }, [showToast]);
+    const activeText = reviewEmail?.body || "";
+    const activeSubject = reviewEmail?.subject || "";
+    const activeSender = reviewEmail?.from || "";
+
+    if (activeText || activeSubject) {
+      const liveFacilities = (data as BootstrapPayload)?.facilities || [];
+      const liveCustomers = (data as BootstrapPayload)?.customers || [];
+      const extracted = extractLoadEntryFromEmail(
+        { subject: activeSubject, sender: activeSender, bodyText: activeText },
+        liveCustomers,
+        liveFacilities,
+      );
+      if (extracted?.entry) {
+        setBuilderEntry(extracted.entry);
+        setLocation("/load-builder");
+        showToast("Extracted email into Load Builder via Knowledge Base.");
+        return;
+      }
+    }
+    setBuilderEntry(createDefaultBuilderEntry());
+    setLocation("/load-builder");
+    showToast("Opened Load Builder with a clean draft.");
+  }, [data, reviewEmail, setLocation, showToast]);
 
   const handleAssignCarrier = async (shipmentId: string, carrierName: string, buyRate: number) => {
     const res = await fetch(`/api/loads/${shipmentId}/writeback-carrier`, {
