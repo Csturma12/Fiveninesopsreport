@@ -16,7 +16,7 @@ declare global {
   }
 }
 
-const COOKIE_NAME = "fivenines_staff_session";
+export const COOKIE_NAME = "fivenines_staff_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Server-only in-memory OAuth access token cache for Gmail API `/api/inbox/sync` (never sent to browser)
@@ -50,29 +50,123 @@ const PUBLIC_PATHS = new Set([
   "/api/webhooks/tai/invoice",
 ]);
 
-function sessionSecret(): string {
-  return (
-    process.env.SESSION_SECRET?.trim() ||
-    crypto.createHash("sha256").update(process.env.SUPABASE_SERVICE_ROLE_KEY || "fivenines-dev-secret").digest("hex")
-  );
+export type AuthEnv = Partial<
+  Record<
+    "NODE_ENV" | "APP_BASE_URL" | "AUTH_DISABLED" | "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET" | "SESSION_SECRET",
+    string | undefined
+  >
+>;
+
+/** Env vars that must be present (non-blank) before the server will serve /api/* in production. */
+export const REQUIRED_PRODUCTION_AUTH_ENV = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "SESSION_SECRET"] as const;
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+function isLoopbackHostname(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase();
+  return LOOPBACK_HOSTS.has(h) || h.startsWith("127.");
 }
 
-export function isOAuthConfigured(): boolean {
-  return Boolean(process.env.GOOGLE_CLIENT_ID?.trim() && process.env.GOOGLE_CLIENT_SECRET?.trim());
+/** True for loopback socket addresses (IPv4 127/8, IPv6 ::1, and IPv4-mapped ::ffff:127.x). */
+export function isLoopbackAddress(address: string | undefined | null): boolean {
+  if (!address) return false;
+  const a = address.trim().toLowerCase().replace(/^::ffff:/, "");
+  return a === "::1" || a.startsWith("127.");
 }
 
 /**
- * Hard 401 gate on internal `/api/*` routes is opt-in via `REQUIRE_OAUTH_LOGIN=true`
- * so the Ops Dashboard and MV3 Gmail extension (`POST /api/inbox/ingest`) never brick
- * with a blank screen while Google Cloud Console redirect URIs are being updated.
- * Note: `/api/pfd/*` gateway still strictly rejects `mode === "local_dev"` in production.
+ * Production-like means either NODE_ENV=production (the Fly Docker image) or an
+ * APP_BASE_URL that points somewhere other than loopback (e.g. https://fivenines-ops.fly.dev).
+ * Any production-like deployment must fail closed on auth.
  */
-export function isAuthEnforced(): boolean {
-  if (process.env.AUTH_DISABLED === "true") return false;
-  return isOAuthConfigured() && process.env.REQUIRE_OAUTH_LOGIN === "true";
+export function isProductionEnv(env: AuthEnv = process.env): boolean {
+  if (env.NODE_ENV === "production") return true;
+  const base = env.APP_BASE_URL?.trim();
+  if (!base) return false;
+  try {
+    return !isLoopbackHostname(new URL(base).hostname);
+  } catch {
+    // An unparseable APP_BASE_URL is not a loopback dev URL; treat it as production.
+    return true;
+  }
 }
 
-function signSession(user: StaffUser): string {
+/** Names (never values) of required production auth env vars that are missing or blank. */
+export function missingProductionAuthEnv(env: AuthEnv = process.env): string[] {
+  return REQUIRED_PRODUCTION_AUTH_ENV.filter((name) => !env[name]?.trim());
+}
+
+/** True when running production-like and at least one required auth secret is absent. */
+export function isProductionAuthMisconfigured(env: AuthEnv = process.env): boolean {
+  return isProductionEnv(env) && missingProductionAuthEnv(env).length > 0;
+}
+
+/**
+ * Boot-time guard: in production the server refuses to start without Google OAuth
+ * credentials and a dedicated SESSION_SECRET. Logs the missing names only.
+ */
+export function assertProductionAuthConfig(env: AuthEnv = process.env): void {
+  if (!isProductionEnv(env)) return;
+  const missing = missingProductionAuthEnv(env);
+  if (missing.length > 0) {
+    console.error(
+      `[auth] FATAL: production deployment is missing required auth env: ${missing.join(", ")}. ` +
+        "Set these as Fly secrets (names only logged; values are never printed). Refusing to start.",
+    );
+    throw new Error(`Missing required production auth env: ${missing.join(", ")}`);
+  }
+  if (env.AUTH_DISABLED === "true") {
+    console.warn("[auth] AUTH_DISABLED=true is ignored in production; Google Workspace sign-in is enforced.");
+  }
+}
+
+let devSessionSecret: string | undefined;
+
+/**
+ * Session-signing secret. In production this is SESSION_SECRET and nothing else —
+ * no fallback, no derivation from the Supabase service-role key. Outside production
+ * a missing SESSION_SECRET falls back to a random per-process secret.
+ */
+export function resolveSessionSecret(env: AuthEnv = process.env): string {
+  const configured = env.SESSION_SECRET?.trim();
+  if (configured) return configured;
+  if (isProductionEnv(env)) {
+    throw new Error("SESSION_SECRET is required in production (no fallback is permitted).");
+  }
+  if (!devSessionSecret) devSessionSecret = crypto.randomBytes(32).toString("hex");
+  return devSessionSecret;
+}
+
+function sessionSecret(): string {
+  return resolveSessionSecret();
+}
+
+export function isOAuthConfigured(env: AuthEnv = process.env): boolean {
+  return Boolean(env.GOOGLE_CLIENT_ID?.trim() && env.GOOGLE_CLIENT_SECRET?.trim());
+}
+
+/**
+ * Whether unauthenticated /api/* requests are rejected. Always true in production;
+ * AUTH_DISABLED=true and the "no OAuth configured" preview only apply to local dev.
+ * main briefly made this opt-in via REQUIRE_OAUTH_LOGIN so the dashboard and the
+ * MV3 extension would not 401 while redirect URIs were being updated. That flag is
+ * not honored: a configured client id must not put production back on the preview user.
+ */
+export function isAuthEnforced(env: AuthEnv = process.env): boolean {
+  if (isProductionEnv(env)) return true;
+  if (env.AUTH_DISABLED === "true") return false;
+  return isOAuthConfigured(env);
+}
+
+/**
+ * Local-dev preview identity is only ever granted when the server is not
+ * production-like AND the request arrived over a loopback socket.
+ */
+export function allowsLocalDevPreview(remoteAddress: string | undefined | null, env: AuthEnv = process.env): boolean {
+  return !isAuthEnforced(env) && isLoopbackAddress(remoteAddress);
+}
+
+export function signSession(user: StaffUser): string {
   const payload = Buffer.from(
     JSON.stringify({ email: user.email, name: user.name, exp: Date.now() + SESSION_TTL_MS }),
   ).toString("base64url");
@@ -80,7 +174,7 @@ function signSession(user: StaffUser): string {
   return `${payload}.${sig}`;
 }
 
-function verifySessionToken(token: string | undefined): StaffUser | null {
+export function verifySessionToken(token: string | undefined): StaffUser | null {
   if (!token || !token.includes(".")) return null;
   const [payload, sig] = token.split(".", 2);
   const expected = crypto.createHmac("sha256", sessionSecret()).update(payload).digest("base64url");
@@ -250,9 +344,25 @@ export function registerAuth(app: Express): void {
     res.json({ ok: true });
   });
 
-  // Populate req.staffUser; soft-fallback to workspace identity unless REQUIRE_OAUTH_LOGIN=true
+  // Populate req.staffUser and gate /api/*. Fails closed in production.
   app.use(async (req: Request, res: Response, next: NextFunction) => {
     if (PUBLIC_PATHS.has(req.path)) return next();
+
+    // Defense in depth: assertProductionAuthConfig() should already have refused to boot,
+    // but if we are somehow serving production traffic without auth secrets, never
+    // authenticate anyone and never fall through to a preview identity.
+    if (isProductionAuthMisconfigured()) {
+      if (req.path.startsWith("/api/")) {
+        res.status(503).json({
+          ok: false,
+          authenticated: false,
+          oauthEnabled: false,
+          message: "Server authentication is not configured. Contact the administrator.",
+        });
+        return;
+      }
+      return next();
+    }
 
     const cookies = parseCookies(req.headers.cookie);
     const cookieUser = verifySessionToken(cookies[COOKIE_NAME]);
@@ -270,7 +380,7 @@ export function registerAuth(app: Express): void {
       }
     }
 
-    if (!isAuthEnforced()) {
+    if (allowsLocalDevPreview(req.socket?.remoteAddress)) {
       req.staffUser = {
         email: "chriss@primarycompanies.com",
         name: "Chris Sturma",

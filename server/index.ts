@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { registerAuth } from "./auth";
+import { assertProductionAuthConfig, isAuthEnforced, isProductionEnv, registerAuth } from "./auth";
 import { registerApiRoutes } from "./routes";
 import { registerPfdGateway } from "./pfd-gateway";
 import { store } from "./store";
@@ -11,6 +11,14 @@ import { startTaiWritebackPollerIfEnabled } from "./tai-writeback-poller";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function startServer() {
+  // Fail loudly at boot: production must never run without OAuth + SESSION_SECRET.
+  assertProductionAuthConfig();
+  if (!isAuthEnforced()) {
+    console.warn(
+      "[auth] Local dev preview: Google OAuth not enforced; loopback requests run as the local preview user.",
+    );
+  }
+
   const app = express();
   app.set("trust proxy", 1);
   app.use(express.json({ limit: "2mb" }));
@@ -63,7 +71,10 @@ async function startServer() {
   const port = Number(process.env.PORT) || 5090;
   const host = isProd ? "0.0.0.0" : "127.0.0.1";
   app.listen(port, host, () => {
-    console.log(`[FiveNines Ops v2] Listening on http://${host}:${port}`);
+    console.log(
+      `[FiveNines Ops v2] Listening on http://${host}:${port} ` +
+        `(auth: ${isProductionEnv() ? "production, enforced" : isAuthEnforced() ? "enforced" : "local dev preview"})`,
+    );
   });
 }
 
