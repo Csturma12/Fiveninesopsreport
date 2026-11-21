@@ -2,7 +2,7 @@
 
 ## Knowledge hub (shared source of truth)
 
-All agents and dashboards (Primary Freight Dashboard, Fiveninesopsreport, Gbots) share one append-only knowledge hub in the main Supabase project (`knowledge` schema). Full spec: [docs/knowledge-hub.md](https://github.com/Csturma12/primary-freight-dashboard/blob/knowledge-hub/docs/knowledge-hub.md).
+All agents and dashboards (Primary Freight Dashboard, Fiveninesopsreport, Gbots) share one append-only knowledge hub in the main Supabase project (`knowledge` schema). Full spec: [docs/knowledge-hub.md](https://github.com/Csturma12/primary-freight-dashboard/blob/main/docs/knowledge-hub.md).
 
 This app uses the main Supabase project with the service role key, so server code and agents call the RPCs directly (`supabase.rpc('knowledge_search', ...)`, `supabase.rpc('knowledge_contribute', {..., p_source_system: 'fivenines_ops'})`). Panel knowledge rules (`/api/panel/knowledge`) are still kept in memory; a follow-up will save them to the hub as proposals.
 
